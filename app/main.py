@@ -43,9 +43,9 @@ app = FastAPI(title="GoatHub Trading Bot", lifespan=lifespan)
 def register(body: Register, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     if "@" not in email or len(body.password) < 6:
-        raise HTTPException(400, "Gültige E-Mail + Passwort (min. 6 Zeichen) nötig")
+        raise HTTPException(400, "Valid email + password (min. 6 chars) required")
     if db.query(User).filter(User.email == email).first():
-        raise HTTPException(409, "E-Mail bereits registriert")
+        raise HTTPException(409, "Email already registered")
     u = User(email=email, password_hash=hash_pw(body.password),
              risk_pct=config.DEFAULT_RISK_PCT, leverage=config.DEFAULT_LEVERAGE,
              max_open_positions=config.DEFAULT_MAX_OPEN)
@@ -59,7 +59,7 @@ def register(body: Register, db: Session = Depends(get_db)):
 def login(body: Login, db: Session = Depends(get_db)):
     u = db.query(User).filter(User.email == body.email.strip().lower()).first()
     if not u or not verify_pw(body.password, u.password_hash):
-        raise HTTPException(401, "Falsche E-Mail oder Passwort")
+        raise HTTPException(401, "Wrong email or password")
     return {"access_token": make_token(u.id), "token_type": "bearer"}
 
 
@@ -132,7 +132,13 @@ async def discord_callback(code: str = None, error: str = None, db: Session = De
 
 
 def _user_public(u: User):
-    return {"email": u.email, "wallet_connected": bool(u.hl_api_secret_enc),
+    avatar_url = None
+    if u.discord_id and u.discord_avatar:
+        avatar_url = f"https://cdn.discordapp.com/avatars/{u.discord_id}/{u.discord_avatar}.png?size=64"
+    return {"email": u.email,
+            "discord_username": u.discord_username or None,
+            "discord_avatar_url": avatar_url,
+            "wallet_connected": bool(u.hl_api_secret_enc),
             "hl_account_address": u.hl_account_address, "bot_active": u.bot_active,
             "builder_approved": u.builder_approved,
             "settings": {"risk_pct": u.risk_pct, "leverage": u.leverage,
@@ -158,7 +164,7 @@ def update_settings(body: SettingsIn, u: User = Depends(current_user), db: Sessi
         u.capital_cap_usdc = max(0, body.capital_cap_usdc)     # 0 = ganzer Account
     if body.bot_active is not None:
         if body.bot_active and not u.hl_api_secret_enc:
-            raise HTTPException(400, "Erst Wallet verbinden, bevor der Bot aktiviert wird")
+            raise HTTPException(400, "Connect your wallet before activating the bot")
         u.bot_active = body.bot_active
     db.commit()
     return _user_public(u)
@@ -170,7 +176,7 @@ def set_wallet(body: WalletIn, u: User = Depends(current_user), db: Session = De
     addr = body.hl_account_address.strip()
     sec = body.hl_api_secret.strip()
     if not addr.startswith("0x") or len(addr) < 20 or not sec:
-        raise HTTPException(400, "Gültige MASTER-Adresse (0x…) + Agent-Key nötig")
+        raise HTTPException(400, "Valid MASTER address (0x...) + Agent Key required")
     u.hl_account_address = addr
     u.hl_api_secret_enc = encrypt(sec)
     db.commit()
