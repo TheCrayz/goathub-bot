@@ -1,0 +1,15 @@
+# Core (für API + Dashboard; reicht für localhost-Test)
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0
+pydantic>=2
+bcrypt
+python-jose[cryptography]
+cryptography
+python-dotenv
+httpx
+
+# Live-Trading (Listener + Engine) — nur auf dem Server nötig:
+discord.py>=2.5.2
+audioop-lts; python_version >= "3.13"
+hyperliquid-python-sdk>=0.9.0

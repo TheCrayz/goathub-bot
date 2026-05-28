@@ -1,0 +1,35 @@
+name: 🐐 Auto-Deploy GoatHub Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to GoatHub Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔑 SSH Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.GOATHUB_HOST }}
+          username: root
+          key: ${{ secrets.GOATHUB_DEPLOY_KEY }}
+          script: |
+            set -e
+            cd /var/www/goathub-bot
+
+            echo "📥 Pulling latest code..."
+            git pull https://${{ secrets.GH_TOKEN }}@github.com/TheCrayz/goathub-bot.git main || \
+              (git fetch https://${{ secrets.GH_TOKEN }}@github.com/TheCrayz/goathub-bot.git main && git reset --hard FETCH_HEAD)
+
+            echo "📦 Installing dependencies..."
+            source venv/bin/activate && pip install -q -r requirements.txt
+
+            echo "🔄 Restarting service..."
+            systemctl restart goathub
+
+            echo "✅ Deploy done! Status:"
+            systemctl status goathub --no-pager -l | tail -20
