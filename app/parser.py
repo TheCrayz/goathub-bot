@@ -61,16 +61,31 @@ def _ticker_from_title(title, direction):
     return " ".join(parts).strip() or None
 
 
+CANCEL_ACTIONS = ("CANCEL_TRADE", "CANCEL", "EXIT", "CLOSE", "CLOSE_TRADE")
+
+
 def parse_signal(embed: dict):
     fm = _fields(embed)
+    title = embed.get("title") or ""
     action = (fm.get("action") or "").upper()
     direction = (fm.get("direction") or "").upper()
+    if not action:
+        # Fallback: Action aus dem Titel "TICKER — ACTION"
+        parts = re.split(r"\s+[—–-]\s+", title)
+        if len(parts) > 1:
+            action = parts[-1].strip().upper()
     m = re.search(r"`([^`]+)`", embed.get("description") or "")
     signal_id = m.group(1) if m else ""
-    ticker = fm.get("ticker") or _ticker_from_title(embed.get("title") or "", direction)
+    ticker = fm.get("ticker") or _ticker_from_title(title, direction)
     entry = _num(fm.get("entry"))
     stop_loss = _num(fm.get("stop loss"))
-    if not action or not ticker or entry is None or stop_loss is None:
+    if not action or not ticker:
+        return None
+    # CANCEL/CLOSE braucht keine Level (Position wird einfach geschlossen)
+    if action in CANCEL_ACTIONS:
+        return Signal(signal_id=signal_id, ticker=ticker, action=action, direction=direction,
+                      entry=entry, stop_loss=stop_loss, take_profits=[], confidence=_num(fm.get("confidence")))
+    if entry is None or stop_loss is None:
         return None
     return Signal(signal_id=signal_id, ticker=ticker, action=action, direction=direction,
                   entry=entry, stop_loss=stop_loss, take_profits=_tps(fm.get("take profits")),

@@ -20,6 +20,7 @@ def init_db():
             ("discord_id", "VARCHAR"),
             ("discord_username", "VARCHAR"),
             ("discord_avatar", "VARCHAR"),
+            ("created_at", "DATETIME"),
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef}"))

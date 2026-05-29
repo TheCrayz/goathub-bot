@@ -83,8 +83,22 @@ class HyperliquidTrader:
             pass
         return 0.0
 
+    def is_tradable(self, coin):
+        return coin_of(coin) in self._sz
+
     def _round_sz(self, coin, sz):
         return round(sz, self._sz.get(coin_of(coin), 3))
+
+    @staticmethod
+    def _status_ok(raw):
+        """True, wenn eine Order-Antwort akzeptiert wurde (kein error-Status)."""
+        try:
+            if not isinstance(raw, dict) or raw.get("status") != "ok":
+                return False
+            st = raw["response"]["data"]["statuses"][0]
+            return "error" not in st
+        except Exception:
+            return False
 
     def set_leverage(self, coin, lev):
         try:
@@ -130,10 +144,11 @@ class HyperliquidTrader:
     def place_protection(self, coin, is_buy, sz, sl_px, tps):
         coin = coin_of(coin)
         sz = self._round_sz(coin, sz)
-        res = {"sl": None, "tp": []}
+        res = {"sl": None, "tp": [], "sl_ok": False}
         res["sl"] = self._order(coin, not is_buy, sz, round_sig(sl_px),
                                 {"trigger": {"triggerPx": round_sig(sl_px), "isMarket": True, "tpsl": "sl"}},
                                 reduce_only=True)
+        res["sl_ok"] = self._status_ok(res["sl"])
         for px, frac in (tps or []):
             tp_sz = self._round_sz(coin, sz * frac)
             if tp_sz > 0:
@@ -141,3 +156,33 @@ class HyperliquidTrader:
                                  {"trigger": {"triggerPx": round_sig(px), "isMarket": True, "tpsl": "tp"}},
                                  reduce_only=True))
         return res
+
+    def cancel_orders(self, coin):
+        """Alle offenen Orders (Entry + SL/TP) für einen Coin canceln. -> Anzahl."""
+        coin = coin_of(coin)
+        n = 0
+        try:
+            for o in self.info.open_orders(self.address):
+                if o.get("coin") == coin and o.get("oid") is not None:
+                    try:
+                        self.exchange.cancel(coin, o["oid"])
+                        n += 1
+                    except Exception as e:
+                        log.warning("cancel %s oid %s: %s", coin, o.get("oid"), e)
+        except Exception as e:
+            log.warning("open_orders(%s): %s", coin, e)
+        return n
+
+    def close_position(self, coin):
+        """Offene Position per Market schließen (reduce-only, ohne Builder-Code)."""
+        coin = coin_of(coin)
+        psz = self.position_size(coin)
+        if abs(psz) == 0:
+            return {"ok": True, "closed": 0.0}
+        try:
+            raw = self.exchange.market_close(coin)
+            ok = isinstance(raw, dict) and raw.get("status") == "ok"
+            return {"ok": ok, "closed": abs(psz), "raw": raw}
+        except Exception as e:
+            log.warning("market_close(%s): %s", coin, e)
+            return {"ok": False, "closed": 0.0, "error": str(e)}

@@ -24,6 +24,15 @@
   .foot{color:#5e756b;font-size:11px;text-align:center;margin-top:26px;line-height:1.6}
   .avatar{width:32px;height:32px;border-radius:50%;border:2px solid #10b981;vertical-align:middle;margin-right:8px}
   .discord-user{display:flex;align-items:center;font-weight:700;font-size:15px}
+  .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .stat{flex:1;min-width:150px;background:#0f1714;border:1px solid #1e2a24;border-radius:12px;padding:16px}
+  .stat-h{color:#7f9a90;font-size:11px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:8px}
+  .stat-v{font-size:26px;font-weight:800;line-height:1.1}
+  .pos{color:#3fe0a0} .neg{color:#ff8a8a}
+  .tf{display:inline-flex;gap:2px;background:#0a100d;border-radius:8px;padding:2px;margin-bottom:10px}
+  .tfbtn{background:transparent;color:#7f9a90;border:0;border-radius:6px;padding:3px 9px;font-size:11px;font-weight:700;cursor:pointer;margin:0}
+  .tfbtn.on{background:#10b981;color:#04120c}
+  #chart{width:100%;height:170px;display:block}
 </style></head>
 <body><div class="wrap">
   <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill on">testnet</span></h1>
@@ -62,6 +71,29 @@
 
   <!-- APP -->
   <div id="app" class="hide">
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-h">$ Total PnL</div>
+        <div class="tf">
+          <button class="tfbtn" data-d="1">24H</button>
+          <button class="tfbtn" data-d="7">7D</button>
+          <button class="tfbtn on" data-d="30">30D</button>
+          <button class="tfbtn" data-d="0">All</button>
+        </div>
+        <div id="statpnl" class="stat-v">—</div>
+      </div>
+      <div class="stat"><div class="stat-h">✓ Win Rate</div><div id="statwin" class="stat-v">—</div>
+        <div class="mut" id="stattrades">—</div></div>
+      <div class="stat"><div class="stat-h">▦ Active Trades</div><div id="statact" class="stat-v">—</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Cumulative PnL Performance</h2>
+      <svg id="chart" viewBox="0 0 600 170" preserveAspectRatio="none"></svg>
+      <div class="mut" id="chartempty" style="display:none">No closed trades in this period yet.</div>
+    </div>
+
     <div class="card">
       <h2>Account</h2>
       <div class="row">
@@ -119,6 +151,12 @@
     </div>
 
     <div class="card">
+      <h2>Recent History</h2>
+      <table id="histtbl"><thead><tr><th>Date</th><th>Asset</th><th>Direction</th><th>Price</th><th>PnL</th></tr></thead><tbody></tbody></table>
+      <div class="mut" id="histempty">No trades yet.</div>
+    </div>
+
+    <div class="card">
       <h2>Bot Activity</h2>
       <table id="acttbl"><thead><tr><th>Time</th><th>Type</th><th>Info</th></tr></thead><tbody></tbody></table>
       <div class="mut" id="actempty">No activity yet.</div>
@@ -140,6 +178,63 @@ async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_addre
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
 async function approveBuilder(){try{await api("POST","/api/builder-approved");show(bmsg,"Thank you — referral confirmed ✓","ok");load()}catch(e){show(bmsg,e.message,"err")}}
 async function toggleBot(){try{const me=await api("GET","/api/me");await api("PUT","/api/settings",{bot_active:!me.bot_active});load()}catch(e){alert(e.message)}}
+let STATS=null, TF=30;
+function fmtUsd(v){return (v>=0?"+$":"−$")+Math.abs(v).toFixed(2)}
+function seriesFor(days){
+  const s=(STATS&&STATS.pnl_series)||[];
+  if(!s.length) return {pts:[],total:0};
+  if(days===0) return {pts:s.slice(),total:s[s.length-1].cum};
+  const start=Date.now()-days*86400000;
+  let base=0; const inWin=[];
+  for(const p of s){ if(p.t<start) base=p.cum; else inWin.push(p); }
+  const last=inWin.length?inWin[inWin.length-1].cum:base;
+  return {pts:[{t:start,cum:base}].concat(inWin),total:+(last-base).toFixed(2)};
+}
+function drawChart(pts){
+  const svg=document.getElementById("chart"), empty=document.getElementById("chartempty");
+  if(!pts||pts.length<2){svg.innerHTML="";svg.style.display="none";empty.style.display="block";return;}
+  svg.style.display="block";empty.style.display="none";
+  const W=600,H=170,pad=8;
+  const xs=pts.map(p=>p.t), ys=pts.map(p=>p.cum);
+  const minX=Math.min.apply(null,xs),maxX=Math.max.apply(null,xs);
+  let minY=Math.min.apply(null,ys.concat([0])),maxY=Math.max.apply(null,ys.concat([0]));
+  if(minY===maxY){maxY=minY+1;minY=minY-1;}
+  const sx=t=>pad+(W-2*pad)*((t-minX)/((maxX-minX)||1));
+  const sy=v=>pad+(H-2*pad)*(1-((v-minY)/((maxY-minY)||1)));
+  const line=pts.map((p,i)=>(i?"L":"M")+sx(p.t).toFixed(1)+" "+sy(p.cum).toFixed(1)).join(" ");
+  const area=line+" L "+sx(maxX).toFixed(1)+" "+(H-pad).toFixed(1)+" L "+sx(minX).toFixed(1)+" "+(H-pad).toFixed(1)+" Z";
+  const zeroY=sy(0).toFixed(1);
+  svg.innerHTML='<defs><linearGradient id="gpnl" x1="0" y1="0" x2="0" y2="1">'+
+    '<stop offset="0" stop-color="#10b981" stop-opacity="0.32"/>'+
+    '<stop offset="1" stop-color="#10b981" stop-opacity="0"/></linearGradient></defs>'+
+    '<line x1="0" y1="'+zeroY+'" x2="'+W+'" y2="'+zeroY+'" stroke="#26342d" stroke-width="1" stroke-dasharray="4 4"/>'+
+    '<path d="'+area+'" fill="url(#gpnl)"/>'+
+    '<path d="'+line+'" fill="none" stroke="#10b981" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
+}
+function renderStats(){
+  if(!STATS) return;
+  document.getElementById("statwin").textContent=(STATS.win_rate||0)+"%";
+  document.getElementById("stattrades").textContent=(STATS.closed_trades||0)+" closed trades";
+  document.getElementById("statact").textContent=STATS.active_trades||0;
+  const w=seriesFor(TF);
+  const el=document.getElementById("statpnl");
+  el.textContent=fmtUsd(w.total); el.className="stat-v "+(w.total>=0?"pos":"neg");
+  drawChart(w.pts);
+  const hb=document.querySelector("#histtbl tbody");hb.innerHTML="";
+  (STATS.recent||[]).forEach(function(r){
+    const cls=/long/i.test(r.dir||"")?"on":(/short/i.test(r.dir||"")?"off":"");
+    const dir='<span class="pill '+cls+'">'+((r.dir||"—").toUpperCase())+'</span>';
+    const pc=r.pnl>0?"pos":(r.pnl<0?"neg":"mut");
+    const date=new Date(r.t).toLocaleString();
+    hb.insertAdjacentHTML("beforeend","<tr><td class=\"mut\">"+date+"</td><td><b>"+(r.coin||"")+"</b></td><td>"+dir+"</td><td>$"+r.px+"</td><td class=\""+pc+"\">"+(r.pnl>0?"+":"")+r.pnl.toFixed(2)+"</td></tr>");
+  });
+  document.getElementById("histempty").style.display=(STATS.recent||[]).length?"none":"block";
+}
+document.querySelectorAll(".tfbtn").forEach(function(b){b.onclick=function(){
+  TF=+b.dataset.d;
+  document.querySelectorAll(".tfbtn").forEach(function(x){x.classList.remove("on")});
+  b.classList.add("on"); renderStats();
+}});
 async function load(){
   try{const d=await api("GET","/api/dashboard");
     auth.classList.add("hide");app.classList.remove("hide");
@@ -167,12 +262,17 @@ async function load(){
     const ab=document.querySelector("#acttbl tbody");ab.innerHTML="";
     d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${a.ts.replace("T"," ")}</td><td>${a.kind}</td><td>${a.text}</td></tr>`)});
     actempty.style.display=d.activity.length?"none":"block";
+    STATS=d.stats||null; renderStats();
   }catch(e){localStorage.removeItem("ght")}
 }
 // Handle Discord OAuth redirect params
 (function(){
   const p=new URLSearchParams(location.search);
-  const tok=p.get("token");
+  // Token kommt jetzt im URL-Fragment (#token=…) — Fragmente gehen nie an den Server (keine Log-Leaks)
+  let tok=null;
+  if(location.hash && location.hash.indexOf("token=")>=0){
+    tok=new URLSearchParams(location.hash.replace(/^#/,"")).get("token");
+  }
   const err=p.get("error");
   if(tok){
     localStorage.setItem("ght",tok);

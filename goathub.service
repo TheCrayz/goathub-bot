@@ -1,0 +1,16 @@
+[Unit]
+Description=GoatHub Trading Bot (Multi-User Plattform)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/goathub-bot
+ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

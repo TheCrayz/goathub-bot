@@ -123,8 +123,9 @@ async def discord_callback(code: str = None, error: str = None, db: Session = De
             db.commit()
 
         jwt_token = make_token(u.id)
-        # Redirect to dashboard with token in URL fragment (not logged, not in server logs)
-        return RedirectResponse(f"/?token={jwt_token}")
+        # Token im URL-FRAGMENT (#) — Fragmente werden NICHT an den Server gesendet,
+        # landen also nicht in Access-Logs/Proxys/Referer. (vorher ?token= = Leak-Risiko)
+        return RedirectResponse(f"/#token={jwt_token}")
 
     except Exception as e:
         log.error(f"Discord OAuth error: {e}")
@@ -155,9 +156,9 @@ def me(u: User = Depends(current_user)):
 @app.put("/api/settings")
 def update_settings(body: SettingsIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
     if body.risk_pct is not None:
-        u.risk_pct = max(0.001, min(0.5, body.risk_pct))
+        u.risk_pct = max(0.001, min(0.05, body.risk_pct))   # max 5% Risiko/Trade (war 50%)
     if body.leverage is not None:
-        u.leverage = max(1, min(50, body.leverage))
+        u.leverage = max(1, min(20, body.leverage))          # max 20x Hebel (war 50x)
     if body.max_open_positions is not None:
         u.max_open_positions = max(1, min(50, body.max_open_positions))
     if body.capital_cap_usdc is not None:
@@ -175,8 +176,17 @@ def set_wallet(body: WalletIn, u: User = Depends(current_user), db: Session = De
     from app.crypto import encrypt
     addr = body.hl_account_address.strip()
     sec = body.hl_api_secret.strip()
-    if not addr.startswith("0x") or len(addr) < 20 or not sec:
-        raise HTTPException(400, "Valid MASTER address (0x...) + Agent Key required")
+    # MASTER-Adresse: 0x + 40 Hex = 42 Zeichen
+    if not addr.startswith("0x") or len(addr) != 42:
+        raise HTTPException(400, "MASTER address must be 0x + 40 chars (42 total). That's the public address, not the key.")
+    # Agent-Key SOFORT validieren (sonst scheitert es erst beim Trade — der häufigste Fehler!)
+    try:
+        from eth_account import Account
+        agent_addr = Account.from_key(sec).address
+    except Exception:
+        raise HTTPException(400, "Invalid Agent key. It must be the long private key (0x + 64 chars = 66 total) — NOT an address.")
+    if agent_addr.lower() == addr.lower():
+        raise HTTPException(400, "This key belongs to the MASTER address. You need the separate AGENT key (from the API-wallet 'Generate' box).")
     u.hl_account_address = addr
     u.hl_api_secret_enc = encrypt(sec)
     db.commit()
@@ -193,7 +203,7 @@ def mark_builder_approved(u: User = Depends(current_user), db: Session = Depends
 
 # ── Dashboard-Daten (Live-PNL/Positionen + Aktivität) ────────────────────────
 def _snapshot(address: str):
-    """Read-only Konto-Snapshot über die Info-API (kein Key nötig)."""
+    """Read-only Konto-Snapshot + PnL-Statistik über die Info-API (kein Key nötig)."""
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
     info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
@@ -211,22 +221,53 @@ def _snapshot(address: str):
         if abs(float(pos.get("szi", 0) or 0)) > 0:
             positions.append({"coin": pos.get("coin"), "size": pos.get("szi"),
                               "entry": pos.get("entryPx"), "uPnl": pos.get("unrealizedPnl")})
-    return {"balance": round(bal, 2), "positions": positions}
+    # PnL-Statistik aus realisierten Fills (Total PnL, Win-Rate, Verlauf, History)
+    stats = {"total_pnl": 0.0, "win_rate": 0, "closed_trades": 0,
+             "active_trades": len(positions), "pnl_series": [], "recent": []}
+    try:
+        fills = info.user_fills(address) or []
+        fills.sort(key=lambda f: f.get("time", 0))
+        cum = 0.0
+        closed = wins = 0
+        series = []
+        for f in fills:
+            pnl = float(f.get("closedPnl", 0) or 0)
+            cum += pnl
+            if pnl != 0:
+                closed += 1
+                wins += 1 if pnl > 0 else 0
+                series.append({"t": int(f.get("time", 0) or 0), "cum": round(cum, 2)})
+        stats["total_pnl"] = round(cum, 2)
+        stats["closed_trades"] = closed
+        stats["win_rate"] = round(100 * wins / closed) if closed else 0
+        stats["pnl_series"] = series
+        stats["recent"] = [
+            {"t": int(f.get("time", 0) or 0), "coin": f.get("coin"), "dir": f.get("dir"),
+             "px": f.get("px"), "pnl": round(float(f.get("closedPnl", 0) or 0), 2)}
+            for f in reversed(fills[-15:])
+        ]
+    except Exception as e:
+        log.warning("stats failed: %s", e)
+    return {"balance": round(bal, 2), "positions": positions, "stats": stats}
 
 
 @app.get("/api/dashboard")
 def dashboard(u: User = Depends(current_user), db: Session = Depends(get_db)):
     acct = {"balance": None, "positions": []}
+    stats = {"total_pnl": 0.0, "win_rate": 0, "closed_trades": 0,
+             "active_trades": 0, "pnl_series": [], "recent": []}
     if u.hl_account_address:
         try:
-            acct = _snapshot(u.hl_account_address)
+            snap = _snapshot(u.hl_account_address)
+            acct = {"balance": snap["balance"], "positions": snap["positions"]}
+            stats = snap["stats"]
         except Exception as e:
             log.warning("snapshot failed: %s", e)
     rows = (db.query(Activity).filter(Activity.user_id == u.id)
             .order_by(Activity.id.desc()).limit(30).all())
     activity = [{"ts": a.ts.isoformat(timespec="seconds") if a.ts else "", "kind": a.kind, "text": a.text}
                 for a in rows]
-    return {"user": _user_public(u), "account": acct, "activity": activity,
+    return {"user": _user_public(u), "account": acct, "stats": stats, "activity": activity,
             "net": "testnet" if config.HL_TESTNET else "mainnet",
             "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE}}
 

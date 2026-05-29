@@ -36,5 +36,22 @@ class Activity(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True)
     ts = Column(DateTime, default=datetime.datetime.utcnow)
-    kind = Column(String)            # signal | order | skip | error
+    kind = Column(String)            # signal | order | update | close | skip | error
     text = Column(Text)
+
+
+class ManagedTrade(Base):
+    """Ein laufend verwalteter Trade pro Nutzer+Coin (NEW -> UPDATE -> CLOSE)."""
+    __tablename__ = "managed_trades"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    coin = Column(String, index=True, nullable=False)   # Basis-Coin, z.B. "ETH"
+    direction = Column(String, default="")              # LONG | SHORT
+    entry = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    take_profits = Column(Text, default="")             # JSON: [[px, percent], ...]
+    status = Column(String, default="resting")          # resting | open | closed
+    resting_oid = Column(String, nullable=True)
+    signal_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)

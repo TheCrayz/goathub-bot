@@ -35,8 +35,13 @@ def _i(n, d):
 
 
 DATABASE_URL = _g("DATABASE_URL", "sqlite:///./goathub.db")
-JWT_SECRET = _g("JWT_SECRET", "dev-insecure-change-me")
-JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 720)
+JWT_SECRET = _g("JWT_SECRET", "")
+if not JWT_SECRET or JWT_SECRET == "dev-insecure-change-me":
+    raise RuntimeError(
+        "JWT_SECRET fehlt oder ist der unsichere Default. In der .env setzen, z.B.:\n"
+        "  JWT_SECRET=$(openssl rand -hex 32)\n"
+        "Ohne sicheres Secret sind alle Login-Tokens fälschbar (Account-Übernahme).")
+JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 168)   # 7 Tage statt 30 (kürzere Token-Lebensdauer)
 ENCRYPTION_KEY = _g("ENCRYPTION_KEY")        # Fernet-Key; nötig zum Speichern der HL-Agent-Keys
 
 # Hyperliquid
@@ -62,7 +67,7 @@ ENTRY_POLL_S = _i("ENTRY_POLL_S", 6)
 
 # Discord OAuth2
 DISCORD_CLIENT_ID = _g("DISCORD_CLIENT_ID", "1508987342482837524")
-DISCORD_CLIENT_SECRET = _g("DISCORD_CLIENT_SECRET", "<REDACTED-secret-rotated-2026-05>")
+DISCORD_CLIENT_SECRET = _g("DISCORD_CLIENT_SECRET", "")   # NUR aus .env — niemals im Code (Secret rotieren!)
 DISCORD_REDIRECT_URI = _g("DISCORD_REDIRECT_URI", "https://bot.goathub.network/auth/callback")
 DISCORD_REQUIRED_ROLE_ID = _g("DISCORD_REQUIRED_ROLE_ID", "1481638494706204732")
 DISCORD_GUILD_ID = _g("DISCORD_GUILD_ID", "")  # filled via .env
