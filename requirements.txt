@@ -1,16 +1,21 @@
-# Core (für API + Dashboard; reicht für localhost-Test)
-fastapi
-uvicorn[standard]
-sqlalchemy>=2.0
-pydantic>=2
-bcrypt
-python-jose[cryptography]
-cryptography
-python-dotenv
-httpx
-slowapi
+# Core (für API + Dashboard; reicht für localhost-Test).
+# Phase 2 (2026-06-02): hart gepinnt. Vorher waren die meisten Pakete
+# unpinned — jeder Re-Install hätte still die Versionen drehen können.
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+sqlalchemy==2.0.50
+pydantic==2.13.4
+bcrypt==5.0.0
+python-jose[cryptography]==3.5.0
+cryptography==48.0.0
+python-dotenv==1.2.2
+httpx==0.28.1
+slowapi==0.1.9
 
 # Live-Trading (Listener + Engine) — nur auf dem Server nötig:
-discord.py>=2.5.2
-audioop-lts; python_version >= "3.13"
-hyperliquid-python-sdk>=0.9.0
+discord.py==2.7.1
+audioop-lts==0.2.2; python_version >= "3.13"
+hyperliquid-python-sdk==0.23.0
+
+# Tests (CI + lokal):
+pytest>=8.0

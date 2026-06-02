@@ -114,9 +114,14 @@
     <div class="card">
       <h2>1. Connect Hyperliquid Wallet</h2>
       <div class="mut">MASTER address (public) + <b>Agent Key</b> (no withdrawal rights). Status: <b id="wstat">not connected</b></div>
-      <label>MASTER Address (0x…)</label><input id="addr" placeholder="0x…">
-      <label>Agent Private Key</label><input id="sec" type="password" placeholder="0x…">
-      <button onclick="saveWallet()">Save Wallet</button>
+      <label>MASTER Address (0x…) <span id="addrlen" class="mut" style="float:right;font-family:monospace">0 / 42</span></label>
+      <input id="addr" placeholder="0x…">
+      <label>Agent Private Key <span id="seclen" class="mut" style="float:right;font-family:monospace">0 / 66</span></label>
+      <input id="sec" type="password" placeholder="0x…">
+      <div class="mut" style="margin-top:6px;font-size:11px">
+        <b>Tipp:</b> Die <i>Adresse</i> hat 42 Zeichen (kurz), der <i>Agent-Key</i> 66 (lang, aus der roten "API-Wallet generate"-Box). Verwechseln = häufigster Fehler.
+      </div>
+      <button id="savewalletbtn" onclick="saveWallet()">Save Wallet</button>
       <div class="msg" id="wmsg"></div>
     </div>
 
@@ -178,7 +183,26 @@ async function api(m,u,b){const o={method:m,headers:b?H():{"Authorization":"Bear
 async function register(){try{const d=await api("POST","/api/register",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
 async function login(){try{const d=await api("POST","/api/login",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
 async function logout(){try{await fetch("/api/logout",{method:"POST",headers:{"Authorization":"Bearer "+T()}})}catch(e){}localStorage.removeItem("ght");location.reload()}
-async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_address:addr.value,hl_api_secret:sec.value});show(wmsg,"Wallet saved ✓","ok");sec.value="";load()}catch(e){show(wmsg,e.message,"err")}}
+async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_address:addr.value,hl_api_secret:sec.value});show(wmsg,"Wallet saved ✓","ok");sec.value="";updateWalletLens();load()}catch(e){show(wmsg,e.message,"err")}}
+// Phase 2 (2026-06-02): live length indicators on the wallet form. The
+// address-in-key-field bug ate ~3 testers (users 3, 4, 6) — none knew
+// which 0x-string went where. Now they see "42 / 42 ✓" or "20 / 66 ✗"
+// as they type, and Save is disabled until both lengths match.
+function updateWalletLens(){
+  const al=addr.value.length, sl=sec.value.length;
+  const aok=al===42, sok=sl===66;
+  const ael=document.getElementById("addrlen"), sel=document.getElementById("seclen");
+  ael.textContent=al+" / 42 "+(aok?"✓":""); ael.style.color=al===0?"":(aok?"#3fe0a0":"#ff8a8a");
+  sel.textContent=sl+" / 66 "+(sok?"✓":""); sel.style.color=sl===0?"":(sok?"#3fe0a0":"#ff8a8a");
+  const btn=document.getElementById("savewalletbtn");
+  if(btn){btn.disabled=!(aok&&sok); btn.style.opacity=(aok&&sok)?"1":"0.5"; btn.style.cursor=(aok&&sok)?"pointer":"not-allowed";}
+}
+// attach as soon as inputs exist
+document.addEventListener("DOMContentLoaded",function(){
+  if(addr){addr.addEventListener("input",updateWalletLens);}
+  if(sec){sec.addEventListener("input",updateWalletLens);}
+  updateWalletLens();
+});
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
 async function approveBuilder(){try{await api("POST","/api/builder-approved");show(bmsg,"Thank you — referral confirmed ✓","ok");load()}catch(e){show(bmsg,e.message,"err")}}
 async function toggleBot(){try{const me=await api("GET","/api/me");await api("PUT","/api/settings",{bot_active:!me.bot_active});load()}catch(e){alert(e.message)}}

@@ -294,21 +294,50 @@ def _snapshot(address: str):
             positions.append({"coin": pos.get("coin"), "size": pos.get("szi"),
                               "entry": pos.get("entryPx"), "uPnl": pos.get("unrealizedPnl")})
     # PnL-Statistik aus realisierten Fills (Total PnL, Win-Rate, Verlauf, History)
+    # Phase 2 (2026-06-02): Win-Rate auf TRADE-EVENTS basieren, nicht auf einzelnen
+    # closing-Fills. Eine Position schließt oft in mehreren Partial-Fills (z. B. BTC
+    # in 11 partial-fills @ 14:19); vorher zählten die als 11 separate Trades →
+    # Win-Rate 47 % statt tatsächlich 36 %. Wir clustern jetzt nach
+    # (coin, side, ≤60s Zeitfenster) zu echten Trade-Events.
     stats = {"total_pnl": 0.0, "win_rate": 0, "closed_trades": 0,
              "active_trades": len(positions), "pnl_series": [], "recent": []}
     try:
         fills = info.user_fills(address) or []
         fills.sort(key=lambda f: f.get("time", 0))
+
+        # 1) pnl_series + cum: pro fill (granular für Chart-Verlauf, OK)
         cum = 0.0
-        closed = wins = 0
         series = []
         for f in fills:
             pnl = float(f.get("closedPnl", 0) or 0)
             cum += pnl
             if pnl != 0:
-                closed += 1
-                wins += 1 if pnl > 0 else 0
                 series.append({"t": int(f.get("time", 0) or 0), "cum": round(cum, 2)})
+
+        # 2) Echte Trade-Events: cluster nach (coin, side) innerhalb 60s.
+        events = []
+        current = None
+        for f in fills:
+            pnl = float(f.get("closedPnl", 0) or 0)
+            if pnl == 0:
+                continue  # Open-fills überspringen
+            t = int(f.get("time", 0) or 0)
+            coin = f.get("coin")
+            d = (f.get("dir") or "")
+            side = "Long" if "Long" in d else ("Short" if "Short" in d else "?")
+            key = (coin, side)
+            if current and current["key"] == key and t - current["t_last"] <= 60_000:
+                current["pnl"] += pnl
+                current["t_last"] = t
+            else:
+                if current is not None:
+                    events.append(current)
+                current = {"key": key, "t": t, "t_last": t, "pnl": pnl}
+        if current is not None:
+            events.append(current)
+
+        closed = len(events)
+        wins = sum(1 for e in events if e["pnl"] > 0)
         stats["total_pnl"] = round(cum, 2)
         stats["closed_trades"] = closed
         stats["win_rate"] = round(100 * wins / closed) if closed else 0
