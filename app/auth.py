@@ -52,10 +52,19 @@ def verify_pw(p: str, h: str) -> bool:
 
 def make_token(uid: int, token_version: int = 0) -> str:
     """JWT minten. `token_version` mit-einbacken, damit Logout/Pw-Change alle
-    alten Tokens unbrauchbar machen kann (Phase 1, 2026-06-02)."""
-    exp = datetime.datetime.utcnow() + datetime.timedelta(hours=config.JWT_EXPIRE_HOURS)
+    alten Tokens unbrauchbar machen kann (Phase 1, 2026-06-02).
+    Phase 6 (2026-06-02): datetime.now(timezone.utc) statt deprecated utcnow().
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    exp = now + datetime.timedelta(hours=config.JWT_EXPIRE_HOURS)
     return jwt.encode(
-        {"sub": str(uid), "exp": exp, "tv": int(token_version)},
+        {
+            "sub": str(uid),
+            "exp": exp,
+            "iat": now,                                   # Phase 6: issued-at
+            "jti": __import__("secrets").token_hex(8),    # Phase 6: unique token id
+            "tv": int(token_version),
+        },
         config.JWT_SECRET,
         algorithm="HS256",
     )

@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GoatHub Trading Bot</title>
+<!-- Phase 6 (2026-06-02): favicon via emoji (no extra file needed). -->
+<link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22&gt;&lt;text y=%22.9em%22 font-size=%2290%22&gt;🐐&lt;/text&gt;&lt;/svg&gt;">
 <style>
   *{box-sizing:border-box} body{margin:0;background:#0b0f0d;color:#e6f2ec;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   .wrap{max-width:880px;margin:0 auto;padding:24px}
@@ -60,8 +62,8 @@
         <span style="font-size:10px">▶</span> Email / Password (Legacy)
       </summary>
       <div style="margin-top:10px">
-        <label>Email</label><input id="email" type="email" placeholder="you@mail.com">
-        <label>Password</label><input id="pw" type="password" placeholder="min. 6 chars">
+        <label>Email</label><input id="email" type="email" autocomplete="email" placeholder="you@mail.com">
+        <label>Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="min. 6 chars">
         <div class="row"><div><button onclick="login()">Login</button></div>
           <div><button class="ghost" onclick="register()">Register</button></div></div>
         <div class="msg" id="authmsg"></div>
@@ -209,11 +211,20 @@ async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_addre
 // which 0x-string went where. Now they see "42 / 42 ✓" or "20 / 66 ✗"
 // as they type, and Save is disabled until both lengths match.
 function updateWalletLens(){
-  const al=addr.value.length, sl=sec.value.length;
-  const aok=al===42, sok=sl===66;
+  const av=addr.value.trim(), sv=sec.value.trim();
+  const al=av.length, sl=sv.length;
+  // Phase 6 (2026-06-02): also check 0x prefix — common copy-paste mistake.
+  const aPrefix=av.startsWith("0x"), sPrefix=sv.startsWith("0x");
+  const aok=al===42 && aPrefix, sok=sl===66 && sPrefix;
   const ael=document.getElementById("addrlen"), sel=document.getElementById("seclen");
-  ael.textContent=al+" / 42 "+(aok?"✓":""); ael.style.color=al===0?"":(aok?"#3fe0a0":"#ff8a8a");
-  sel.textContent=sl+" / 66 "+(sok?"✓":""); sel.style.color=sl===0?"":(sok?"#3fe0a0":"#ff8a8a");
+  let aMsg=al+" / 42";
+  if(al===42 && !aPrefix) aMsg += " ✗ braucht 0x-Prefix";
+  else if(aok) aMsg += " ✓";
+  ael.textContent=aMsg; ael.style.color=al===0?"":(aok?"#3fe0a0":"#ff8a8a");
+  let sMsg=sl+" / 66";
+  if(sl===66 && !sPrefix) sMsg += " ✗ braucht 0x-Prefix";
+  else if(sok) sMsg += " ✓";
+  sel.textContent=sMsg; sel.style.color=sl===0?"":(sok?"#3fe0a0":"#ff8a8a");
   const btn=document.getElementById("savewalletbtn");
   if(btn){btn.disabled=!(aok&&sok); btn.style.opacity=(aok&&sok)?"1":"0.5"; btn.style.cursor=(aok&&sok)?"pointer":"not-allowed";}
 }
@@ -322,6 +333,8 @@ async function load(){
     const s=d.user.settings; risk.value=s.risk_pct;lev.value=s.leverage;maxp.value=s.max_open_positions;cap.value=s.capital_cap_usdc;
     baddr.textContent=(d.builder&&d.builder.address)||"(not set)"; bfee.textContent=(d.builder&&d.builder.fee)||"—";
     const ba=d.user.builder_approved; bstat.textContent=ba?"confirmed":"not confirmed"; bstat.className="pill "+(ba?"on":"off");
+    // Phase 6 (2026-06-02): hide "confirm"-button wenn schon bestätigt; zeige stattdessen "Re-verify".
+    const bbtn=document.getElementById("bbtn"); if(bbtn){bbtn.textContent=ba?"Re-verify on-chain":"Builder fee approved — confirm";}
     const pb=document.querySelector("#postbl tbody");pb.innerHTML="";
     (d.account.positions||[]).forEach(p=>{pb.insertAdjacentHTML("beforeend",`<tr><td>${esc(p.coin)}</td><td>${esc(p.size)}</td><td>${esc(p.entry)}</td><td>${esc(p.uPnl)}</td></tr>`)});
     posempty.style.display=(d.account.positions||[]).length?"none":"block";

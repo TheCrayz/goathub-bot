@@ -149,6 +149,164 @@ def admin_activity(
     } for a in rows]
 
 
+@router.get("/trades")
+def admin_trades(
+    user_id: int | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(current_admin_user),
+):
+    """Managed-Trades drill-down view. Filter optional."""
+    q = db.query(ManagedTrade)
+    if user_id is not None:
+        q = q.filter(ManagedTrade.user_id == user_id)
+    if status:
+        q = q.filter(ManagedTrade.status == status)
+    rows = q.order_by(ManagedTrade.id.desc()).limit(max(1, min(limit, 500))).all()
+    out = []
+    for t in rows:
+        try:
+            tps = (
+                [{"price": p, "percent": pct} for p, pct in __import__("json").loads(t.take_profits or "[]")]
+                if t.take_profits else []
+            )
+        except Exception:
+            tps = []
+        out.append({
+            "id": t.id,
+            "user_id": t.user_id,
+            "coin": t.coin,
+            "direction": t.direction,
+            "entry": t.entry,
+            "stop_loss": t.stop_loss,
+            "take_profits": tps,
+            "status": t.status,
+            "signal_id": t.signal_id,
+            "created_at": t.created_at.isoformat(timespec="seconds") if t.created_at else None,
+            "updated_at": t.updated_at.isoformat(timespec="seconds") if t.updated_at else None,
+        })
+    return out
+
+
+@router.get("/cost")
+def admin_cost(_: User = Depends(current_admin_user)):
+    """Gemini-API-Cost-Indikatoren aus den Signal-bot Cycle-Logs.
+    Liest die letzten N CYCLE-COMPLETE-Zeilen aus der signal-bot bot_logs Tabelle
+    und parst die strukturierten Werte (processed/hold/signals/...).
+    """
+    import re
+    import sqlite3
+    sb_db = os.getenv(
+        "SIGNALBOT_DB_PATH",
+        "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/charthub.db",
+    )
+    out = {
+        "signalbot_db_found": os.path.exists(sb_db),
+        "cycles": [],
+        "estimates": {},
+        "error": None,
+    }
+    if not os.path.exists(sb_db):
+        out["error"] = f"signal-bot DB not at {sb_db}"
+        return out
+    try:
+        con = sqlite3.connect(f"file:{sb_db}?mode=ro", uri=True, timeout=2)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT timestamp, message FROM bot_logs "
+            "WHERE message LIKE 'CYCLE COMPLETE:%' "
+            "ORDER BY id DESC LIMIT 50"
+        )
+        rows = cur.fetchall()
+        con.close()
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        return out
+
+    rx = re.compile(
+        r"processed=(\d+)\s+hold=(\d+)\s+signals=(\d+)\s+\(new=(\d+)\s+upd=(\d+)\s+cancel=(\d+)\)"
+        r"\s+ai_skip=(\d+)\s+ai_timeout=(\d+)\s+scrape_fail=(\d+)\s+scrape_timeout=(\d+)"
+    )
+    for ts, msg in rows:
+        m = rx.search(msg or "")
+        if not m:
+            continue
+        p, h, s, nw, up, ca, sk, to, sf, st = map(int, m.groups())
+        out["cycles"].append({
+            "ts": ts,
+            "processed": p, "hold": h, "signals_total": s,
+            "new_trade": nw, "update_trade": up, "cancel_trade": ca,
+            "ai_skip": sk, "ai_timeout": to,
+            "scrape_fail": sf, "scrape_timeout": st,
+            "pro_calls_estimate": s + sk,  # rough — escalated to Pro then succeeded or failed
+        })
+
+    # Aggregierte Schätzung über die letzten N Cycles
+    if out["cycles"]:
+        n = len(out["cycles"])
+        total_flash = sum(c["processed"] for c in out["cycles"])  # je Cycle = 1 Flash/Coin
+        total_pro = sum(c["pro_calls_estimate"] for c in out["cycles"])
+        # Kosten-Schätzung mit thinking_budget=0 (Flash) und =1024 (Pro), siehe vision.py Header
+        cost_flash = total_flash * 0.001        # ~$0.001 / call (no thinking)
+        cost_pro = total_pro * 0.02             # ~$0.02 / call (thinking capped at 1024)
+        out["estimates"] = {
+            "cycles_sampled": n,
+            "flash_calls_total": total_flash,
+            "pro_calls_total_est": total_pro,
+            "usd_total_est": round(cost_flash + cost_pro, 2),
+            "usd_per_cycle_avg": round((cost_flash + cost_pro) / max(1, n), 4),
+            "usd_per_week_extrapolated": round((cost_flash + cost_pro) / max(1, n) * 168, 2),  # 1 cycle/h × 168h
+            "note": "Estimate based on thinking_budget=0 Flash + 1024 Pro. Actual: check Google Cloud Billing.",
+        }
+    return out
+
+
+@router.get("/per-coin")
+def admin_per_coin(_: User = Depends(current_admin_user), db: Session = Depends(get_db)):
+    """Per-Coin Win/Loss-Statistik je aktivem User aus HL-Fills (cached via engine._per_coin_stats).
+    Auch zeigt, welche Coins der per-coin-Filter aktuell blockt."""
+    from app import config
+    from app.engine import _per_coin_stats
+    users = db.query(User).filter(User.bot_active.is_(True)).all()
+    out = []
+    for u in users:
+        if not u.hl_account_address:
+            continue
+        # Standard-Coins die wir handeln (aus dem signal-bot)
+        common = ["BTC", "ETH", "SOL", "BNB", "AVAX", "DOGE", "ADA", "NEAR", "ATOM",
+                  "APT", "ARB", "OP", "TIA", "SUI", "INJ", "AAVE"]
+        u_out = {
+            "user_id": u.id,
+            "username": u.discord_username or u.email,
+            "address_short": (u.hl_account_address[:6] + ".." + u.hl_account_address[-4:]),
+            "coins": [],
+        }
+        for coin in common:
+            try:
+                stats = _per_coin_stats(u.hl_account_address, coin)
+            except Exception:
+                stats = None
+            if stats and stats["trades"] > 0:
+                blocked = (
+                    stats["trades"] >= config.PERCOIN_MIN_TRADES
+                    and stats["win_rate"] < config.PERCOIN_MIN_WINRATE
+                )
+                u_out["coins"].append({
+                    "coin": coin,
+                    "trades": stats["trades"],
+                    "wins": stats["wins"],
+                    "win_rate": round(stats["win_rate"], 3),
+                    "blocked": blocked,
+                })
+        out.append(u_out)
+    return {
+        "min_trades_required": config.PERCOIN_MIN_TRADES,
+        "min_winrate": config.PERCOIN_MIN_WINRATE,
+        "users": out,
+    }
+
+
 @router.get("/health")
 def admin_health(_: User = Depends(current_admin_user)):
     """Live-Health beider Bots: signal-bot (Docker) + goathub (this).

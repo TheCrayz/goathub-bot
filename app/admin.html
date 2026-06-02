@@ -57,6 +57,49 @@
       </tr><tbody></tbody></thead></table>
     </div>
 
+    <!-- Cost -->
+    <div class="card">
+      <h2>API Cost — Signal-bot (Gemini)</h2>
+      <div class="stats">
+        <div class="stat"><div class="stat-h">Cycles sampled</div><div class="stat-v" id="c-cycles">—</div></div>
+        <div class="stat"><div class="stat-h">Flash calls (total)</div><div class="stat-v" id="c-flash">—</div></div>
+        <div class="stat"><div class="stat-h">Pro calls est. (total)</div><div class="stat-v" id="c-pro">—</div></div>
+        <div class="stat"><div class="stat-h">USD / cycle (avg)</div><div class="stat-v" id="c-cyclecost">—</div></div>
+        <div class="stat"><div class="stat-h">USD / week (extrapol.)</div><div class="stat-v" id="c-weekcost">—</div></div>
+      </div>
+      <div class="mut" style="font-size:11px" id="c-note">Estimate; real cost via Google Cloud Billing.</div>
+      <div style="overflow-x:auto;margin-top:8px"><table id="ctbl"><thead><tr>
+        <th>ts</th><th>processed</th><th>hold</th><th>signals (new/upd/cancel)</th>
+        <th>pro est.</th><th>ai_skip</th><th>scrape_fail</th>
+      </tr><tbody></tbody></thead></table></div>
+    </div>
+
+    <!-- Trades -->
+    <div class="card">
+      <h2>Managed Trades (last 100)</h2>
+      <div class="row" style="margin-bottom:10px">
+        <span class="mut">Filter:</span>
+        <button class="ghost" onclick="loadTrades('')">all</button>
+        <button class="ghost" onclick="loadTrades('open')">open</button>
+        <button class="ghost" onclick="loadTrades('closed')">closed</button>
+        <button class="ghost" onclick="loadTrades('resting')">resting</button>
+      </div>
+      <div style="overflow-x:auto"><table id="ttbl"><thead><tr>
+        <th>id</th><th>user</th><th>coin</th><th>dir</th><th>entry</th><th>SL</th><th>TPs</th>
+        <th>status</th><th>created</th>
+      </tr><tbody></tbody></thead></table></div>
+    </div>
+
+    <!-- Per-Coin Performance -->
+    <div class="card">
+      <h2>Per-Coin Performance / Filter Status</h2>
+      <div class="mut" style="font-size:11px;margin-bottom:8px">
+        Coins mit ≥<span id="pc-mintrades">10</span> Trades und Win-Rate <<span id="pc-minrate">30%</span>
+        werden automatisch von neuen Trades ausgeschlossen (Phase 2 #27).
+      </div>
+      <div id="pc-list"></div>
+    </div>
+
     <!-- Activity -->
     <div class="card">
       <h2>Recent Activity (all users, last 100)</h2>
@@ -146,13 +189,83 @@ async function resumeUser(id){
   try{await api("POST","/api/admin/users/"+id+"/resume"); loadUsers()}catch(e){alert(e.message)}
 }
 
+async function loadCost(){
+  try{
+    const c=await api("GET","/api/admin/cost");
+    if(c.estimates){
+      document.getElementById("c-cycles").textContent=c.estimates.cycles_sampled;
+      document.getElementById("c-flash").textContent=c.estimates.flash_calls_total;
+      document.getElementById("c-pro").textContent=c.estimates.pro_calls_total_est;
+      document.getElementById("c-cyclecost").textContent="$"+(c.estimates.usd_per_cycle_avg||0);
+      document.getElementById("c-weekcost").textContent="$"+(c.estimates.usd_per_week_extrapolated||0);
+      document.getElementById("c-note").textContent=c.estimates.note||"";
+    }
+    const tb=document.querySelector("#ctbl tbody"); tb.innerHTML="";
+    (c.cycles||[]).slice(0,15).forEach(x=>{
+      tb.insertAdjacentHTML("beforeend",
+        `<tr><td class="mut">${esc(x.ts)}</td><td>${x.processed}</td>
+        <td>${x.hold}</td>
+        <td>${x.signals_total} (${x.new_trade}/${x.update_trade}/${x.cancel_trade})</td>
+        <td>${x.pro_calls_estimate}</td>
+        <td>${x.ai_skip}</td><td>${x.scrape_fail}</td></tr>`);
+    });
+  }catch(e){console.error("cost:",e)}
+}
+
+async function loadTrades(status){
+  const url=status?`/api/admin/trades?status=${encodeURIComponent(status)}`:"/api/admin/trades";
+  const rows=await api("GET",url);
+  const tb=document.querySelector("#ttbl tbody"); tb.innerHTML="";
+  rows.forEach(t=>{
+    const dirCls=t.direction==="LONG"?"on":"off";
+    const stPill={open:"on",closed:"neutral",resting:"on"}[t.status]||"neutral";
+    const tps=(t.take_profits||[]).map(p=>`${p.percent}%@${p.price}`).join(" / ")||"—";
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td>${t.id}</td><td>${t.user_id}</td><td><b>${esc(t.coin)}</b></td>
+       <td><span class="pill ${dirCls}">${esc(t.direction||"")}</span></td>
+       <td>${esc(t.entry||"—")}</td><td>${esc(t.stop_loss||"—")}</td>
+       <td class="mut">${esc(tps)}</td>
+       <td><span class="pill ${stPill}">${esc(t.status)}</span></td>
+       <td class="mut">${esc((t.created_at||"").replace("T"," "))}</td></tr>`);
+  });
+}
+
+async function loadPerCoin(){
+  try{
+    const d=await api("GET","/api/admin/per-coin");
+    document.getElementById("pc-mintrades").textContent=d.min_trades_required;
+    document.getElementById("pc-minrate").textContent=Math.round((d.min_winrate||0)*100)+"%";
+    const root=document.getElementById("pc-list"); root.innerHTML="";
+    if(!d.users||d.users.length===0){root.innerHTML="<span class='mut'>No active users with trades yet.</span>";return}
+    d.users.forEach(u=>{
+      let coinHTML=u.coins.length===0?"<span class='mut'>No closed trades yet.</span>":"";
+      if(u.coins.length){
+        coinHTML="<table><thead><tr><th>coin</th><th>trades</th><th>wins</th><th>win-rate</th><th>status</th></tr><tbody>";
+        u.coins.sort((a,b)=>b.trades-a.trades).forEach(c=>{
+          const wr=Math.round(c.win_rate*100);
+          const wrCls=wr>=50?"on":(wr>=30?"neutral":"off");
+          coinHTML+=`<tr><td><b>${esc(c.coin)}</b></td><td>${c.trades}</td><td>${c.wins}</td>
+            <td><span class="pill ${wrCls}">${wr}%</span></td>
+            <td>${c.blocked?'<span class="pill off">BLOCKED</span>':'<span class="pill on">ok</span>'}</td></tr>`;
+        });
+        coinHTML+="</tbody></table>";
+      }
+      root.insertAdjacentHTML("beforeend",
+        `<div style="margin:12px 0;padding:10px;background:#0a100d;border-radius:6px">
+          <div style="font-weight:700;margin-bottom:6px">${esc(u.username)} <span class="mut" style="font-weight:normal;font-size:11px">· ${esc(u.address_short)}</span></div>
+          ${coinHTML}
+         </div>`);
+    });
+  }catch(e){console.error("per-coin:",e)}
+}
+
 async function loadAll(){
   try{
     // Quick guard: if not admin, /api/admin/users 403s — we show a banner
     await api("GET","/api/admin/health");
     document.getElementById("content").style.display="block";
     document.getElementById("auth-err").style.display="none";
-    loadHealth(); loadUsers(); loadActivity("");
+    loadHealth(); loadUsers(); loadActivity(""); loadCost(); loadTrades(""); loadPerCoin();
   }catch(e){
     const banner=document.getElementById("auth-err");
     banner.style.display="block";
