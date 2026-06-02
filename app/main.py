@@ -330,12 +330,85 @@ def set_wallet(body: WalletIn, u: User = Depends(current_user), db: Session = De
     return {"ok": True, "wallet_connected": True}
 
 
+def _query_on_chain_builder_fee(user_addr: str, builder_addr: str) -> int:
+    """Frag Hyperliquid nach dem aktuell on-chain approved max-fee für (user, builder).
+    Antwort ist in basis points (1bp = 0.01%). 0 = nicht freigegeben.
+    Wirft im Fehlerfall (Network, Format) — Caller behandelt."""
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
+    # SDK exposes `post` for arbitrary Info-API requests. The maxBuilderFee
+    # request returns a number (or string number) representing approved bps.
+    raw = info.post("/info", {"type": "maxBuilderFee", "user": user_addr, "builder": builder_addr})
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return 0
+
+
+@app.get("/api/builder-status")
+def builder_status(u: User = Depends(current_user)):
+    """Aktueller on-chain Approval-Status (Phase 5, 2026-06-02).
+    Dashboard kann damit anzeigen "✓ on-chain bestätigt 5 bps" vs
+    "✗ nicht bestätigt — bitte in HL approveBuilderFee aufrufen".
+    """
+    from app.hyperliquid_exec import fee_to_int
+    out = {
+        "configured": bool(config.BUILDER_ADDRESS),
+        "builder_address": config.BUILDER_ADDRESS or None,
+        "required_bps": fee_to_int(config.BUILDER_FEE) if config.BUILDER_ADDRESS else 0,
+        "user_wallet_connected": bool(u.hl_account_address),
+        "db_flag": bool(u.builder_approved),
+        "on_chain_bps": None,
+        "on_chain_ok": False,
+        "error": None,
+    }
+    if not (config.BUILDER_ADDRESS and u.hl_account_address):
+        return out
+    try:
+        bps = _query_on_chain_builder_fee(u.hl_account_address, config.BUILDER_ADDRESS)
+        out["on_chain_bps"] = bps
+        out["on_chain_ok"] = bps >= out["required_bps"]
+    except Exception as e:
+        out["error"] = f"HL Info-API: {e}"
+    return out
+
+
 @app.post("/api/builder-approved")
 def mark_builder_approved(u: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Nutzer bestätigt, dass er die Builder-Gebühr in der HL-UI freigegeben hat."""
+    """Nutzer bestätigt, dass er die Builder-Gebühr in der HL-UI freigegeben hat.
+
+    Phase 5 (2026-06-02): vorher war das ein reiner Trust-me-Flag. Der Button
+    setzte db.builder_approved=True ohne irgendeine Verifikation — was dazu
+    führte, dass die Engine versuchte mit Builder-Code zu traden, HL den Trade
+    aber ablehnte mit "Builder fee has not been approved". Jetzt prüfen wir
+    on-chain via HL Info-API; nur wenn das echte Approval da ist, wird das
+    Flag gesetzt.
+    """
+    if not config.BUILDER_ADDRESS:
+        raise HTTPException(400, "Server has no BUILDER_ADDRESS configured — nothing to confirm.")
+    if not u.hl_account_address:
+        raise HTTPException(400, "Connect your wallet first.")
+    from app.hyperliquid_exec import fee_to_int
+    required_bps = fee_to_int(config.BUILDER_FEE)
+    try:
+        approved_bps = _query_on_chain_builder_fee(u.hl_account_address, config.BUILDER_ADDRESS)
+    except Exception as e:
+        raise HTTPException(502, f"Could not reach Hyperliquid to verify approval: {e}")
+    if approved_bps < required_bps:
+        raise HTTPException(
+            400,
+            (f"On-chain approval not found or insufficient (approved {approved_bps} bps, "
+             f"need {required_bps} bps for fee {config.BUILDER_FEE}). "
+             f"Open Hyperliquid → Builder Approvals and approve `{config.BUILDER_ADDRESS}` "
+             f"for at least {config.BUILDER_FEE}, then click confirm again."),
+        )
     u.builder_approved = True
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "approved_bps": approved_bps, "required_bps": required_bps}
 
 
 # ── Dashboard-Daten (Live-PNL/Positionen + Aktivität) ────────────────────────
