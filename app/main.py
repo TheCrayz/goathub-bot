@@ -14,7 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import config
-from app.auth import current_user, hash_pw, make_token, verify_pw
+from app.auth import MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw, make_token, verify_pw
 from app.db import get_db, init_db
 from app.models import Activity, User
 from app.schemas import Login, Register, SettingsIn, WalletIn
@@ -43,24 +43,83 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("goathub")
 
 
+async def _activity_purge_loop():
+    """Phase 4 (2026-06-02): Activity-Tabelle TTL-purge täglich.
+    Behalte 90 Tage Historie, lösche älter. Verhindert unbeschränktes Wachstum
+    (aktuell ~70 rows/Tag = ~25k/Jahr; nach 5 Jahren wird's spürbar).
+    """
+    import datetime
+    PURGE_KEEP_DAYS = int(os.getenv("ACTIVITY_KEEP_DAYS", "90"))
+    # Beim ersten Mal nach 60 s starten — nicht direkt beim Service-Start
+    # (damit Boot-Logs nicht zugespammt werden), dann täglich.
+    await asyncio.sleep(60)
+    while True:
+        try:
+            from app.db import SessionLocal
+            db = SessionLocal()
+            try:
+                cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=PURGE_KEEP_DAYS)
+                deleted = db.query(Activity).filter(Activity.ts < cutoff).delete(synchronize_session=False)
+                db.commit()
+                if deleted:
+                    log.info("activity-purge: %d alte Zeilen gelöscht (älter als %d Tage)", deleted, PURGE_KEEP_DAYS)
+            finally:
+                db.close()
+        except Exception as e:
+            log.warning("activity-purge fehlgeschlagen: %s", e)
+        await asyncio.sleep(86400)  # 1 Tag
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    task = None
+    tasks = []
     if config.ENABLE_LISTENER:
         from app.discord_listener import start_listener
-        task = asyncio.create_task(start_listener())
+        tasks.append(asyncio.create_task(start_listener()))
         log.info("Discord-Listener gestartet.")
     else:
         log.info("Listener AUS (ENABLE_LISTENER=false) — API/Dashboard laufen, kein Live-Trading.")
+    # Activity-Purge läuft IMMER (auch wenn Listener aus ist) — die Tabelle
+    # wächst auch über manuelle Settings-Änderungen, Login-Events etc.
+    tasks.append(asyncio.create_task(_activity_purge_loop()))
     yield
-    if task:
-        task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(title="GoatHub Trading Bot", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# ── Security-Headers (Phase 4, 2026-06-02) ──────────────────────────────────
+# Defense-in-depth: setzt Browser-Schutzmechanismen, die das XSS-Risiko
+# (auch nach dem Escape-Fix C-4) reduzieren und Clickjacking via iframes
+# komplett verbieten.
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # HSTS: Browser merkt sich, immer HTTPS zu verwenden (Caddy terminiert TLS).
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # CSP: 'unsafe-inline' nur wegen der inline-Scripts in dashboard.html.
+    # Wenn die irgendwann mit nonces oder externen Scripts ersetzt werden,
+    # kann das hier strenger gemacht werden.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https://cdn.discordapp.com; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self' https://discord.com"
+    )
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    return response
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -70,9 +129,15 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     if "@" not in email or len(body.password) < 6:
         raise HTTPException(400, "Valid email + password (min. 6 chars) required")
+    if len(body.password.encode("utf-8")) > MAX_PW_BYTES:
+        raise HTTPException(400, f"Password too long (max {MAX_PW_BYTES} bytes / ~72 ASCII chars)")
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(409, "Email already registered")
-    u = User(email=email, password_hash=hash_pw(body.password),
+    try:
+        pw_hash = hash_pw(body.password)
+    except PasswordTooLongError as e:
+        raise HTTPException(400, str(e))
+    u = User(email=email, password_hash=pw_hash,
              risk_pct=config.DEFAULT_RISK_PCT, leverage=config.DEFAULT_LEVERAGE,
              max_open_positions=config.DEFAULT_MAX_OPEN)
     db.add(u)

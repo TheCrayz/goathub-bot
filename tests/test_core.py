@@ -1,6 +1,12 @@
-"""Dependency-freie Tests: Kapital-Cap-Sizing + Signal-Parser. Run:
+"""Dependency-freie Tests: Kapital-Cap-Sizing + Signal-Parser + bcrypt-Max.
+Run:
     PYTHONPATH=. python3 tests/test_core.py
 """
+import os
+# Phase 4: bcrypt-Max-Test importiert app.auth → app.config → braucht Env.
+os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef")
+os.environ.setdefault("ENCRYPTION_KEY", "AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=")
+
 from app.sizing import size_trade
 from app.parser import parse_signal
 
@@ -37,8 +43,40 @@ def test_parser():
     print("parser: OK ->", s.ticker, s.direction, s.entry, [(t.percent, t.price) for t in s.take_profits])
 
 
+def test_bcrypt_max_length():
+    """Phase 4: 72-Byte-Collision-Schutz. >72 Bytes muss abgelehnt werden,
+    72 Bytes selbst muss funktionieren (Grenzwert)."""
+    from app.auth import hash_pw, verify_pw, PasswordTooLongError, MAX_PW_BYTES
+
+    # 72 ASCII Bytes — am Limit, muss funktionieren
+    pw_max = "a" * MAX_PW_BYTES
+    h = hash_pw(pw_max)
+    assert h and len(h) > 50
+    assert verify_pw(pw_max, h) is True
+
+    # 73 Bytes — über dem Limit, muss ablehnen
+    try:
+        hash_pw("a" * (MAX_PW_BYTES + 1))
+        assert False, "expected PasswordTooLongError on 73-byte input"
+    except PasswordTooLongError:
+        pass
+
+    # UTF-8 multibyte: 36 emoji-Zeichen × 4 Bytes = 144 Bytes — auch ablehnen
+    try:
+        hash_pw("🔥" * 36)
+        assert False, "expected PasswordTooLongError on multi-byte UTF-8 input"
+    except PasswordTooLongError:
+        pass
+
+    # verify_pw mit zu langem PW: muss False zurückgeben (kein crash)
+    assert verify_pw("a" * (MAX_PW_BYTES + 1), h) is False
+
+    print("bcrypt-max: OK -> 72-byte hashes, >72 raises, multibyte counted in bytes")
+
+
 if __name__ == "__main__":
     test_cap_limits_capital()
     test_no_cap_uses_full()
     test_parser()
+    test_bcrypt_max_length()
     print("\nALLE CORE-TESTS BESTANDEN ✅")

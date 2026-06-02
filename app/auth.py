@@ -13,14 +13,35 @@ from app.models import User
 
 _oauth2 = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
 
+# Phase 4 (2026-06-02): bcrypt schneidet stillschweigend bei 72 Bytes ab.
+# Zwei Passwörter mit gleichem 72-Byte-Präfix hashen identisch (Collision-
+# Class). Wir lehnen >72-Byte-Eingaben sauber ab und werfen aus dem .encode()
+# selbst — UTF-8-Multibyte-Zeichen verbrauchen mehr als 1 Byte.
+MAX_PW_BYTES = 72
+
+
+class PasswordTooLongError(ValueError):
+    """Eingabe > 72 Bytes UTF-8 — bcrypt würde sie sonst still truncieren."""
+
+
+def _pw_bytes(p: str) -> bytes:
+    b = p.encode("utf-8")
+    if len(b) > MAX_PW_BYTES:
+        raise PasswordTooLongError(f"Password too long ({len(b)} bytes > {MAX_PW_BYTES} max)")
+    return b
+
 
 def hash_pw(p: str) -> str:
-    return bcrypt.hashpw(p.encode()[:72], bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(_pw_bytes(p), bcrypt.gensalt()).decode()
 
 
 def verify_pw(p: str, h: str) -> bool:
     try:
-        return bcrypt.checkpw(p.encode()[:72], h.encode())
+        return bcrypt.checkpw(_pw_bytes(p), h.encode())
+    except PasswordTooLongError:
+        # Eine Authentifizierung mit zu langem PW ist immer falsch — wir
+        # KÖNNEN nicht prüfen ob es passt (truncate wäre Collision).
+        return False
     except Exception:
         return False
 

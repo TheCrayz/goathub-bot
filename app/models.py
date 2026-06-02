@@ -1,7 +1,7 @@
 """DB-Modelle."""
 import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
 
 from app.db import Base
 
@@ -40,7 +40,10 @@ class User(Base):
 class Activity(Base):
     __tablename__ = "activity"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True)
+    # Phase 4 (2026-06-02): FK + CASCADE — bei User-Delete fallen Activity-Zeilen
+    # automatisch mit raus. Auf alten SQLite-DBs ohne FK greift die Migration
+    # in db.py (recreate-table-with-fk).
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     ts = Column(DateTime, default=datetime.datetime.utcnow)
     kind = Column(String)            # signal | order | update | close | skip | error
     text = Column(Text)
@@ -50,7 +53,7 @@ class ManagedTrade(Base):
     """Ein laufend verwalteter Trade pro Nutzer+Coin (NEW -> UPDATE -> CLOSE)."""
     __tablename__ = "managed_trades"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     coin = Column(String, index=True, nullable=False)   # Basis-Coin, z.B. "ETH"
     direction = Column(String, default="")              # LONG | SHORT
     entry = Column(Float, nullable=True)
