@@ -36,6 +36,11 @@ class User(Base):
     # wenn jemand sie per XSS gestohlen hatte.
     token_version = Column(Integer, default=0, nullable=False)
 
+    # Phase 3 (2026-06-02): Admin-Flag — Voraussetzung für /api/admin/*. Wer
+    # is_admin=True ist, sieht das Admin-Panel im Dashboard und kann andere
+    # Nutzer pausieren / Errors einsehen. Default False; per SQL gesetzt.
+    is_admin = Column(Boolean, default=False, nullable=False)
+
 
 class Activity(Base):
     __tablename__ = "activity"

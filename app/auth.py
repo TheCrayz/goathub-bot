@@ -1,7 +1,7 @@
 """Auth: Passwort-Hashing (bcrypt) + JWT."""
 import datetime
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 import bcrypt
 from jose import JWTError, jwt
@@ -12,6 +12,10 @@ from app.db import get_db
 from app.models import User
 
 _oauth2 = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
+
+# Phase 2 #18 (2026-06-02): hybrid auth — Cookie hat Vorrang vor Bearer.
+# Beide funktionieren weiter, neue Sessions kommen über Cookie.
+SESSION_COOKIE_NAME = "ght_session"
 
 # Phase 4 (2026-06-02): bcrypt schneidet stillschweigend bei 72 Bytes ab.
 # Zwei Passwörter mit gleichem 72-Byte-Präfix hashen identisch (Collision-
@@ -57,7 +61,16 @@ def make_token(uid: int, token_version: int = 0) -> str:
     )
 
 
-def current_user(token: str = Depends(_oauth2), db: Session = Depends(get_db)) -> User:
+def current_user(
+    request: Request,
+    bearer: str = Depends(_oauth2),
+    db: Session = Depends(get_db),
+) -> User:
+    """Auth-Resolver. Versucht zuerst das httpOnly-Session-Cookie (Phase 2 #18,
+    XSS-sicher), fällt sonst auf das Bearer-Token zurück (Backward-Compat für
+    alte Browser-Sessions, curl/dev usage). Beide Wege validieren denselben JWT.
+    """
+    token = request.cookies.get(SESSION_COOKIE_NAME) or bearer
     if not token:
         raise HTTPException(401, "Nicht angemeldet")
     try:

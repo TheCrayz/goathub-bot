@@ -109,6 +109,7 @@
       </div>
       <button id="toggle" onclick="toggleBot()" style="margin-top:14px">Enable Bot</button>
       <button class="ghost" onclick="logout()">Logout</button>
+      <a id="adminlink" href="/admin" class="hide" style="margin-left:8px;color:#10b981;font-size:12px;text-decoration:none">⚙ Admin →</a>
     </div>
 
     <div class="card">
@@ -141,11 +142,15 @@
     <div class="card">
       <h2>3. Builder Fee / Referral</h2>
       <div class="mut">Trades carry a builder code. Approve the fee once in the Hyperliquid UI
-        (<i>approve builder fee</i>) for this address, then confirm here:</div>
+        (<i>approve builder fee</i>) for this address, then confirm here. Phase 5 (2026-06-02):
+        the dashboard now verifies on-chain — clicking confirm will only succeed if the approval
+        is actually on Hyperliquid.</div>
       <div style="margin:8px 0"><span class="mut">Builder address:</span> <code id="baddr">—</code>
         <span class="mut">· Fee <span id="bfee">—</span></span></div>
-      <div>Status: <span id="bstat" class="pill off">not confirmed</span></div>
+      <div>Status (DB): <span id="bstat" class="pill off">not confirmed</span></div>
+      <div style="margin-top:6px;font-size:13px">On-chain: <span id="bonchain" class="mut">— click "Verify" to check</span></div>
       <button id="bbtn" onclick="approveBuilder()">Builder fee approved — confirm</button>
+      <button class="ghost" onclick="verifyBuilder()">Verify on-chain</button>
       <div class="msg" id="bmsg"></div>
     </div>
 
@@ -172,17 +177,32 @@
     Trading involves risk. You trade at your own risk with your own Hyperliquid account.</div>
 </div>
 <script>
-const T=()=>localStorage.getItem("ght");
-const H=()=>({"Content-Type":"application/json","Authorization":"Bearer "+T()});
+// Phase 2 #18 (2026-06-02): hybrid auth.
+//  - NEUE Logins → server setzt httpOnly+Secure+SameSite=Lax Session-Cookie.
+//    Wir schreiben NICHTS mehr aktiv in localStorage — XSS kann den Token nicht stehlen.
+//  - ALTE localStorage-Tokens funktionieren weiter (Bearer-Fallback, transition).
+//  - Browser sendet das Cookie automatisch via `credentials: 'include'`.
+const T=()=>localStorage.getItem("ght");  // legacy bearer fallback
 // XSS-Fix (Phase 1, 2026-06-02): HTML-escape EVERY user-influenced value before
 // it goes into innerHTML / insertAdjacentHTML. Activity texts come from upstream
 // (exchange errors, parser output, Discord embeds) and could contain <script> etc.
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function show(el,t,cls){el.textContent=t;el.className="msg "+(cls||"")}
-async function api(m,u,b){const o={method:m,headers:b?H():{"Authorization":"Bearer "+T()}};if(b)o.body=JSON.stringify(b);const r=await fetch(u,o);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||r.status);return r.json()}
-async function register(){try{const d=await api("POST","/api/register",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
-async function login(){try{const d=await api("POST","/api/login",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
-async function logout(){try{await fetch("/api/logout",{method:"POST",headers:{"Authorization":"Bearer "+T()}})}catch(e){}localStorage.removeItem("ght");location.reload()}
+async function api(m,u,b){
+  // Cookie kommt automatisch via credentials:'include'. Bearer NUR senden,
+  // falls noch alter localStorage-Token da ist (transition).
+  const headers={};
+  if(b)headers["Content-Type"]="application/json";
+  const t=T(); if(t)headers["Authorization"]="Bearer "+t;
+  const o={method:m,headers,credentials:"include"};
+  if(b)o.body=JSON.stringify(b);
+  const r=await fetch(u,o);
+  if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||r.status);
+  return r.json();
+}
+async function register(){try{await api("POST","/api/register",{email:email.value,password:pw.value});location.reload()}catch(e){show(authmsg,e.message,"err")}}
+async function login(){try{await api("POST","/api/login",{email:email.value,password:pw.value});location.reload()}catch(e){show(authmsg,e.message,"err")}}
+async function logout(){try{await api("POST","/api/logout")}catch(e){}localStorage.removeItem("ght");location.reload()}
 async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_address:addr.value,hl_api_secret:sec.value});show(wmsg,"Wallet saved ✓","ok");sec.value="";updateWalletLens();load()}catch(e){show(wmsg,e.message,"err")}}
 // Phase 2 (2026-06-02): live length indicators on the wallet form. The
 // address-in-key-field bug ate ~3 testers (users 3, 4, 6) — none knew
@@ -204,7 +224,23 @@ document.addEventListener("DOMContentLoaded",function(){
   updateWalletLens();
 });
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
-async function approveBuilder(){try{await api("POST","/api/builder-approved");show(bmsg,"Thank you — referral confirmed ✓","ok");load()}catch(e){show(bmsg,e.message,"err")}}
+async function approveBuilder(){try{const r=await api("POST","/api/builder-approved");show(bmsg,`Thank you — referral confirmed on-chain (${r.approved_bps} bps) ✓`,"ok");load();verifyBuilder()}catch(e){show(bmsg,e.message,"err")}}
+// Phase 5 (2026-06-02): explicit on-chain verification button.
+async function verifyBuilder(){
+  const el=document.getElementById("bonchain");
+  if(el)el.textContent="checking…";
+  try{
+    const s=await api("GET","/api/builder-status");
+    if(!s.configured){if(el)el.textContent="server has no BUILDER_ADDRESS configured";return}
+    if(!s.user_wallet_connected){if(el)el.textContent="connect wallet first";return}
+    if(s.error){if(el){el.textContent="error: "+s.error; el.style.color="#ff8a8a"}return}
+    if(s.on_chain_ok){
+      if(el){el.textContent="✓ approved on-chain ("+s.on_chain_bps+" bps, need "+s.required_bps+")"; el.style.color="#3fe0a0"}
+    }else{
+      if(el){el.textContent="✗ not approved on-chain ("+s.on_chain_bps+" bps, need "+s.required_bps+") — approve in Hyperliquid UI"; el.style.color="#ff8a8a"}
+    }
+  }catch(e){if(el){el.textContent="error: "+e.message; el.style.color="#ff8a8a"}}
+}
 async function toggleBot(){try{const me=await api("GET","/api/me");await api("PUT","/api/settings",{bot_active:!me.bot_active});load()}catch(e){alert(e.message)}}
 let STATS=null, TF=30;
 function fmtUsd(v){return (v>=0?"+$":"−$")+Math.abs(v).toFixed(2)}
@@ -280,6 +316,8 @@ async function load(){
     }
     const on=d.user.bot_active; botpill.textContent=on?"on":"off"; botpill.className="pill "+(on?"on":"off");
     document.getElementById("toggle").textContent=on?"Disable Bot":"Enable Bot";
+    // Phase 3 (2026-06-02): admin link nur für is_admin user zeigen.
+    const al=document.getElementById("adminlink"); if(al){if(d.user.is_admin)al.classList.remove("hide");else al.classList.add("hide")}
     wstat.textContent=d.user.wallet_connected?"connected ✓":"not connected";
     const s=d.user.settings; risk.value=s.risk_pct;lev.value=s.leverage;maxp.value=s.max_open_positions;cap.value=s.capital_cap_usdc;
     baddr.textContent=(d.builder&&d.builder.address)||"(not set)"; bfee.textContent=(d.builder&&d.builder.fee)||"—";
@@ -296,20 +334,18 @@ async function load(){
 // Handle Discord OAuth redirect params
 (function(){
   const p=new URLSearchParams(location.search);
-  // Token kommt jetzt im URL-Fragment (#token=…) — Fragmente gehen nie an den Server (keine Log-Leaks)
-  let tok=null;
+  // Phase 2 #18: Server setzt httpOnly Cookie direkt — wir brauchen kein
+  // #token=… mehr. Falls noch ein altes Fragment dasteht, einfach ignorieren
+  // und URL aufräumen (Cookie ist schon gesetzt).
   if(location.hash && location.hash.indexOf("token=")>=0){
-    tok=new URLSearchParams(location.hash.replace(/^#/,"")).get("token");
-  }
-  const err=p.get("error");
-  if(tok){
-    localStorage.setItem("ght",tok);
     history.replaceState(null,"","/");
   }
+  const err=p.get("error");
   if(err){
     const msgs={
       no_role:"You need the @Goat Hub Supporter role to use this bot. Get it at <a href='https://goathub.network/join.html' target='_blank'>goathub.network/join</a>",
       discord_denied:"Discord login was cancelled.",
+      oauth_state_mismatch:"OAuth security check failed. Please try logging in again.",
       oauth_failed:"Login failed. Please try again."
     };
     const el=document.getElementById("autherror");
@@ -317,5 +353,7 @@ async function load(){
     history.replaceState(null,"","/");
   }
 })();
-if(T())load();
+// Phase 2 #18: immer load() probieren — auth läuft via Cookie. Wenn 401,
+// fängt load() das ab und zeigt Login-Form (auth section ist by default sichtbar).
+load();
 </script></body></html>

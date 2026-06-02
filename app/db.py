@@ -35,6 +35,8 @@ def init_db():
             ("created_at", "DATETIME"),
             # Phase 1 (2026-06-02): JWT-Versionierung für Server-side-Logout.
             ("token_version", "INTEGER NOT NULL DEFAULT 0"),
+            # Phase 3 (2026-06-02): Admin-Flag für /api/admin/*-Endpoints.
+            ("is_admin", "BOOLEAN NOT NULL DEFAULT 0"),
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef}"))

@@ -65,6 +65,16 @@ MIN_CONFIDENCE = _f("MIN_CONFIDENCE", 0.75)
 ENTRY_FILL_TIMEOUT_S = _i("ENTRY_FILL_TIMEOUT_S", 300)   # 5 min (Phase 2 von 15→5 Min)
 ENTRY_POLL_S = _i("ENTRY_POLL_S", 4)                     # alle 4s pollen (war 6)
 
+# Phase 2 #27 (2026-06-02): per-Coin Auto-Filter.
+# Wenn ein Coin nach >=PERCOIN_MIN_TRADES echten Trade-Events (Partial-Fills
+# geclustert) auf dem User-Konto unter PERCOIN_MIN_WINRATE liegt, werden
+# NEUE Trades für dieses Coin geskippt. UPDATE/CANCEL bleiben unberührt.
+# Default 10 Trades / 30 % — beides env-tunbar. Wer den Filter komplett
+# aus will setzt PERCOIN_MIN_TRADES auf eine sehr große Zahl (z. B. 99999).
+PERCOIN_MIN_TRADES = _i("PERCOIN_MIN_TRADES", 10)
+PERCOIN_MIN_WINRATE = _f("PERCOIN_MIN_WINRATE", 0.30)
+PERCOIN_CACHE_TTL_S = _i("PERCOIN_CACHE_TTL_S", 600)     # HL-fills nur alle 10 Min neu ziehen
+
 # Discord OAuth2
 DISCORD_CLIENT_ID = _g("DISCORD_CLIENT_ID", "1508987342482837524")
 DISCORD_CLIENT_SECRET = _g("DISCORD_CLIENT_SECRET", "")   # NUR aus .env — niemals im Code (Secret rotieren!)

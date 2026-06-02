@@ -21,6 +21,9 @@ from app.db import SessionLocal
 from app.models import Activity, ManagedTrade, User
 from app.parser import CANCEL_ACTIONS, parse_signal
 
+# Phase 2 #27 (2026-06-02): per-coin performance cache. {(addr,coin) → (ts, stats)}.
+_percoin_cache: dict = {}
+
 log = logging.getLogger("goathub.engine")
 
 # Laufende Tasks festhalten (sonst kann der GC sie mitten im Trade abräumen)
@@ -171,6 +174,64 @@ def _is_bad_key_error(exc):
             or "unexpected private key length" in s)
 
 
+def _per_coin_stats(user_addr: str, coin: str) -> dict | None:
+    """Per-coin Trade-Event-Stats aus HL-Fills (Phase 2 #27, 2026-06-02).
+    Cluster Partial-Fills (≤60s, gleiche Seite) zu Events; return win_rate + count.
+    10-Min-Cache pro (user, coin) damit nicht jeder Trade einen Info-Call löst.
+    """
+    key = (user_addr, coin)
+    now = time.time()
+    cached = _percoin_cache.get(key)
+    if cached and now - cached[0] < config.PERCOIN_CACHE_TTL_S:
+        return cached[1]
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
+        fills = info.user_fills(user_addr) or []
+    except Exception as e:
+        log.warning("per-coin stats: HL fetch failed for %s: %s", user_addr[:8], e)
+        return None
+    fills.sort(key=lambda f: f.get("time", 0))
+    events = []
+    current = None
+    for f in fills:
+        if f.get("coin") != coin:
+            continue
+        pnl = float(f.get("closedPnl", 0) or 0)
+        if pnl == 0:
+            continue
+        t = int(f.get("time", 0) or 0)
+        d = f.get("dir", "")
+        side = "Long" if "Long" in d else ("Short" if "Short" in d else "?")
+        k2 = (coin, side)
+        if current and current["key"] == k2 and t - current["t_last"] <= 60_000:
+            current["pnl"] += pnl
+            current["t_last"] = t
+        else:
+            if current is not None:
+                events.append(current)
+            current = {"key": k2, "t": t, "t_last": t, "pnl": pnl}
+    if current is not None:
+        events.append(current)
+    trades = len(events)
+    wins = sum(1 for e in events if e["pnl"] > 0)
+    win_rate = (wins / trades) if trades else 0.0
+    result = {"trades": trades, "wins": wins, "win_rate": win_rate}
+    _percoin_cache[key] = (now, result)
+    return result
+
+
+def _per_coin_blocked(user_addr: str, coin: str) -> tuple[bool, dict | None]:
+    """True wenn Coin per-coin-filter blocken soll. Liefert (blocked, stats)."""
+    s = _per_coin_stats(user_addr, coin)
+    if s is None:
+        return False, None
+    if s["trades"] < config.PERCOIN_MIN_TRADES:
+        return False, s
+    return s["win_rate"] < config.PERCOIN_MIN_WINRATE, s
+
+
 # ── Signal-Eingang ───────────────────────────────────────────────────────────
 async def handle_signal(embed: dict):
     sig = parse_signal(embed)
@@ -244,6 +305,21 @@ async def _open_or_update(user_id, sig):
 async def _open_new(trader, u, sig):
     from app.sizing import size_trade
     coin = coin_of(sig.ticker)
+
+    # Phase 2 #27 (2026-06-02): Per-Coin Auto-Filter. Schaut auf den User's
+    # Track-Record für DIESES Coin auf Hyperliquid (cached 10 min). Wenn >=10
+    # Trades und Win-Rate <30%, wird NEUE Position blockiert — UPDATE/CANCEL
+    # bestehender Positionen läuft normal weiter.
+    blocked, stats = await asyncio.to_thread(_per_coin_blocked, u.hl_account_address, coin)
+    if blocked and stats:
+        _log_activity(
+            u.id, "skip",
+            f"{coin}: per-coin filter — "
+            f"win-rate {stats['win_rate']*100:.0f}% über {stats['trades']} Trades "
+            f"< {config.PERCOIN_MIN_WINRATE*100:.0f}%-Schwelle — NEW_TRADE skipped"
+        )
+        return
+
     balance = await asyncio.to_thread(trader.account_value)
     if balance <= 0:
         _log_activity(u.id, "skip", f"{coin}: kein handelbares Guthaben")

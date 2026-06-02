@@ -39,6 +39,27 @@ REGISTER_RATE_LIMIT = os.getenv("REGISTER_RATE_LIMIT", "5/5minute")
 OAUTH_STATE_COOKIE = "discord_oauth_state"
 OAUTH_STATE_TTL_S = 600  # 10 min, plenty for a sane user flow
 
+# Phase 2 #18 (2026-06-02): hybrid Session-Cookie zusätzlich zum Bearer-Token.
+# - Bearer-Token bleibt für Backwards-Compat (alte clients + curl/dev) erhalten.
+# - Cookie ist httpOnly + Secure + SameSite=Lax → kann nicht via XSS gelesen werden.
+# - Dashboard-JS bevorzugt Cookie und schreibt KEIN localStorage mehr.
+# - `current_user` (in auth.py) liest beide Wege.
+SESSION_COOKIE = "ght_session"
+SESSION_COOKIE_TTL_S = 60 * 60 * 24 * 7  # 7 Tage, matches JWT_EXPIRE_HOURS=168
+
+
+def _set_session_cookie(response, jwt_token: str):
+    """Setzt das Session-Cookie sicher (httpOnly/Secure/Lax)."""
+    response.set_cookie(
+        SESSION_COOKIE,
+        jwt_token,
+        max_age=SESSION_COOKIE_TTL_S,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("goathub")
 
@@ -92,6 +113,10 @@ app = FastAPI(title="GoatHub Trading Bot", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Phase 3 (2026-06-02): Admin-Router. is_admin-Gate ist im Modul selbst.
+from app.admin import router as admin_router
+app.include_router(admin_router)
+
 
 # ── Security-Headers (Phase 4, 2026-06-02) ──────────────────────────────────
 # Defense-in-depth: setzt Browser-Schutzmechanismen, die das XSS-Risiko
@@ -123,6 +148,9 @@ async def _security_headers(request: Request, call_next):
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
+from fastapi.responses import JSONResponse  # für Cookie-setting Response
+
+
 @app.post("/api/register")
 @limiter.limit(REGISTER_RATE_LIMIT)
 def register(request: Request, body: Register, db: Session = Depends(get_db)):
@@ -143,7 +171,10 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
     db.add(u)
     db.commit()
     db.refresh(u)
-    return {"access_token": make_token(u.id, getattr(u, "token_version", 0)), "token_type": "bearer"}
+    tok = make_token(u.id, getattr(u, "token_version", 0))
+    response = JSONResponse({"access_token": tok, "token_type": "bearer"})
+    _set_session_cookie(response, tok)  # Phase 2 #18: hybrid auth
+    return response
 
 
 @app.post("/api/login")
@@ -152,17 +183,23 @@ def login(request: Request, body: Login, db: Session = Depends(get_db)):
     u = db.query(User).filter(User.email == body.email.strip().lower()).first()
     if not u or not verify_pw(body.password, u.password_hash):
         raise HTTPException(401, "Wrong email or password")
-    return {"access_token": make_token(u.id, getattr(u, "token_version", 0)), "token_type": "bearer"}
+    tok = make_token(u.id, getattr(u, "token_version", 0))
+    response = JSONResponse({"access_token": tok, "token_type": "bearer"})
+    _set_session_cookie(response, tok)  # Phase 2 #18: hybrid auth
+    return response
 
 
 @app.post("/api/logout")
 def logout(u: User = Depends(current_user), db: Session = Depends(get_db)):
     """Server-side logout — bumps token_version so every JWT issued before
     this point stops validating. Even if a token was exfiltrated via XSS, it
-    is now useless after the user clicks Logout."""
+    is now useless after the user clicks Logout. Phase 2 #18: clears the
+    httpOnly session cookie too."""
     u.token_version = int(getattr(u, "token_version", 0) or 0) + 1
     db.commit()
-    return {"ok": True, "message": "Alle bestehenden Sessions invalidiert."}
+    response = JSONResponse({"ok": True, "message": "Alle bestehenden Sessions invalidiert."})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.get("/auth/discord")
@@ -256,9 +293,13 @@ async def discord_callback(request: Request, code: str = None, state: str = None
             db.commit()
 
         jwt_token = make_token(u.id, getattr(u, "token_version", 0))
-        # Token im URL-FRAGMENT (#) — Fragmente werden NICHT an den Server gesendet,
-        # landen also nicht in Access-Logs/Proxys/Referer. (vorher ?token= = Leak-Risiko)
+        # Phase 2 #18 (2026-06-02): NEUE Strategie — Session-Cookie (httpOnly).
+        # Das URL-Fragment-Token bleibt zusätzlich für Backward-Compat erhalten,
+        # aber das Dashboard wird's nicht mehr in localStorage stecken — der
+        # XSS-Exfil-Vektor ist damit zu. Wenn beide Pfade aktiv sind, gewinnt
+        # das Cookie in `current_user` (cookie-first).
         resp = RedirectResponse(f"/#token={jwt_token}")
+        _set_session_cookie(resp, jwt_token)
         resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
         return resp
 
@@ -279,6 +320,7 @@ def _user_public(u: User):
             "wallet_connected": bool(u.hl_api_secret_enc),
             "hl_account_address": u.hl_account_address, "bot_active": u.bot_active,
             "builder_approved": u.builder_approved,
+            "is_admin": bool(getattr(u, "is_admin", False)),   # Phase 3 (2026-06-02)
             "settings": {"risk_pct": u.risk_pct, "leverage": u.leverage,
                          "max_open_positions": u.max_open_positions,
                          "capital_cap_usdc": u.capital_cap_usdc}}
@@ -515,6 +557,15 @@ def dashboard(u: User = Depends(current_user), db: Session = Depends(get_db)):
 @app.get("/", response_class=HTMLResponse)
 def index():
     path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    """Phase 3 (2026-06-02): Admin-Dashboard. Auth-Gate sitzt im Frontend
+    (JS prüft /api/me.is_admin), das echte Gate ist in /api/admin/*."""
+    path = os.path.join(os.path.dirname(__file__), "admin.html")
     with open(path, encoding="utf-8") as f:
         return f.read()
 

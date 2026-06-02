@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GoatHub Admin</title>
+<style>
+  *{box-sizing:border-box} body{margin:0;background:#0b0f0d;color:#e6f2ec;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px}
+  h1{font-size:22px;margin:0 0 4px} h2{font-size:14px;color:#10b981;margin:0 0 10px;text-transform:uppercase;letter-spacing:.07em}
+  .sub{color:#7f9a90;font-size:13px;margin-bottom:18px}
+  .card{background:#0f1714;border:1px solid #1e2a24;border-radius:12px;padding:16px;margin:14px 0;overflow:auto}
+  .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .stat{flex:1;min-width:160px;background:#0f1714;border:1px solid #1e2a24;border-radius:10px;padding:14px}
+  .stat-h{color:#7f9a90;font-size:11px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px}
+  .stat-v{font-size:22px;font-weight:800;line-height:1.1}
+  table{width:100%;border-collapse:collapse;font-size:13px;font-family:ui-monospace,Menlo,monospace}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #1e2a24;white-space:nowrap}
+  th{color:#9fb8af;font-size:11px;text-transform:uppercase;font-family:system-ui,sans-serif;letter-spacing:.05em}
+  td.mut{color:#7f9a90}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;font-family:system-ui,sans-serif}
+  .on{background:#0e3b2b;color:#3fe0a0} .off{background:#3b1e1e;color:#ff8a8a}
+  .neutral{background:#2a2f2d;color:#9fb8af}
+  button{background:#10b981;color:#04120c;border:0;border-radius:6px;padding:5px 10px;font-weight:700;cursor:pointer;font-size:12px}
+  button.danger{background:#3b1e1e;color:#ff8a8a}
+  button.ghost{background:transparent;color:#10b981;border:1px solid #0e7c5a}
+  .row{display:flex;gap:8px;align-items:center}
+  pre{background:#0a100d;padding:10px;border-radius:6px;overflow-x:auto;font-size:11px;margin:6px 0}
+  a{color:#10b981}
+  .err-banner{background:#3b1e1e;color:#ffb0b0;padding:12px;border-radius:8px;margin:10px 0;display:none}
+</style></head>
+<body><div class="wrap">
+  <h1>🐐 Admin <span style="font-size:12px;color:#7f9a90">· <a href="/">← back to user dashboard</a></span></h1>
+  <div class="sub">Admin-only view. Phase 3 (2026-06-02).</div>
+
+  <div id="auth-err" class="err-banner"></div>
+
+  <div id="content" style="display:none">
+    <!-- Health -->
+    <div class="card">
+      <h2>Health</h2>
+      <div class="stats">
+        <div class="stat"><div class="stat-h">GoatHub Listener</div><div class="stat-v" id="h-listener">—</div></div>
+        <div class="stat"><div class="stat-h">Network</div><div class="stat-v" id="h-net">—</div></div>
+        <div class="stat"><div class="stat-h">Builder</div><div class="stat-v" id="h-builder">—</div></div>
+        <div class="stat"><div class="stat-h">Signal-bot</div><div class="stat-v" id="h-sb">—</div></div>
+      </div>
+      <div class="mut" style="font-size:11px">Last signal-bot cycle: <code id="h-cycle">—</code></div>
+      <button class="ghost" onclick="loadAll()" style="margin-top:8px">↻ Refresh</button>
+    </div>
+
+    <!-- Users -->
+    <div class="card">
+      <h2>Users (<span id="user-count">0</span>)</h2>
+      <table id="utbl"><thead><tr>
+        <th>id</th><th>username</th><th>bot</th><th>wallet</th>
+        <th>key-status</th><th>open</th><th>closed</th><th>errors 24h</th><th>actions</th>
+      </tr><tbody></tbody></thead></table>
+    </div>
+
+    <!-- Activity -->
+    <div class="card">
+      <h2>Recent Activity (all users, last 100)</h2>
+      <div class="row" style="margin-bottom:10px">
+        <span class="mut">Filter:</span>
+        <button class="ghost" onclick="loadActivity('')">all</button>
+        <button class="ghost" onclick="loadActivity('error')">error</button>
+        <button class="ghost" onclick="loadActivity('skip')">skip</button>
+        <button class="ghost" onclick="loadActivity('order')">order</button>
+        <button class="ghost" onclick="loadActivity('update')">update</button>
+        <button class="ghost" onclick="loadActivity('close')">close</button>
+      </div>
+      <table id="atbl"><thead><tr><th>time</th><th>user</th><th>kind</th><th>text</th></tr><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+<script>
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+async function api(m,u,b){
+  const headers={};
+  if(b)headers["Content-Type"]="application/json";
+  const t=localStorage.getItem("ght"); if(t)headers["Authorization"]="Bearer "+t;
+  const o={method:m,headers,credentials:"include"};
+  if(b)o.body=JSON.stringify(b);
+  const r=await fetch(u,o);
+  if(!r.ok){const e=await r.json().catch(()=>({})); throw new Error(e.detail||r.status)}
+  return r.json();
+}
+
+async function loadHealth(){
+  try{
+    const h=await api("GET","/api/admin/health");
+    document.getElementById("h-listener").innerHTML=h.goathub.listener_enabled?'<span class="pill on">on</span>':'<span class="pill off">off</span>';
+    document.getElementById("h-net").textContent=h.goathub.net;
+    document.getElementById("h-builder").textContent=h.goathub.builder_configured?h.goathub.builder_fee:"off";
+    document.getElementById("h-sb").innerHTML=h.signalbot.reachable?'<span class="pill on">reachable</span>':'<span class="pill off">unreachable</span>';
+    const c=h.signalbot.last_cycle_summary;
+    document.getElementById("h-cycle").textContent=c?(c.ts+" — "+c.text):(h.signalbot.error||"—");
+  }catch(e){console.error("health:",e);}
+}
+
+async function loadUsers(){
+  const users=await api("GET","/api/admin/users");
+  document.getElementById("user-count").textContent=users.length;
+  const tb=document.querySelector("#utbl tbody"); tb.innerHTML="";
+  users.forEach(u=>{
+    const keyCls={ok:"on","address?!":"off","no key":"neutral",error:"off"}[u.key_status]||"neutral";
+    const actions=u.bot_active
+      ? `<button class="danger" onclick="pauseUser(${u.id})">pause</button>`
+      : (u.key_status==="ok" ? `<button onclick="resumeUser(${u.id})">resume</button>` : '<span class="mut">no resume</span>');
+    tb.insertAdjacentHTML("beforeend",
+      `<tr>
+        <td>${u.id}</td>
+        <td>${esc(u.discord_username||u.email||"")}</td>
+        <td>${u.bot_active?'<span class="pill on">on</span>':'<span class="pill off">off</span>'}</td>
+        <td class="mut">${esc(u.address_short||"—")}</td>
+        <td><span class="pill ${keyCls}">${esc(u.key_status)}</span></td>
+        <td>${u.open_trades}</td>
+        <td class="mut">${u.closed_trades}</td>
+        <td class="${u.errors_24h>10?'':''}">${u.errors_24h>10?'<span class="pill off">'+u.errors_24h+'</span>':u.errors_24h}</td>
+        <td>${actions}</td>
+      </tr>`);
+  });
+}
+
+async function loadActivity(kind){
+  const url=kind?`/api/admin/activity?kind=${encodeURIComponent(kind)}`:"/api/admin/activity";
+  const rows=await api("GET",url);
+  const tb=document.querySelector("#atbl tbody"); tb.innerHTML="";
+  rows.forEach(r=>{
+    const kpill={error:'off',skip:'neutral',order:'on',update:'on',close:'on'}[r.kind]||'neutral';
+    tb.insertAdjacentHTML("beforeend",
+      `<tr>
+        <td class="mut">${esc((r.ts||"").replace("T"," "))}</td>
+        <td>${r.user_id||"—"}</td>
+        <td><span class="pill ${kpill}">${esc(r.kind)}</span></td>
+        <td>${esc(r.text||"")}</td>
+      </tr>`);
+  });
+}
+
+async function pauseUser(id){
+  if(!confirm("Pause user "+id+"?"))return;
+  try{await api("POST","/api/admin/users/"+id+"/pause"); loadUsers()}catch(e){alert(e.message)}
+}
+async function resumeUser(id){
+  try{await api("POST","/api/admin/users/"+id+"/resume"); loadUsers()}catch(e){alert(e.message)}
+}
+
+async function loadAll(){
+  try{
+    // Quick guard: if not admin, /api/admin/users 403s — we show a banner
+    await api("GET","/api/admin/health");
+    document.getElementById("content").style.display="block";
+    document.getElementById("auth-err").style.display="none";
+    loadHealth(); loadUsers(); loadActivity("");
+  }catch(e){
+    const banner=document.getElementById("auth-err");
+    banner.style.display="block";
+    if((e.message||"").includes("Admin")){
+      banner.innerHTML="🚫 Admin only — you don't have access to this page. <a href='/'>Back to dashboard</a>";
+    }else if((e.message||"").includes("Nicht angemeldet")||(e.message||"").includes("401")){
+      banner.innerHTML="Not logged in. <a href='/'>Log in here</a> then come back.";
+    }else{
+      banner.textContent="Error: "+e.message;
+    }
+  }
+}
+loadAll();
+</script></body></html>
