@@ -8,6 +8,7 @@ python-jose[cryptography]
 cryptography
 python-dotenv
 httpx
+slowapi
 
 # Live-Trading (Listener + Engine) — nur auf dem Server nötig:
 discord.py>=2.5.2

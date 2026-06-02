@@ -30,6 +30,12 @@ class User(Base):
     bot_active = Column(Boolean, default=False)        # Nutzer schaltet selbst scharf
     builder_approved = Column(Boolean, default=False)  # Referral-Gebühr freigegeben?
 
+    # Session-Invalidierung (Phase 1, 2026-06-02): jeder JWT trägt `tv`, das
+    # gegen diese Spalte verglichen wird. Wird beim Logout (und Passwort-
+    # änderung) bumped → alle alten Tokens verlieren ihre Gültigkeit, auch
+    # wenn jemand sie per XSS gestohlen hatte.
+    token_version = Column(Integer, default=0, nullable=False)
+
 
 class Activity(Base):
     __tablename__ = "activity"

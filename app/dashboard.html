@@ -169,11 +169,15 @@
 <script>
 const T=()=>localStorage.getItem("ght");
 const H=()=>({"Content-Type":"application/json","Authorization":"Bearer "+T()});
+// XSS-Fix (Phase 1, 2026-06-02): HTML-escape EVERY user-influenced value before
+// it goes into innerHTML / insertAdjacentHTML. Activity texts come from upstream
+// (exchange errors, parser output, Discord embeds) and could contain <script> etc.
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function show(el,t,cls){el.textContent=t;el.className="msg "+(cls||"")}
 async function api(m,u,b){const o={method:m,headers:b?H():{"Authorization":"Bearer "+T()}};if(b)o.body=JSON.stringify(b);const r=await fetch(u,o);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||r.status);return r.json()}
 async function register(){try{const d=await api("POST","/api/register",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
 async function login(){try{const d=await api("POST","/api/login",{email:email.value,password:pw.value});localStorage.setItem("ght",d.access_token);load()}catch(e){show(authmsg,e.message,"err")}}
-function logout(){localStorage.removeItem("ght");location.reload()}
+async function logout(){try{await fetch("/api/logout",{method:"POST",headers:{"Authorization":"Bearer "+T()}})}catch(e){}localStorage.removeItem("ght");location.reload()}
 async function saveWallet(){try{await api("POST","/api/wallet",{hl_account_address:addr.value,hl_api_secret:sec.value});show(wmsg,"Wallet saved ✓","ok");sec.value="";load()}catch(e){show(wmsg,e.message,"err")}}
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
 async function approveBuilder(){try{await api("POST","/api/builder-approved");show(bmsg,"Thank you — referral confirmed ✓","ok");load()}catch(e){show(bmsg,e.message,"err")}}
@@ -223,10 +227,10 @@ function renderStats(){
   const hb=document.querySelector("#histtbl tbody");hb.innerHTML="";
   (STATS.recent||[]).forEach(function(r){
     const cls=/long/i.test(r.dir||"")?"on":(/short/i.test(r.dir||"")?"off":"");
-    const dir='<span class="pill '+cls+'">'+((r.dir||"—").toUpperCase())+'</span>';
+    const dir='<span class="pill '+cls+'">'+esc((r.dir||"—").toUpperCase())+'</span>';
     const pc=r.pnl>0?"pos":(r.pnl<0?"neg":"mut");
-    const date=new Date(r.t).toLocaleString();
-    hb.insertAdjacentHTML("beforeend","<tr><td class=\"mut\">"+date+"</td><td><b>"+(r.coin||"")+"</b></td><td>"+dir+"</td><td>$"+r.px+"</td><td class=\""+pc+"\">"+(r.pnl>0?"+":"")+r.pnl.toFixed(2)+"</td></tr>");
+    const date=esc(new Date(r.t).toLocaleString());
+    hb.insertAdjacentHTML("beforeend","<tr><td class=\"mut\">"+date+"</td><td><b>"+esc(r.coin||"")+"</b></td><td>"+dir+"</td><td>$"+esc(r.px)+"</td><td class=\""+pc+"\">"+(r.pnl>0?"+":"")+esc(r.pnl.toFixed(2))+"</td></tr>");
   });
   document.getElementById("histempty").style.display=(STATS.recent||[]).length?"none":"block";
 }
@@ -257,10 +261,10 @@ async function load(){
     baddr.textContent=(d.builder&&d.builder.address)||"(not set)"; bfee.textContent=(d.builder&&d.builder.fee)||"—";
     const ba=d.user.builder_approved; bstat.textContent=ba?"confirmed":"not confirmed"; bstat.className="pill "+(ba?"on":"off");
     const pb=document.querySelector("#postbl tbody");pb.innerHTML="";
-    (d.account.positions||[]).forEach(p=>{pb.insertAdjacentHTML("beforeend",`<tr><td>${p.coin}</td><td>${p.size}</td><td>${p.entry}</td><td>${p.uPnl}</td></tr>`)});
+    (d.account.positions||[]).forEach(p=>{pb.insertAdjacentHTML("beforeend",`<tr><td>${esc(p.coin)}</td><td>${esc(p.size)}</td><td>${esc(p.entry)}</td><td>${esc(p.uPnl)}</td></tr>`)});
     posempty.style.display=(d.account.positions||[]).length?"none":"block";
     const ab=document.querySelector("#acttbl tbody");ab.innerHTML="";
-    d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${a.ts.replace("T"," ")}</td><td>${a.kind}</td><td>${a.text}</td></tr>`)});
+    d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${esc((a.ts||"").replace("T"," "))}</td><td>${esc(a.kind)}</td><td>${esc(a.text)}</td></tr>`)});
     actempty.style.display=d.activity.length?"none":"block";
     STATS=d.stats||null; renderStats();
   }catch(e){localStorage.removeItem("ght")}

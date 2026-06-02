@@ -126,6 +126,51 @@ def _get_user(user_id):
         db.close()
 
 
+def _get_current_sl(user_id, coin):
+    """Aktueller SL aus dem letzten offenen managed_trade. Für SL-Ratchet (Phase 1)."""
+    db = SessionLocal()
+    try:
+        mt = (db.query(ManagedTrade)
+              .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                      ManagedTrade.status != "closed")
+              .order_by(ManagedTrade.id.desc()).first())
+        return mt.stop_loss if mt else None
+    finally:
+        db.close()
+
+
+def _pause_user_bad_key(user_id, err_msg):
+    """Bot AUS schalten wenn der Agent-Key nicht parsebar ist (Adresse-statt-Key).
+    Genau EINE Activity-Zeile statt 100 Tracebacks pro Tag."""
+    db = SessionLocal()
+    try:
+        u = db.get(User, user_id)
+        if not u or not u.bot_active:
+            return  # idempotent — schon pausiert oder weg
+        u.bot_active = False
+        db.add(Activity(
+            user_id=user_id,
+            kind="error",
+            text=("Agent-Key ungültig (sieht aus wie eine 42-Zeichen-Adresse, "
+                  "erwartet wird der 66-Zeichen-Agent-Key). Bot pausiert. "
+                  "Im Dashboard den korrekten Agent-Key neu speichern, dann selbst wieder aktivieren."),
+        ))
+        db.commit()
+        log.warning("user %s auto-paused: invalid agent key (%s)", user_id, err_msg[:120])
+    except Exception as e:
+        log.error("auto-pause failed for user %s: %s", user_id, e)
+    finally:
+        db.close()
+
+
+def _is_bad_key_error(exc):
+    """Klassifiziert eine Exception als 'Key kaputt' (vs anderer Fehler).
+    Trifft den eth-account-Validator: 'private key must be exactly 32 bytes'."""
+    s = str(exc).lower()
+    return ("private key must be exactly 32 bytes" in s
+            or "unexpected private key length" in s)
+
+
 # ── Signal-Eingang ───────────────────────────────────────────────────────────
 async def handle_signal(embed: dict):
     sig = parse_signal(embed)
@@ -138,8 +183,12 @@ async def handle_signal(embed: dict):
     is_entry = action in ("NEW_TRADE", "UPDATE_TRADE")
     if not is_cancel and not is_entry:
         return
-    # Confidence-Gate nur für Einstiege (NEW/UPDATE)
-    if is_entry and sig.confidence is not None and sig.confidence < config.MIN_CONFIDENCE:
+    # Confidence-Gate für ALLE Aktionen (Phase 1: vorher nur Einstiege).
+    # Low-confidence CANCEL hat zuvor offene Positionen mid-trade geschlossen
+    # und Verluste festgenagelt — eine der Haupt-Verlustquellen.
+    if sig.confidence is not None and sig.confidence < config.MIN_CONFIDENCE:
+        log.info("Signal %s %s ignoriert: confidence %.2f < %.2f",
+                 action, coin_of(sig.ticker), sig.confidence, config.MIN_CONFIDENCE)
         return
 
     db = SessionLocal()
@@ -178,6 +227,15 @@ async def _open_or_update(user_id, sig):
             else:
                 await asyncio.to_thread(trader.cancel_orders, coin)   # evtl. alte Ruhe-Order weg
                 await _open_new(trader, u, sig)           # frisch eröffnen
+        except ValueError as e:
+            # Bad-Key Auto-Pause (Phase 1): User hat eine 42-char Adresse statt
+            # des 66-char Agent-Keys gespeichert. Statt 100 Tracebacks pro Tag
+            # einmalig pausieren + klare Activity-Meldung.
+            if _is_bad_key_error(e):
+                _pause_user_bad_key(user_id, str(e))
+                return
+            log.exception("user %s %s: %s", user_id, coin, e)
+            _log_activity(user_id, "error", f"{coin}: {e}")
         except Exception as e:
             log.exception("user %s %s: %s", user_id, coin, e)
             _log_activity(user_id, "error", f"{coin}: {e}")
@@ -226,7 +284,14 @@ async def _open_new(trader, u, sig):
 
 
 async def _adjust(trader, u, sig, pos):
-    """These hat sich geändert, Position ist offen -> SL/TP auf neue Level nachziehen."""
+    """These hat sich geändert, Position ist offen -> SL/TP auf neue Level nachziehen.
+
+    SL-RATCHET (Phase 1, 2026-06-02): Ein UPDATE_TRADE darf den SL NUR in
+    Richtung 'sicherer' verschieben (LONG: höher; SHORT: niedriger). Loosen
+    war die größte Verlustquelle (BNB SL 695→725 = −€25 zusätzlich, DOGE
+    SL 0.113→0.172 = 70 % gelockert, NEAR zickzack). Verworfene Updates
+    werden geloggt; der bestehende Schutz bleibt unverändert.
+    """
     coin = coin_of(sig.ticker)
     is_buy = pos > 0
     if sig.stop_loss is None:
@@ -234,6 +299,21 @@ async def _adjust(trader, u, sig, pos):
         _log_activity(u.id, "update", f"{coin}: Update ohne neuen SL — bestehender Schutz bleibt")
         _save_managed(u.id, coin, sig, status="open")
         return
+
+    # ── SL-RATCHET — Update verwerfen, wenn es das Risiko erhöht ─────────
+    current_sl = _get_current_sl(u.id, coin)
+    if current_sl is not None:
+        loosens = (is_buy and sig.stop_loss < current_sl) or (not is_buy and sig.stop_loss > current_sl)
+        if loosens:
+            _log_activity(
+                u.id, "update",
+                f"{coin}: SL-Update {sig.stop_loss} abgelehnt (würde Risiko erhöhen — "
+                f"aktueller SL {current_sl}, {'LONG' if is_buy else 'SHORT'}). Bestehender Schutz bleibt."
+            )
+            # WICHTIG: managed_trade NICHT überschreiben, sonst zukünftige
+            # Ratchet-Checks vergleichen gegen den falschen Wert.
+            return
+
     tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
     await asyncio.to_thread(trader.cancel_orders, coin)            # alte SL/TP weg
     prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sig.stop_loss, tps)
@@ -248,6 +328,16 @@ async def _adjust(trader, u, sig, pos):
 
 # ── CANCEL_TRADE ─────────────────────────────────────────────────────────────
 async def _cancel(user_id, sig):
+    """CANCEL-Behandlung — NUR pre-entry (Phase 1, 2026-06-02).
+
+    Vorher hat ein CANCEL_TRADE-Signal offene Positionen sofort per Market
+    geschlossen, auch wenn die Position underwater war. Das war neben dem
+    SL-Loosen die zweite Haupt-Verlustquelle (0/13 Trades trafen TP, 4/13
+    wurden per CANCEL im Minus geschlossen). Ab jetzt: bei offener Position
+    wird CANCEL ignoriert — der Trade exitiert ausschließlich via SL/TP.
+    Pre-entry (Limit ruht, noch nicht gefüllt) wird die Order weiterhin
+    gecancelt.
+    """
     u = _get_user(user_id)
     if not u:
         return
@@ -255,17 +345,28 @@ async def _cancel(user_id, sig):
     async with _lock_for(user_id, coin):
         try:
             trader = await _build_trader(u)
-            await asyncio.to_thread(trader.cancel_orders, coin)
             pos = await asyncio.to_thread(trader.position_size, coin)
+
             if abs(pos) > 0:
-                res = await asyncio.to_thread(trader.close_position, coin)
-                if res.get("ok"):
-                    _log_activity(user_id, "close", f"{coin}: geschlossen — These invalidiert (qty {abs(pos):.6g})")
-                else:
-                    _log_activity(user_id, "error", f"{coin}: Schließen fehlgeschlagen — {res.get('error')}")
-            else:
-                _log_activity(user_id, "close", f"{coin}: Order gecancelt — These invalidiert")
+                # Position OFFEN -> CANCEL ignorieren, SL/TP übernehmen den Exit.
+                _log_activity(
+                    user_id, "skip",
+                    f"{coin}: CANCEL ignoriert — Position offen (qty {abs(pos):.6g}). "
+                    f"Exit erfolgt über SL/TP."
+                )
+                return
+
+            # Position FLAT -> evtl. ruhende Limit-Entry-Order canceln.
+            n = await asyncio.to_thread(trader.cancel_orders, coin)
+            if n > 0:
+                _log_activity(user_id, "close", f"{coin}: pre-entry Limit gecancelt (n={n}) — These invalidiert")
             _close_managed(user_id, coin)
+        except ValueError as e:
+            if _is_bad_key_error(e):
+                _pause_user_bad_key(user_id, str(e))
+                return
+            log.exception("cancel user %s %s: %s", user_id, coin, e)
+            _log_activity(user_id, "error", f"{coin} cancel: {e}")
         except Exception as e:
             log.exception("cancel user %s %s: %s", user_id, coin, e)
             _log_activity(user_id, "error", f"{coin} cancel: {e}")

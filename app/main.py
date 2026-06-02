@@ -2,12 +2,16 @@
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 import httpx
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app import config
 from app.auth import current_user, hash_pw, make_token, verify_pw
@@ -15,6 +19,25 @@ from app.db import get_db, init_db
 from app.models import Activity, User
 from app.schemas import Login, Register, SettingsIn, WalletIn
 from app.discord_oauth import exchange_code, get_discord_user, get_guild_member, has_required_role
+
+
+# ── Rate limiting (Phase 1, 2026-06-02) ─────────────────────────────────────
+# Honor X-Forwarded-For from the Caddy reverse-proxy so login attempts are
+# bucketed by real client IP, not by the bridge IP of whatever proxy sits
+# in front of uvicorn.
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_ip)
+LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "10/5minute")
+REGISTER_RATE_LIMIT = os.getenv("REGISTER_RATE_LIMIT", "5/5minute")
+
+OAUTH_STATE_COOKIE = "discord_oauth_state"
+OAUTH_STATE_TTL_S = 600  # 10 min, plenty for a sane user flow
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("goathub")
@@ -36,11 +59,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GoatHub Trading Bot", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 @app.post("/api/register")
-def register(body: Register, db: Session = Depends(get_db)):
+@limiter.limit(REGISTER_RATE_LIMIT)
+def register(request: Request, body: Register, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     if "@" not in email or len(body.password) < 6:
         raise HTTPException(400, "Valid email + password (min. 6 chars) required")
@@ -52,20 +78,39 @@ def register(body: Register, db: Session = Depends(get_db)):
     db.add(u)
     db.commit()
     db.refresh(u)
-    return {"access_token": make_token(u.id), "token_type": "bearer"}
+    return {"access_token": make_token(u.id, getattr(u, "token_version", 0)), "token_type": "bearer"}
 
 
 @app.post("/api/login")
-def login(body: Login, db: Session = Depends(get_db)):
+@limiter.limit(LOGIN_RATE_LIMIT)
+def login(request: Request, body: Login, db: Session = Depends(get_db)):
     u = db.query(User).filter(User.email == body.email.strip().lower()).first()
     if not u or not verify_pw(body.password, u.password_hash):
         raise HTTPException(401, "Wrong email or password")
-    return {"access_token": make_token(u.id), "token_type": "bearer"}
+    return {"access_token": make_token(u.id, getattr(u, "token_version", 0)), "token_type": "bearer"}
+
+
+@app.post("/api/logout")
+def logout(u: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Server-side logout — bumps token_version so every JWT issued before
+    this point stops validating. Even if a token was exfiltrated via XSS, it
+    is now useless after the user clicks Logout."""
+    u.token_version = int(getattr(u, "token_version", 0) or 0) + 1
+    db.commit()
+    return {"ok": True, "message": "Alle bestehenden Sessions invalidiert."}
 
 
 @app.get("/auth/discord")
 def discord_login():
-    """Redirect to Discord OAuth2."""
+    """Redirect to Discord OAuth2 with a CSRF-protecting `state` parameter.
+
+    Phase 1 (2026-06-02): vorher hatte der Flow KEIN state → klassische OAuth-
+    CSRF-Lücke. Wir generieren ein zufälliges Token, schicken es per httpOnly-
+    Cookie an den Browser UND als state-Param an Discord. Beim Callback
+    vergleichen wir Cookie vs. Query-Param — stimmen sie nicht überein, wird
+    der Flow verweigert.
+    """
+    state = secrets.token_urlsafe(32)
     scopes = "identify guilds"
     url = (
         f"https://discord.com/oauth2/authorize"
@@ -73,15 +118,36 @@ def discord_login():
         f"&redirect_uri={config.DISCORD_REDIRECT_URI}"
         f"&response_type=code"
         f"&scope={scopes.replace(' ', '%20')}"
+        f"&state={state}"
     )
-    return RedirectResponse(url)
+    response = RedirectResponse(url)
+    response.set_cookie(
+        OAUTH_STATE_COOKIE,
+        state,
+        max_age=OAUTH_STATE_TTL_S,
+        httponly=True,
+        secure=True,        # Caddy terminiert TLS → HTTPS-only
+        samesite="lax",     # erlaubt Top-Level-Navigation vom Discord-Redirect
+        path="/auth",
+    )
+    return response
 
 
 @app.get("/auth/callback")
-async def discord_callback(code: str = None, error: str = None, db: Session = Depends(get_db)):
-    """Handle Discord OAuth callback."""
+async def discord_callback(request: Request, code: str = None, state: str = None, error: str = None, db: Session = Depends(get_db)):
+    """Handle Discord OAuth callback — mit CSRF-state-Check (Phase 1)."""
+    # CSRF-Check: state aus dem Query-Param muss mit dem httpOnly-Cookie übereinstimmen.
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE)
+    if not expected_state or not state or not secrets.compare_digest(state, expected_state):
+        log.warning("OAuth state mismatch (cookie=%s, query=%s)", bool(expected_state), bool(state))
+        resp = RedirectResponse("/?error=oauth_state_mismatch")
+        resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+        return resp
+
     if error or not code:
-        return RedirectResponse("/?error=discord_denied")
+        resp = RedirectResponse("/?error=discord_denied")
+        resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+        return resp
 
     try:
         # Exchange code for token
@@ -98,7 +164,9 @@ async def discord_callback(code: str = None, error: str = None, db: Session = De
         if config.DISCORD_GUILD_ID and config.DISCORD_BOT_TOKEN:
             member = await get_guild_member(discord_id, config.DISCORD_BOT_TOKEN, config.DISCORD_GUILD_ID)
             if not has_required_role(member, config.DISCORD_REQUIRED_ROLE_ID):
-                return RedirectResponse("/?error=no_role")
+                resp = RedirectResponse("/?error=no_role")
+                resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+                return resp
 
         # Find or create user by discord_id
         u = db.query(User).filter(User.discord_id == discord_id).first()
@@ -122,14 +190,18 @@ async def discord_callback(code: str = None, error: str = None, db: Session = De
             u.discord_avatar = avatar
             db.commit()
 
-        jwt_token = make_token(u.id)
+        jwt_token = make_token(u.id, getattr(u, "token_version", 0))
         # Token im URL-FRAGMENT (#) — Fragmente werden NICHT an den Server gesendet,
         # landen also nicht in Access-Logs/Proxys/Referer. (vorher ?token= = Leak-Risiko)
-        return RedirectResponse(f"/#token={jwt_token}")
+        resp = RedirectResponse(f"/#token={jwt_token}")
+        resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+        return resp
 
     except Exception as e:
         log.error(f"Discord OAuth error: {e}")
-        return RedirectResponse("/?error=oauth_failed")
+        resp = RedirectResponse("/?error=oauth_failed")
+        resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+        return resp
 
 
 def _user_public(u: User):

@@ -21,6 +21,8 @@ def init_db():
             ("discord_username", "VARCHAR"),
             ("discord_avatar", "VARCHAR"),
             ("created_at", "DATETIME"),
+            # Phase 1 (2026-06-02): JWT-Versionierung für Server-side-Logout.
+            ("token_version", "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef}"))
