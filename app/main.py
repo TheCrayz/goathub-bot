@@ -104,6 +104,11 @@ async def lifespan(app: FastAPI):
     # Activity-Purge läuft IMMER (auch wenn Listener aus ist) — die Tabelle
     # wächst auch über manuelle Settings-Änderungen, Login-Events etc.
     tasks.append(asyncio.create_task(_activity_purge_loop()))
+    # Phase 6+ (2026-06-03): Position-Sync-Loop — reconcilet managed_trades
+    # gegen die echte HL-Position-State. Verhindert "stale open"-Rows wenn
+    # HL via SL/TP autonom schließt (siehe SOL id=24 vom 03:38 UTC).
+    from app.sync import position_sync_loop
+    tasks.append(asyncio.create_task(position_sync_loop()))
     yield
     for t in tasks:
         t.cancel()
