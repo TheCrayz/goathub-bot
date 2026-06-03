@@ -25,6 +25,7 @@ jobs:
           ENCRYPTION_KEY: AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=
         run: |
           PYTHONPATH=. python tests/test_core.py
+          PYTHONPATH=. python tests/test_engine.py
 
   deploy:
     name: 🚀 Deploy to GoatHub Server

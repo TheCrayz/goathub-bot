@@ -174,7 +174,7 @@ def _is_bad_key_error(exc):
             or "unexpected private key length" in s)
 
 
-def _per_coin_stats(user_addr: str, coin: str) -> dict | None:
+def _per_coin_stats(user_addr: str, coin: str):
     """Per-coin Trade-Event-Stats aus HL-Fills (Phase 2 #27, 2026-06-02).
     Cluster Partial-Fills (≤60s, gleiche Seite) zu Events; return win_rate + count.
     10-Min-Cache pro (user, coin) damit nicht jeder Trade einen Info-Call löst.
@@ -222,7 +222,7 @@ def _per_coin_stats(user_addr: str, coin: str) -> dict | None:
     return result
 
 
-def _per_coin_blocked(user_addr: str, coin: str) -> tuple[bool, dict | None]:
+def _per_coin_blocked(user_addr: str, coin: str):
     """True wenn Coin per-coin-filter blocken soll. Liefert (blocked, stats)."""
     s = _per_coin_stats(user_addr, coin)
     if s is None:
