@@ -141,18 +141,45 @@ class HyperliquidTrader:
             out["error"] = st["error"]
         return out
 
-    def place_protection(self, coin, is_buy, sz, sl_px, tps):
+    def place_protection(self, coin, is_buy, sz, sl_px, tps, slippage_cap=None):
+        """Setze SL + TPs als Schutz-Orders.
+
+        Phase 6+ (2026-06-03, H-8): Slippage-Cap. Vorher passte das `px`-Feld bei
+        isMarket=true das gleiche wie triggerPx → HL nutzte default-Slippage und SL
+        füllte in dünnen Märkten beliebig schlecht (SOL -30 USDC am 2026-06-03 mit
+        7.94 % Slippage trotz SL bei 72.5 → exit 66.74). Jetzt setzen wir explizit
+        den Worst-Case-Preis SLIPPAGE_CAP schlechter als triggerPx. Trade-off:
+        Gaps > Cap → Order füllt nicht (Position bleibt offen bis Position-Sync /
+        manueller Eingriff). Auf Testnet besser 3 %, auf Mainnet ggf. 1.5 %.
+        """
         coin = coin_of(coin)
         sz = self._round_sz(coin, sz)
         res = {"sl": None, "tp": [], "sl_ok": False}
-        res["sl"] = self._order(coin, not is_buy, sz, round_sig(sl_px),
+        # cap defaults aus app.config; getattr-Fallback damit das Module ohne config importierbar bleibt
+        if slippage_cap is None:
+            try:
+                from app import config as _cfg
+                slippage_cap = float(getattr(_cfg, "SL_SLIPPAGE_CAP", 0.02))
+            except Exception:
+                slippage_cap = 0.02
+
+        # Schutz-Order-Richtung = umgekehrt zur Entry-Position
+        is_buy_protection = not is_buy
+        # Worst-Case-Preis-Logik:
+        #   - Sell-side (closing LONG): worst = unter dem Trigger → cap * (1 - x)
+        #   - Buy-side (closing SHORT): worst = über dem Trigger → cap * (1 + x)
+        sign = 1 if is_buy_protection else -1
+        sl_worst = round_sig(sl_px * (1 + sign * slippage_cap))
+
+        res["sl"] = self._order(coin, is_buy_protection, sz, sl_worst,
                                 {"trigger": {"triggerPx": round_sig(sl_px), "isMarket": True, "tpsl": "sl"}},
                                 reduce_only=True)
         res["sl_ok"] = self._status_ok(res["sl"])
         for px, frac in (tps or []):
             tp_sz = self._round_sz(coin, sz * frac)
             if tp_sz > 0:
-                res["tp"].append(self._order(coin, not is_buy, tp_sz, round_sig(px),
+                tp_worst = round_sig(px * (1 + sign * slippage_cap))
+                res["tp"].append(self._order(coin, is_buy_protection, tp_sz, tp_worst,
                                  {"trigger": {"triggerPx": round_sig(px), "isMarket": True, "tpsl": "tp"}},
                                  reduce_only=True))
         return res
@@ -173,14 +200,27 @@ class HyperliquidTrader:
             log.warning("open_orders(%s): %s", coin, e)
         return n
 
-    def close_position(self, coin):
-        """Offene Position per Market schließen (reduce-only, ohne Builder-Code)."""
+    def close_position(self, coin, slippage_cap=None):
+        """Offene Position per Market schließen (reduce-only, ohne Builder-Code).
+        Phase 6+ (2026-06-03, H-8): explizite Slippage-Cap statt HL-Default (8 %).
+        """
         coin = coin_of(coin)
         psz = self.position_size(coin)
         if abs(psz) == 0:
             return {"ok": True, "closed": 0.0}
+        if slippage_cap is None:
+            try:
+                from app import config as _cfg
+                slippage_cap = float(getattr(_cfg, "SL_SLIPPAGE_CAP", 0.02))
+            except Exception:
+                slippage_cap = 0.02
         try:
-            raw = self.exchange.market_close(coin)
+            # market_close akzeptiert slippage-Kwarg im HL-SDK (default 0.05).
+            # Falls eine SDK-Version den Kwarg nicht hat, fallback.
+            try:
+                raw = self.exchange.market_close(coin, slippage=slippage_cap)
+            except TypeError:
+                raw = self.exchange.market_close(coin)
             ok = isinstance(raw, dict) and raw.get("status") == "ok"
             return {"ok": ok, "closed": abs(psz), "raw": raw}
         except Exception as e:

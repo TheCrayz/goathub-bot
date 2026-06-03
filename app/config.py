@@ -75,6 +75,16 @@ PERCOIN_MIN_TRADES = _i("PERCOIN_MIN_TRADES", 10)
 PERCOIN_MIN_WINRATE = _f("PERCOIN_MIN_WINRATE", 0.30)
 PERCOIN_CACHE_TTL_S = _i("PERCOIN_CACHE_TTL_S", 600)     # HL-fills nur alle 10 Min neu ziehen
 
+# Phase 6+ (2026-06-03): SL/TP-Slippage-Cap.
+# Bisher passte place_protection px=trigger_px bei isMarket=true → HL hat den
+# Default genutzt und SL in dünnen Märkten mit -7.94 % Slippage ausgeführt
+# (SOL-Disaster 2026-06-03 03:38 UTC: -30 USDC bei 3.87 SOL). Jetzt setzen wir
+# explizit den Worst-Case-Preis 2 % schlechter als der Trigger. Trade-off: bei
+# Gaps > 2 % wird die Order nicht gefüllt → seltene naked-position-Restzeit,
+# bis Position-Sync sie aufpickt oder manueller Eingriff. Für Mainnet kann
+# das tighter sein, für Testnet (dünne Bücher) eher 3 %.
+SL_SLIPPAGE_CAP = _f("SL_SLIPPAGE_CAP", 0.02)            # 2 %, env: SL_SLIPPAGE_CAP=0.03 für mehr Toleranz
+
 # Discord OAuth2
 DISCORD_CLIENT_ID = _g("DISCORD_CLIENT_ID", "1508987342482837524")
 DISCORD_CLIENT_SECRET = _g("DISCORD_CLIENT_SECRET", "")   # NUR aus .env — niemals im Code (Secret rotieren!)
