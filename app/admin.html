@@ -68,6 +68,10 @@
         <div class="stat"><div class="stat-h">USD / week (extrapol.)</div><div class="stat-v" id="c-weekcost">—</div></div>
       </div>
       <div class="mut" style="font-size:11px" id="c-note">Estimate; real cost via Google Cloud Billing.</div>
+      <!-- Phase 6+ (2026-06-03): real-cost-block from TOKEN_USAGE logs -->
+      <div style="margin-top:10px;padding:10px;background:#0a100d;border-radius:6px" id="real-cost-block">
+        <span class="mut">Loading real token usage…</span>
+      </div>
       <div style="overflow-x:auto;margin-top:8px"><table id="ctbl"><thead><tr>
         <th>ts</th><th>processed</th><th>hold</th><th>signals (new/upd/cancel)</th>
         <th>pro est.</th><th>ai_skip</th><th>scrape_fail</th>
@@ -199,6 +203,26 @@ async function loadCost(){
       document.getElementById("c-cyclecost").textContent="$"+(c.estimates.usd_per_cycle_avg||0);
       document.getElementById("c-weekcost").textContent="$"+(c.estimates.usd_per_week_extrapolated||0);
       document.getElementById("c-note").textContent=c.estimates.note||"";
+    }
+    // Phase 6+ (2026-06-03): real TOKEN_USAGE-basierte Cost-Daten anzeigen
+    if(c.real){
+      const r=c.real;
+      const block=document.getElementById("real-cost-block");
+      if(block){
+        if(r.error||!r.per_model){
+          block.innerHTML='<span class="mut">No real-cost data yet — restart signal-bot to start TOKEN_USAGE logging.'+(r.error?' Error: '+esc(r.error):'')+'</span>';
+        }else{
+          let html='<div style="font-size:12px;margin-bottom:8px;color:#9fb8af">Real tokens (last 10MB of bot.log):</div>';
+          html+='<table><thead><tr><th>model</th><th>calls</th><th>prompt</th><th>output</th><th>thoughts</th><th>cached</th><th>USD</th></tr><tbody>';
+          for(const [model,m] of Object.entries(r.per_model||{})){
+            html+=`<tr><td><b>${esc(model)}</b></td><td>${m.calls}</td><td>${m.prompt.toLocaleString()}</td>
+              <td>${m.output.toLocaleString()}</td><td>${m.thoughts.toLocaleString()}</td>
+              <td class="mut">${m.cached.toLocaleString()}</td><td><b>$${m.usd.toFixed(4)}</b></td></tr>`;
+          }
+          html+=`</tbody></table><div style="margin-top:8px"><b>Total: ${r.total_calls} calls = $${(r.total_usd_so_far||0).toFixed(4)} USD</b></div>`;
+          block.innerHTML=html;
+        }
+      }
     }
     const tb=document.querySelector("#ctbl tbody"); tb.innerHTML="";
     (c.cycles||[]).slice(0,15).forEach(x=>{

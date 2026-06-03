@@ -191,9 +191,9 @@ def admin_trades(
 
 @router.get("/cost")
 def admin_cost(_: User = Depends(current_admin_user)):
-    """Gemini-API-Cost-Indikatoren aus den Signal-bot Cycle-Logs.
-    Liest die letzten N CYCLE-COMPLETE-Zeilen aus der signal-bot bot_logs Tabelle
-    und parst die strukturierten Werte (processed/hold/signals/...).
+    """Gemini-API-Cost — zwei Datenquellen:
+      A) Heuristic-Estimate aus bot_logs CYCLE-COMPLETE-Zeilen (immer da)
+      B) Real-Cost aus bot.log TOKEN_USAGE-Zeilen (seit 2026-06-03 deployed)
     """
     import re
     import sqlite3
@@ -201,64 +201,117 @@ def admin_cost(_: User = Depends(current_admin_user)):
         "SIGNALBOT_DB_PATH",
         "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/charthub.db",
     )
+    sb_log = os.getenv(
+        "SIGNALBOT_LOG_PATH",
+        "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/logs/bot.log",
+    )
     out = {
         "signalbot_db_found": os.path.exists(sb_db),
+        "signalbot_log_found": os.path.exists(sb_log),
         "cycles": [],
         "estimates": {},
+        "real": {},
         "error": None,
     }
-    if not os.path.exists(sb_db):
-        out["error"] = f"signal-bot DB not at {sb_db}"
-        return out
-    try:
-        con = sqlite3.connect(f"file:{sb_db}?mode=ro", uri=True, timeout=2)
-        cur = con.cursor()
-        cur.execute(
-            "SELECT timestamp, message FROM bot_logs "
-            "WHERE message LIKE 'CYCLE COMPLETE:%' "
-            "ORDER BY id DESC LIMIT 50"
+    # ── A) Heuristic-Estimate aus CYCLE-COMPLETE ───────────────────────────
+    if os.path.exists(sb_db):
+        try:
+            con = sqlite3.connect(f"file:{sb_db}?mode=ro", uri=True, timeout=2)
+            cur = con.cursor()
+            cur.execute(
+                "SELECT timestamp, message FROM bot_logs "
+                "WHERE message LIKE 'CYCLE COMPLETE:%' "
+                "ORDER BY id DESC LIMIT 50"
+            )
+            rows = cur.fetchall()
+            con.close()
+        except Exception as e:
+            out["error"] = str(e)[:200]
+            rows = []
+        rx = re.compile(
+            r"processed=(\d+)\s+hold=(\d+)\s+signals=(\d+)\s+\(new=(\d+)\s+upd=(\d+)\s+cancel=(\d+)\)"
+            r"\s+ai_skip=(\d+)\s+ai_timeout=(\d+)\s+scrape_fail=(\d+)\s+scrape_timeout=(\d+)"
         )
-        rows = cur.fetchall()
-        con.close()
-    except Exception as e:
-        out["error"] = str(e)[:200]
-        return out
-
-    rx = re.compile(
-        r"processed=(\d+)\s+hold=(\d+)\s+signals=(\d+)\s+\(new=(\d+)\s+upd=(\d+)\s+cancel=(\d+)\)"
-        r"\s+ai_skip=(\d+)\s+ai_timeout=(\d+)\s+scrape_fail=(\d+)\s+scrape_timeout=(\d+)"
-    )
-    for ts, msg in rows:
-        m = rx.search(msg or "")
-        if not m:
-            continue
-        p, h, s, nw, up, ca, sk, to, sf, st = map(int, m.groups())
-        out["cycles"].append({
-            "ts": ts,
-            "processed": p, "hold": h, "signals_total": s,
-            "new_trade": nw, "update_trade": up, "cancel_trade": ca,
-            "ai_skip": sk, "ai_timeout": to,
-            "scrape_fail": sf, "scrape_timeout": st,
-            "pro_calls_estimate": s + sk,  # rough — escalated to Pro then succeeded or failed
-        })
-
-    # Aggregierte Schätzung über die letzten N Cycles
-    if out["cycles"]:
-        n = len(out["cycles"])
-        total_flash = sum(c["processed"] for c in out["cycles"])  # je Cycle = 1 Flash/Coin
-        total_pro = sum(c["pro_calls_estimate"] for c in out["cycles"])
-        # Kosten-Schätzung mit thinking_budget=0 (Flash) und =1024 (Pro), siehe vision.py Header
-        cost_flash = total_flash * 0.001        # ~$0.001 / call (no thinking)
-        cost_pro = total_pro * 0.02             # ~$0.02 / call (thinking capped at 1024)
-        out["estimates"] = {
-            "cycles_sampled": n,
-            "flash_calls_total": total_flash,
-            "pro_calls_total_est": total_pro,
-            "usd_total_est": round(cost_flash + cost_pro, 2),
-            "usd_per_cycle_avg": round((cost_flash + cost_pro) / max(1, n), 4),
-            "usd_per_week_extrapolated": round((cost_flash + cost_pro) / max(1, n) * 168, 2),  # 1 cycle/h × 168h
-            "note": "Estimate based on thinking_budget=0 Flash + 1024 Pro. Actual: check Google Cloud Billing.",
-        }
+        for ts, msg in rows:
+            m = rx.search(msg or "")
+            if not m:
+                continue
+            p, h, s, nw, up, ca, sk, to, sf, st = map(int, m.groups())
+            out["cycles"].append({
+                "ts": ts, "processed": p, "hold": h, "signals_total": s,
+                "new_trade": nw, "update_trade": up, "cancel_trade": ca,
+                "ai_skip": sk, "ai_timeout": to,
+                "scrape_fail": sf, "scrape_timeout": st,
+                "pro_calls_estimate": s + sk,
+            })
+        if out["cycles"]:
+            n = len(out["cycles"])
+            total_flash = sum(c["processed"] for c in out["cycles"])
+            total_pro = sum(c["pro_calls_estimate"] for c in out["cycles"])
+            cost_flash = total_flash * 0.001
+            cost_pro = total_pro * 0.02
+            out["estimates"] = {
+                "cycles_sampled": n,
+                "flash_calls_total": total_flash,
+                "pro_calls_total_est": total_pro,
+                "usd_total_est": round(cost_flash + cost_pro, 2),
+                "usd_per_cycle_avg": round((cost_flash + cost_pro) / max(1, n), 4),
+                "usd_per_week_extrapolated": round((cost_flash + cost_pro) / max(1, n) * 168, 2),
+                "note": "Heuristic estimate; see 'real' section for actual TOKEN_USAGE data.",
+            }
+    # ── B) Real-Cost aus TOKEN_USAGE-Zeilen ──────────────────────────────────
+    if os.path.exists(sb_log):
+        try:
+            # Phase 6+ (2026-06-03): parse TOKEN_USAGE lines added in vision.py.
+            # Format: 'TOKEN_USAGE model=gemini-2.5-flash prompt=2242 output=41 thoughts=0 cached=0'
+            tu_rx = re.compile(
+                r"TOKEN_USAGE\s+model=(\S+)\s+prompt=(\d+)\s+output=(\d+)\s+thoughts=(\d+)\s+cached=(\d+)"
+            )
+            # Gemini Pricing (2025): per million tokens
+            PRICING = {
+                "gemini-2.5-flash": {"in": 0.075,  "out": 0.30,  "thought": 0.30, "cached": 0.01875},
+                "gemini-2.5-pro":   {"in": 1.25,   "out": 10.00, "thought": 10.00, "cached": 0.3125},
+            }
+            per_model = {}
+            # Read up to last 10 MB of the log (avoid OOM on huge logs)
+            import io
+            sz = os.path.getsize(sb_log)
+            with open(sb_log, "rb") as f:
+                if sz > 10 * 1024 * 1024:
+                    f.seek(sz - 10 * 1024 * 1024)
+                tail = f.read().decode("utf-8", errors="ignore")
+            for line in tail.splitlines():
+                m = tu_rx.search(line)
+                if not m:
+                    continue
+                model, prompt, output, thoughts, cached = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))
+                if model not in per_model:
+                    per_model[model] = {"calls": 0, "prompt": 0, "output": 0, "thoughts": 0, "cached": 0, "usd": 0.0}
+                rec = per_model[model]
+                rec["calls"] += 1
+                rec["prompt"] += prompt
+                rec["output"] += output
+                rec["thoughts"] += thoughts
+                rec["cached"] += cached
+                p = PRICING.get(model, {"in": 0, "out": 0, "thought": 0, "cached": 0})
+                # Uncached prompt = prompt - cached (we report total prompt but charge only the non-cached delta)
+                uncached_prompt = max(0, prompt - cached)
+                rec["usd"] += (
+                    uncached_prompt * p["in"] / 1_000_000
+                    + cached * p["cached"] / 1_000_000
+                    + output * p["out"] / 1_000_000
+                    + thoughts * p["thought"] / 1_000_000
+                )
+            total_calls = sum(r["calls"] for r in per_model.values())
+            total_usd = sum(r["usd"] for r in per_model.values())
+            out["real"] = {
+                "per_model": {k: {**v, "usd": round(v["usd"], 4)} for k, v in per_model.items()},
+                "total_calls": total_calls,
+                "total_usd_so_far": round(total_usd, 4),
+                "note": "Real token counts from vision.py TOKEN_USAGE logs (last 10MB of bot.log).",
+            }
+        except Exception as e:
+            out["real"] = {"error": str(e)[:200]}
     return out
 
 
