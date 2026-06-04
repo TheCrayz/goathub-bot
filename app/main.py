@@ -382,9 +382,8 @@ def _query_on_chain_builder_fee(user_addr: str, builder_addr: str) -> int:
     """Frag Hyperliquid nach dem aktuell on-chain approved max-fee für (user, builder).
     Antwort ist in basis points (1bp = 0.01%). 0 = nicht freigegeben.
     Wirft im Fehlerfall (Network, Format) — Caller behandelt."""
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-    info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
+    from app.hyperliquid_exec import get_info
+    info = get_info(config.HL_TESTNET)
     # SDK exposes `post` for arbitrary Info-API requests. The maxBuilderFee
     # request returns a number (or string number) representing approved bps.
     raw = info.post("/info", {"type": "maxBuilderFee", "user": user_addr, "builder": builder_addr})
@@ -535,9 +534,8 @@ def mark_builder_approved(u: User = Depends(current_user), db: Session = Depends
 # ── Dashboard-Daten (Live-PNL/Positionen + Aktivität) ────────────────────────
 def _snapshot(address: str):
     """Read-only Konto-Snapshot + PnL-Statistik über die Info-API (kein Key nötig)."""
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-    info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
+    from app.hyperliquid_exec import get_info
+    info = get_info(config.HL_TESTNET)
     st = info.user_state(address)
     bal = float(st.get("marginSummary", {}).get("accountValue", 0) or 0)
     try:

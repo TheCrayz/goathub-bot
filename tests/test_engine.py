@@ -132,20 +132,24 @@ def test_pause_user_bad_key_idempotent():
 
 
 def test_get_current_sl():
-    """Liest den SL aus dem neuesten non-closed managed_trade."""
+    """Liest (SL, direction) aus dem neuesten non-closed managed_trade.
+
+    2026-06-04 audit-fix (B-#1): Funktion gibt jetzt Tuple (sl, direction) zurück
+    statt nur sl, damit _adjust den Ratchet aufgeben kann bei Direction-Flips.
+    """
     _reset_db()
     db = SessionLocal()
     _make_user(db, user_id=1)
-    _make_managed(db, user_id=1, coin="ETH", stop_loss=1890.0, status="closed")  # älteste, closed → ignoriert
-    _make_managed(db, user_id=1, coin="ETH", stop_loss=1850.0, status="open")    # älter, open
-    _make_managed(db, user_id=1, coin="ETH", stop_loss=1900.0, status="open")    # neueste → soll gewinnen
+    _make_managed(db, user_id=1, coin="ETH", stop_loss=1890.0, direction="LONG", status="closed")
+    _make_managed(db, user_id=1, coin="ETH", stop_loss=1850.0, direction="LONG", status="open")
+    _make_managed(db, user_id=1, coin="ETH", stop_loss=1900.0, direction="LONG", status="open")  # neueste
     db.close()
-    assert engine._get_current_sl(1, "ETH") == 1900.0, "neuester non-closed SL erwartet"
+    assert engine._get_current_sl(1, "ETH") == (1900.0, "LONG"), "neuester non-closed (SL, direction) erwartet"
 
-    # Anderer Coin → None
-    assert engine._get_current_sl(1, "BTC") is None
-    # Nicht-existenter User → None
-    assert engine._get_current_sl(999, "ETH") is None
+    # Anderer Coin → (None, None)
+    assert engine._get_current_sl(1, "BTC") == (None, None)
+    # Nicht-existenter User → (None, None)
+    assert engine._get_current_sl(999, "ETH") == (None, None)
     print("get_current_sl: OK")
 
 

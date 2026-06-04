@@ -22,6 +22,15 @@ log = logging.getLogger("goathub.sync")
 
 SYNC_INTERVAL_S = int(os.getenv("POSITION_SYNC_INTERVAL_S", "60"))
 
+# 2026-06-04 audit-fix (B-#5): 2-strike-rule gegen API-Latency-false-positives.
+# Wenn HL einmalig wegen Timeout/Partial-Response leeren assetPositions returnt,
+# darf das KEIN managed_trade auf 'closed' flippen — sonst macht der nächste
+# Signal-Trade-Cycle eine doppelte Position. Wir merken uns pro (user_id, coin,
+# mt_id) wieviele aufeinanderfolgende Runs HL die Position als weg gemeldet hat
+# und flippen erst nach _STALE_STRIKES_NEEDED Runs hintereinander.
+_STALE_STRIKES_NEEDED = int(os.getenv("POSITION_SYNC_STRIKES", "2"))
+_stale_counter: dict[tuple[int, str, int], int] = {}
+
 
 async def position_sync_loop():
     """Endlosschleife — startet im lifespan() neben dem Discord-Listener."""
@@ -84,10 +93,8 @@ async def _reconcile_one_user(user_id: int, address: str):
 
     # HL Info API — read-only, kein Decrypt nötig
     try:
-        from hyperliquid.info import Info
-        from hyperliquid.utils import constants
-        url = constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL
-        info = Info(url, skip_ws=True)
+        from app.hyperliquid_exec import get_info
+        info = get_info(config.HL_TESTNET)
         state = await asyncio.to_thread(info.user_state, address)
     except Exception as e:
         log.warning("HL fetch failed for user %d: %s", user_id, e)
@@ -112,17 +119,30 @@ async def _reconcile_one_user(user_id: int, address: str):
         for mt_id, coin in open_coins:
             mt = db.get(ManagedTrade, mt_id)
             if mt is None or mt.status == "closed":
+                # Counter aufräumen — diese Position interessiert uns nicht mehr.
+                _stale_counter.pop((user_id, coin, mt_id), None)
                 continue
             if coin in hl_positions:
-                continue  # HL hat sie noch → ok
-            # HL hat sie NICHT mehr aber DB sagt open → reconcile
+                # HL hat sie wieder → strike-counter reset
+                _stale_counter.pop((user_id, coin, mt_id), None)
+                continue
+            # HL hat sie NICHT — counter erhöhen, aber erst nach N Strikes wirklich closen
+            key = (user_id, coin, mt_id)
+            strikes = _stale_counter.get(key, 0) + 1
+            _stale_counter[key] = strikes
+            if strikes < _STALE_STRIKES_NEEDED:
+                log.debug("position-sync user=%d coin=%s mt=%d: strike %d/%d, warte",
+                          user_id, coin, mt_id, strikes, _STALE_STRIKES_NEEDED)
+                continue
+            # N-te leere Antwort hintereinander → tatsächlich geschlossen
             mt.status = "closed"
             db.add(Activity(
                 user_id=user_id,
                 kind="close",
                 text=(f"{coin}: autonom auf HL geschlossen — Position-Sync hat stale DB-Status "
-                      f"(managed_trade id={mt_id}) auf 'closed' angepasst"),
+                      f"(managed_trade id={mt_id}, {strikes} strikes) auf 'closed' angepasst"),
             ))
+            _stale_counter.pop(key, None)
             closed_count += 1
         if closed_count > 0:
             db.commit()

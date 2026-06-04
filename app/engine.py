@@ -147,14 +147,24 @@ def _get_user(user_id):
 
 
 def _get_current_sl(user_id, coin):
-    """Aktueller SL aus dem letzten offenen managed_trade. Für SL-Ratchet (Phase 1)."""
+    """Aktueller SL + Direction aus dem letzten offenen managed_trade.
+
+    Returns (sl, direction) tuple, oder (None, None) wenn kein offener Trade.
+
+    2026-06-04 audit-fix (B-#1): vorher nur SL ohne Direction. Wenn der DB-Eintrag
+    noch ein altes LONG ist und HL inzwischen SHORT zeigt (z. B. nach manuellem
+    Re-Open des Users), hat der Ratchet die falsche Richtung verglichen. Jetzt
+    gibt der Caller (_adjust) den Ratchet auf wenn DB-Direction != HL-Direction.
+    """
     db = SessionLocal()
     try:
         mt = (db.query(ManagedTrade)
               .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
                       ManagedTrade.status != "closed")
               .order_by(ManagedTrade.id.desc()).first())
-        return mt.stop_loss if mt else None
+        if mt is None:
+            return (None, None)
+        return (mt.stop_loss, (mt.direction or "").upper() or None)
     finally:
         db.close()
 
@@ -202,9 +212,8 @@ def _per_coin_stats(user_addr: str, coin: str):
     if cached and now - cached[0] < config.PERCOIN_CACHE_TTL_S:
         return cached[1]
     try:
-        from hyperliquid.info import Info
-        from hyperliquid.utils import constants
-        info = Info(constants.TESTNET_API_URL if config.HL_TESTNET else constants.MAINNET_API_URL, skip_ws=True)
+        from app.hyperliquid_exec import get_info
+        info = get_info(config.HL_TESTNET)
         fills = info.user_fills(user_addr) or []
     except Exception as e:
         log.warning("per-coin stats: HL fetch failed for %s: %s", user_addr[:8], e)
@@ -284,11 +293,20 @@ async def handle_signal(embed: dict):
         if is_cancel:
             _spawn(_cancel(uid, sig))
         else:
-            _spawn(_open_or_update(uid, sig))
+            _spawn(_open_or_update(uid, sig, action))
 
 
 # ── NEW_TRADE / UPDATE_TRADE ─────────────────────────────────────────────────
-async def _open_or_update(user_id, sig):
+async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
+    """action_type = "NEW_TRADE" or "UPDATE_TRADE".
+
+    2026-06-04 audit-fix (B-#7): UPDATE_TRADE bei pos==0 ist semantisch ein
+    Anpassungs-Signal für eine bereits offene Position, die aber HL nicht (mehr)
+    hat — z. B. weil der User manuell geschlossen hat oder ein vorheriger SL
+    getriggert wurde. Wir sollten KEINE neue Position aufmachen, nur loggen
+    und skippen. Vorher fiel dieser Pfad blind in _open_new und konnte gegen
+    den User-Willen einen frischen Trade öffnen.
+    """
     u = _get_user(user_id)
     if not u:
         return
@@ -303,8 +321,14 @@ async def _open_or_update(user_id, sig):
             if abs(pos) > 0:
                 await _adjust(trader, u, sig, pos)        # Position offen -> SL/TP nachziehen
             else:
+                if action_type == "UPDATE_TRADE":
+                    _log_activity(user_id, "skip",
+                                  f"{coin}: UPDATE_TRADE ohne offene Position — nicht neu eröffnet "
+                                  f"(Original-Position evtl. manuell oder per SL geschlossen).")
+                    _close_managed(user_id, coin)         # DB-State aufräumen
+                    return
                 await asyncio.to_thread(trader.cancel_orders, coin)   # evtl. alte Ruhe-Order weg
-                await _open_new(trader, u, sig)           # frisch eröffnen
+                await _open_new(trader, u, sig)           # NEW_TRADE: frisch eröffnen
         except ValueError as e:
             # Bad-Key Auto-Pause (Phase 1): User hat eine 42-char Adresse statt
             # des 66-char Agent-Keys gespeichert. Statt 100 Tracebacks pro Tag
@@ -337,7 +361,18 @@ async def _open_new(trader, u, sig):
         )
         return
 
-    balance = await asyncio.to_thread(trader.account_value)
+    try:
+        balance = await asyncio.to_thread(trader.account_value)
+    except Exception as e:
+        # 2026-06-04 audit-fix (B-#9): HL-Outage explizit unterscheiden von
+        # "kein Geld" damit Beobachter (Discord-Alert/Admin-Dashboard) sieht
+        # was wirklich los ist. Kein Trade-Open ohne verifiziertes Balance.
+        from app.hyperliquid_exec import HLOutageError
+        if isinstance(e, HLOutageError):
+            _log_activity(u.id, "error", f"{coin}: HL Info-API down — Trade-Open abgebrochen ({e})")
+        else:
+            _log_activity(u.id, "error", f"{coin}: account_value-Fehler ({e}) — Trade-Open abgebrochen")
+        return
     if balance <= 0:
         _log_activity(u.id, "skip", f"{coin}: kein handelbares Guthaben")
         return
@@ -423,14 +458,27 @@ async def _adjust(trader, u, sig, pos):
         return
 
     # ── SL-RATCHET — Update verwerfen, wenn es das Risiko erhöht ─────────
-    current_sl = _get_current_sl(u.id, coin)
+    current_sl, db_direction = _get_current_sl(u.id, coin)
+    hl_direction = "LONG" if is_buy else "SHORT"
+    # 2026-06-04 audit-fix (B-#1): Wenn DB-Direction != HL-Direction (User hat
+    # die Position manuell geflippt zwischen den Signalen), gibt der Ratchet
+    # auf — der gespeicherte SL gilt für die falsche Richtung und Vergleich
+    # wäre semantisch falsch. Frischer Trade-Pfad: kein Ratchet, place_protection
+    # setzt den neuen SL direkt.
+    if current_sl is not None and db_direction and db_direction != hl_direction:
+        _log_activity(
+            u.id, "update",
+            f"{coin}: Direction-Flip erkannt (DB={db_direction}, HL={hl_direction}) — "
+            f"SL-Ratchet übersprungen, neuer SL {sig.stop_loss} wird gesetzt."
+        )
+        current_sl = None  # Ratchet ausschalten, sauber neu setzen
     if current_sl is not None:
         loosens = (is_buy and sig.stop_loss < current_sl) or (not is_buy and sig.stop_loss > current_sl)
         if loosens:
             _log_activity(
                 u.id, "update",
                 f"{coin}: SL-Update {sig.stop_loss} abgelehnt (würde Risiko erhöhen — "
-                f"aktueller SL {current_sl}, {'LONG' if is_buy else 'SHORT'}). Bestehender Schutz bleibt."
+                f"aktueller SL {current_sl}, {hl_direction}). Bestehender Schutz bleibt."
             )
             # WICHTIG: managed_trade NICHT überschreiben, sonst zukünftige
             # Ratchet-Checks vergleichen gegen den falschen Wert.
@@ -515,6 +563,25 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
             _log_activity(user_id, "order", f"{coin} gefüllt (qty {abs(psz):.6g}) — SL+TP gesetzt")
             _save_managed(user_id, coin, sig, status="open")
             return
+    # 2026-06-04 audit-fix (B-#8): Vor dem cancel_orders FINAL prüfen ob die Order
+    # nicht doch noch in der allerletzten Iteration gefillt wurde. Sonst Race:
+    # zwischen letztem sleep und timeout könnte HL die Order matchen und wir
+    # cancellen eine bereits eröffnete Position → naked.
+    try:
+        psz_final = await asyncio.to_thread(trader.position_size, coin)
+    except Exception:
+        psz_final = 0
+    if abs(psz_final) > 0:
+        prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(psz_final), sig.stop_loss, tps)
+        if not prot.get("sl_ok"):
+            await asyncio.to_thread(trader.close_position, coin)
+            await asyncio.to_thread(trader.cancel_orders, coin)
+            _log_activity(user_id, "error", f"{coin}: last-second fill, SL fehlgeschlagen → Position geschlossen")
+            _close_managed(user_id, coin)
+            return
+        _log_activity(user_id, "order", f"{coin}: last-second fill (qty {abs(psz_final):.6g}) — SL+TP nachgesetzt")
+        _save_managed(user_id, coin, sig, status="open")
+        return
     await asyncio.to_thread(trader.cancel_orders, coin)
     _log_activity(user_id, "skip", f"{coin} nicht gefüllt — kein Trade")
     _close_managed(user_id, coin)

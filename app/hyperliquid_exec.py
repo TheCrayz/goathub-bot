@@ -5,6 +5,7 @@ Gebühren-Anteil. Schwere Imports (eth_account/hyperliquid) bleiben hier; das
 Modul wird nur geladen, wenn wirklich ausgeführt wird (Listener/Engine).
 """
 import logging
+import threading
 from math import floor, log10
 
 from eth_account import Account
@@ -13,6 +14,38 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
 log = logging.getLogger("goathub.hl")
+
+
+class HLOutageError(RuntimeError):
+    """Raised when both perps + spot info-calls failed — HL is unreachable.
+
+    Engine-Caller should differentiate this from a legitimate 0-Balance:
+    OutageError = retry/alert, return 0 = legitimately skip trade.
+    """
+    pass
+
+
+# 2026-06-04 audit-fix (B-#12): Module-level Info-Singleton (read-only) statt
+# bei jedem _per_coin_stats/sync.py-Call einen frischen Info() aufzubauen. Der
+# Konstruktor macht selbst Network-Calls für meta(), das ist Overhead pro Trade.
+# Get-Or-Init thread-safe via simple lock; meta() ist cached innerhalb der
+# SDK-Instanz, also TTL-Refresh dort nicht nötig (zur Not Service-Restart).
+_info_singletons = {}   # key: is_testnet (bool) -> Info instance
+_info_lock = threading.Lock()
+
+def get_info(testnet: bool) -> Info:
+    """Returns a process-wide singleton Info() instance for the given network.
+
+    Thread-safe via lock. Use for read-only queries (user_state, meta, fills) —
+    NOT for sign-able actions (those need the Exchange object with a wallet).
+    """
+    with _info_lock:
+        info = _info_singletons.get(testnet)
+        if info is None:
+            url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
+            info = Info(url, skip_ws=True)
+            _info_singletons[testnet] = info
+        return info
 
 
 def coin_of(t):
@@ -63,20 +96,34 @@ class HyperliquidTrader:
         self._sz = {a["name"]: a.get("szDecimals", 2) for a in self.info.meta().get("universe", [])}
 
     def account_value(self):
-        """Handelbares Guthaben = Perps-Equity + Spot-USDC (Unified/Cross-Collateral)."""
-        perps = spot = 0.0
+        """Handelbares Guthaben = Perps-Equity + Spot-USDC (Unified/Cross-Collateral).
+
+        2026-06-04 audit-fix (B-#9): Vorher hat die Funktion bei BEIDEN Calls
+        fehlschlagen einen 0-Sentinel zurückgegeben — der Engine-Caller hat das
+        als "kein Geld" interpretiert und Trade silently geskippt. Jetzt: wenn
+        BEIDE HL-Calls schlagen fehl (echte Outage), HLOutageError raisen damit
+        der Engine-Caller differenzieren kann zwischen "kein Geld" (legitimer
+        Skip) und "HL nicht erreichbar" (Retry-Logik kann anschlagen, Activity
+        meldet HL-Outage, nicht Insufficient-Funds).
+        """
+        perps = None
+        spot = None
         try:
             perps = _f(self.info.user_state(self.address).get("marginSummary", {}).get("accountValue"))
         except Exception as e:
             log.warning("user_state: %s", e)
         try:
+            spot = 0.0
             for b in self.info.spot_user_state(self.address).get("balances", []):
                 if b.get("coin") == "USDC":
                     spot = _f(b.get("total"))
                     break
         except Exception as e:
             log.warning("spot_user_state: %s", e)
-        return perps + spot
+            spot = None
+        if perps is None and spot is None:
+            raise HLOutageError("Hyperliquid Info-API unreachable (perps+spot both failed)")
+        return (perps or 0.0) + (spot or 0.0)
 
     def open_positions_count(self):
         try:
