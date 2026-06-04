@@ -158,7 +158,19 @@ async def lifespan(app: FastAPI):
         t.cancel()
 
 
-app = FastAPI(title="GoatHub Trading Bot", lifespan=lifespan)
+# 2026-06-04 Audit-Find: /docs, /redoc und /openapi.json waren publik ohne Auth
+# erreichbar — kompletter API-Surface inkl. Admin-Endpoints + Query-Params
+# leakte raus (curl https://bot.goathub.network/openapi.json → 200, voller
+# Schema-Dump). Default jetzt: aus. Wer das Schema lokal in der UI explorieren
+# will, setzt ENABLE_DOCS=true in der .env — prod bleibt zu.
+_ENABLE_DOCS = os.getenv("ENABLE_DOCS", "false").strip().lower() in ("1", "true", "yes", "on")
+app = FastAPI(
+    title="GoatHub Trading Bot",
+    lifespan=lifespan,
+    docs_url="/docs" if _ENABLE_DOCS else None,
+    redoc_url="/redoc" if _ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if _ENABLE_DOCS else None,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
