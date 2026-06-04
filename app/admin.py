@@ -173,13 +173,16 @@ def admin_trades(
             )
         except Exception:
             tps = []
+        # 2026-06-04 (#6): t.entry/stop_loss sind Decimal — als String serialisieren
+        # damit FastAPI's JSON-Encoder nicht in float-Drift fällt; Frontend
+        # behandelt sie eh als Display-Text.
         out.append({
             "id": t.id,
             "user_id": t.user_id,
             "coin": t.coin,
             "direction": t.direction,
-            "entry": t.entry,
-            "stop_loss": t.stop_loss,
+            "entry": str(t.entry) if t.entry is not None else None,
+            "stop_loss": str(t.stop_loss) if t.stop_loss is not None else None,
             "take_profits": tps,
             "status": t.status,
             "signal_id": t.signal_id,

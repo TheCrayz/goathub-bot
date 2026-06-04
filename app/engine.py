@@ -164,7 +164,11 @@ def _get_current_sl(user_id, coin):
               .order_by(ManagedTrade.id.desc()).first())
         if mt is None:
             return (None, None)
-        return (mt.stop_loss, (mt.direction or "").upper() or None)
+        # 2026-06-04 (#6): mt.stop_loss ist jetzt Decimal (MoneyDecimal).
+        # Cast zu float am Boundary — Engine-internes Math arbeitet weiter
+        # mit float (sig.stop_loss kommt vom Parser als float).
+        sl = float(mt.stop_loss) if mt.stop_loss is not None else None
+        return (sl, (mt.direction or "").upper() or None)
     finally:
         db.close()
 

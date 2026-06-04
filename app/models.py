@@ -1,9 +1,47 @@
 """DB-Modelle."""
 import datetime
+import decimal
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.types import TypeDecorator
 
 from app.db import Base
+
+
+# 2026-06-04 Restposten #6: Decimal-präzision für gespeicherte Preise.
+# SQLite mapped Numeric per default auf REAL (float64) → Drift bei wiederholten
+# Reads. Mit TypeDecorator speichern wir als TEXT (verlustfrei) und liefern
+# Decimal im Python-Layer. Auf Postgres (Mainnet-Migration) mapped Numeric
+# direkt auf NUMERIC — kein Code-Change nötig.
+class MoneyDecimal(TypeDecorator):
+    """Lossless Decimal-Storage: TEXT in SQLite, NUMERIC in Postgres.
+
+    Read: gibt Decimal zurück. Vergleiche `Decimal(x) < float_y` funktionieren
+    in Python korrekt (Decimal-Klasse hat __lt__ mit float). Math zwischen
+    Decimal und float wirft TypeError; daher in engine.py: explizite
+    float()-Konversion am Math-Boundary.
+    """
+    impl = String
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(String())   # TEXT auf SQLite
+        return dialect.type_descriptor(Numeric(precision=24, scale=12))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        # Akzeptiert float, int, Decimal, str — alle → str (verlustfrei für die ersten beiden)
+        return str(decimal.Decimal(str(value)))
+
+    def process_result_value(self, value, dialect):
+        if value is None or value == "":
+            return None
+        try:
+            return decimal.Decimal(str(value))
+        except (decimal.InvalidOperation, ValueError):
+            return None
 
 
 class User(Base):
@@ -82,8 +120,9 @@ class ManagedTrade(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     coin = Column(String, index=True, nullable=False)   # Basis-Coin, z.B. "ETH"
     direction = Column(String, default="")              # LONG | SHORT
-    entry = Column(Float, nullable=True)
-    stop_loss = Column(Float, nullable=True)
+    # 2026-06-04 (#6): MoneyDecimal statt Float — preisgenau und kein Drift.
+    entry = Column(MoneyDecimal, nullable=True)
+    stop_loss = Column(MoneyDecimal, nullable=True)
     take_profits = Column(Text, default="")             # JSON: [[px, percent], ...]
     status = Column(String, default="resting")          # resting | open | closed
     resting_oid = Column(String, nullable=True)
