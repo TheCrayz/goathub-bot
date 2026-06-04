@@ -32,7 +32,16 @@ _tasks = set()
 def _spawn(coro):
     t = asyncio.create_task(coro)
     _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
+    def _on_done(task):
+        _tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            # 2026-06-04 audit-fix: vorher wurden Exceptions in spawn'd Tasks
+            # schweigend verschluckt; das hat versteckte Trade-Verluste möglich
+            # gemacht. Jetzt landen sie als ERROR im Log mit Stacktrace.
+            if exc is not None:
+                log.error("spawned task crashed: %r", exc, exc_info=exc)
+    t.add_done_callback(_on_done)
     return t
 
 # Ein Lock pro (user_id, coin) -> verhindert Doppel-Position bei schnellen/doppelten Signalen
@@ -57,7 +66,10 @@ def _log_activity(user_id, kind, text):
         db.add(Activity(user_id=user_id, kind=kind, text=str(text)[:500]))
         db.commit()
     except Exception as e:
-        log.warning("activity log failed: %s", e)
+        # Activity-Verlust ist Error-Level: alle Trader/Admin-Beobachtung läuft
+        # über Activities (audit log). Wenn das hier failt, fliegt die ganze
+        # Observability blind.
+        log.error("activity log failed: %s", e)
     finally:
         db.close()
 
@@ -78,7 +90,12 @@ def _save_managed(user_id, coin, sig, status, resting_oid=None):
             mt.entry = sig.entry
         if sig.stop_loss is not None:
             mt.stop_loss = sig.stop_loss
-        mt.take_profits = json.dumps([[tp.price, tp.percent] for tp in (sig.take_profits or [])])
+        # 2026-06-04 audit-fix: TP-Liste NUR überschreiben wenn das Signal
+        # tatsächlich TPs enthält. Vorher hat ein UPDATE_TRADE-Signal ohne TPs
+        # (z. B. nur SL-Adjust) die DB-Spalte auf "[]" gesetzt und damit die
+        # ursprüngliche TP-Historie verworfen.
+        if sig.take_profits:
+            mt.take_profits = json.dumps([[tp.price, tp.percent] for tp in sig.take_profits])
         mt.status = status
         if resting_oid is not None:
             mt.resting_oid = str(resting_oid)

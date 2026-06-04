@@ -31,12 +31,24 @@ def _f(x, d=0.0):
 
 
 def fee_to_int(fee_str):
-    """'0.05%' -> 50 (f:10 == 1bp == 0.01%). Perps-Max 0.1% == 100."""
+    """'0.05%' -> 50 (f:10 == 1bp == 0.01%). Perps-Max 0.1% == 100.
+
+    2026-06-04 audit-fix: vorher hat ein BUILDER_FEE='5%' (häufiger Tippfehler,
+    real Perps-Max ist 0.1%) lautlos auf 100 gecappt — Operator dachte 5%
+    wären aktiv. Jetzt: pct>0.1 raised ValueError mit klarer Message.
+    """
     try:
         pct = float(str(fee_str).replace("%", "").strip())
-        return max(0, min(100, int(round(pct * 1000))))
     except (TypeError, ValueError):
         return 0
+    if pct < 0:
+        return 0
+    if pct > 0.1:
+        raise ValueError(
+            f"BUILDER_FEE={fee_str!r}: Perps Builder-Fee ist auf 0.1% (=100 bps) "
+            f"hard-capped. Setze 0.05% oder 0.1%, nicht {pct}%."
+        )
+    return int(round(pct * 1000))
 
 
 class HyperliquidTrader:
