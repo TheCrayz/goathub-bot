@@ -23,14 +23,27 @@ from app.schemas import Login, Register, SettingsIn, WalletIn
 from app.discord_oauth import exchange_code, get_discord_user, get_guild_member, has_required_role
 
 
-# ── Rate limiting (Phase 1, 2026-06-02) ─────────────────────────────────────
-# Honor X-Forwarded-For from the Caddy reverse-proxy so login attempts are
-# bucketed by real client IP, not by the bridge IP of whatever proxy sits
-# in front of uvicorn.
+# ── Rate limiting (Phase 1, 2026-06-02, gefixt 2026-06-04) ──────────────────
+# 2026-06-04 KRITISCH: Rate-Limit-Bypass via X-Forwarded-For Spoofing entdeckt!
+# Vorher: erster Wert aus X-Forwarded-For — vom Client KOMPLETT kontrollierbar,
+# weil nginx append-mode ($proxy_add_x_forwarded_for) jeden Attacker-Eintrag
+# durchlässt und nur DAHINTER den echten Client appendet. 15 verschiedene Fakes
+# → 15× kein Block. Jetzt: nginx setzt X-Real-IP zum echten Client-IP — das
+# nehmen wir. Fallback: letzter Wert in X-Forwarded-For (= was nginx appendiert
+# hat = echter Client). Letzter Fallback: TCP-Peer.
 def _client_ip(request: Request) -> str:
+    # Primary: X-Real-IP von nginx (proxy_set_header X-Real-IP $remote_addr).
+    # nginx-config selbst kontrolliert was hier landet, nicht der Client.
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    # Fallback: letzter Wert in der XFF-Chain (nginx appendet immer als letztes).
+    # Achtung: NICHT der erste — der ist attacker-controlled wenn nginx kein
+    # XFF-Clearing macht.
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
+        return xff.split(",")[-1].strip()
+    # Letzter Ausweg: direkte TCP-Peer-Address (bei direkt-am-Server, ohne Proxy).
     return get_remote_address(request)
 
 
