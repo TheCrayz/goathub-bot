@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import httpx
@@ -123,6 +124,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 from app.admin import router as admin_router
 app.include_router(admin_router)
 
+# 2026-06-04 (Restposten #2): static-mount für /static/dashboard.js etc.
+# Erlaubt strikt CSP (script-src 'self' ohne 'unsafe-inline').
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+
 
 # ── Security-Headers (Phase 4, 2026-06-02) ──────────────────────────────────
 # Defense-in-depth: setzt Browser-Schutzmechanismen, die das XSS-Risiko
@@ -136,12 +141,14 @@ async def _security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     # HSTS: Browser merkt sich, immer HTTPS zu verwenden (Caddy terminiert TLS).
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    # CSP: 'unsafe-inline' nur wegen der inline-Scripts in dashboard.html.
-    # Wenn die irgendwann mit nonces oder externen Scripts ersetzt werden,
-    # kann das hier strenger gemacht werden.
+    # CSP — 2026-06-04 (Restposten #2): script 'unsafe-inline' RAUS. Inline-JS
+    # ist nach /static/dashboard.js (und admin.js wenn portiert) gewandert, alle
+    # onclick-Handler sind addEventListener-basiert. 'unsafe-inline' für style-src
+    # bleibt vorerst (viele style="…"-Attribute, das wäre eigener Refactor); ist
+    # weniger gefährliche XSS-Klasse als script-inline.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: https://cdn.discordapp.com; "
         "connect-src 'self'; "
@@ -335,6 +342,49 @@ def _user_public(u: User):
 @app.get("/api/me")
 def me(u: User = Depends(current_user)):
     return _user_public(u)
+
+
+@app.get("/api/per-coin-status")
+def per_coin_status(u: User = Depends(current_user)):
+    """Per-coin filter status für DEN AKTUELLEN USER.
+
+    2026-06-04: Tester sehen jetzt direkt im Dashboard warum ein Coin
+    geskippt wird (Win-Rate < Schwelle nach genug Trades), statt nur via
+    Admin-Endpoint. Identisches Format wie admin_per_coin aber gefiltert
+    auf u.hl_account_address; ein einzelner User-Eintrag in 'users'.
+    """
+    if not u.hl_account_address:
+        return {"connected": False, "min_trades_required": config.PERCOIN_MIN_TRADES,
+                "min_winrate": config.PERCOIN_MIN_WINRATE, "coins": []}
+    from app.engine import _per_coin_stats
+    common = ["BTC", "ETH", "SOL", "BNB", "AVAX", "DOGE", "ADA", "NEAR", "ATOM",
+              "APT", "ARB", "OP", "TIA", "SUI", "INJ", "AAVE"]
+    coins_out = []
+    for coin in common:
+        try:
+            stats = _per_coin_stats(u.hl_account_address, coin)
+        except Exception:
+            stats = None
+        if stats and stats["trades"] > 0:
+            blocked = (
+                stats["trades"] >= config.PERCOIN_MIN_TRADES
+                and stats["win_rate"] < config.PERCOIN_MIN_WINRATE
+            )
+            coins_out.append({
+                "coin": coin,
+                "trades": stats["trades"],
+                "wins": stats["wins"],
+                "win_rate": round(stats["win_rate"], 3),
+                "blocked": blocked,
+            })
+    # Sort: blocked first (warnt User), dann nach trades desc
+    coins_out.sort(key=lambda c: (not c["blocked"], -c["trades"]))
+    return {
+        "connected": True,
+        "min_trades_required": config.PERCOIN_MIN_TRADES,
+        "min_winrate": config.PERCOIN_MIN_WINRATE,
+        "coins": coins_out,
+    }
 
 
 # ── Settings & Wallet ────────────────────────────────────────────────────────
