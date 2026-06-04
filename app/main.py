@@ -187,10 +187,22 @@ from fastapi.responses import JSONResponse  # für Cookie-setting Response
 @limiter.limit(REGISTER_RATE_LIMIT)
 def register(request: Request, body: Register, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
-    if "@" not in email or len(body.password) < 6:
+    # 2026-06-04 audit-find: vorher hat "@" alleine durchgelassen z.B.
+    # "<script>alert(1)</script>@x.com" oder 1MB-langer string. Beides wäre
+    # in der DB gelandet (admin.js escapt via esc(), aber DB-Pollution +
+    # potenzielle nicht-escapte stellen sind real). Jetzt strikte Validierung.
+    import re
+    EMAIL_RE = re.compile(r"^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}$")
+    if len(email) > 254:
+        raise HTTPException(400, "Email too long (max 254 chars per RFC 5321)")
+    if not EMAIL_RE.match(email):
         raise HTTPException(400, "Valid email + password (min. 6 chars) required")
-    if len(body.password.encode("utf-8")) > MAX_PW_BYTES:
-        raise HTTPException(400, f"Password too long (max {MAX_PW_BYTES} bytes / ~72 ASCII chars)")
+    if len(body.password) < 6:
+        raise HTTPException(400, "Valid email + password (min. 6 chars) required")
+    # Mit BCrypt-v2 (Restposten #3) ist 72-byte Limit weg, aber wir limitieren
+    # trotzdem nach oben (gegen Resource-Exhaust via mega-strings).
+    if len(body.password) > 512:
+        raise HTTPException(400, "Password too long (max 512 chars)")
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(409, "Email already registered")
     try:
