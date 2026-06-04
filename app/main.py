@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import httpx
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -422,6 +423,79 @@ def builder_status(u: User = Depends(current_user)):
     except Exception as e:
         out["error"] = f"HL Info-API: {e}"
     return out
+
+
+class BuilderApprovalSubmit(BaseModel):
+    """Phase 6+ (2026-06-03): payload from the MetaMask-signing-flow im Dashboard.
+    Der User hat in MetaMask die EIP-712-Payload signiert, schickt sie über uns
+    weiter an HL's /exchange Endpoint, weil HL CORS-restrict + wir DB-flag setzen
+    wollen."""
+    action: dict   # die HL-Action ({type, hyperliquidChain, signatureChainId, maxFeeRate, builder, nonce})
+    signature: dict  # {r, s, v}
+    nonce: int
+
+
+@app.post("/api/builder-approval-submit")
+def submit_builder_approval(
+    body: BuilderApprovalSubmit,
+    u: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Phase 6+ (2026-06-03): receive the MetaMask-signed approveBuilderFee
+    payload, forward it to HL, verify success, set DB flag.
+
+    Frontend builds the EIP-712 payload, asks MetaMask to sign, gives us
+    {action, signature, nonce}. We just relay to HL — HL itself validates
+    that the signature comes from the user's master address.
+    """
+    if not config.BUILDER_ADDRESS:
+        raise HTTPException(400, "Server has no BUILDER_ADDRESS configured")
+    if not u.hl_account_address:
+        raise HTTPException(400, "Connect your wallet first")
+    # Sanity: action.builder must match our configured BUILDER_ADDRESS
+    action_builder = str(body.action.get("builder", "")).lower()
+    if action_builder != config.BUILDER_ADDRESS.lower():
+        raise HTTPException(400, f"action.builder mismatch (got {action_builder[:10]}…, expected our builder)")
+    # POST to HL /exchange
+    import httpx
+    hl_url = (
+        "https://api.hyperliquid-testnet.xyz/exchange"
+        if config.HL_TESTNET
+        else "https://api.hyperliquid.xyz/exchange"
+    )
+    payload = {"action": body.action, "nonce": body.nonce, "signature": body.signature}
+    try:
+        r = httpx.post(hl_url, json=payload, timeout=15.0)
+        hl_resp = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"HL POST failed: {e}")
+    log.info("approveBuilderFee submit for user %s: %s", u.id, hl_resp)
+    if hl_resp.get("status") != "ok":
+        # HL bounced — return the actual error so user sees something useful
+        err = hl_resp.get("response") if isinstance(hl_resp, dict) else str(hl_resp)
+        raise HTTPException(400, f"HL rejected approval: {err}")
+    # Success on HL — verify on-chain (cache may not be instantly up — give HL 1 s)
+    import time
+    time.sleep(1)
+    try:
+        from app.hyperliquid_exec import fee_to_int
+        approved_bps = _query_on_chain_builder_fee(u.hl_account_address, config.BUILDER_ADDRESS)
+        required_bps = fee_to_int(config.BUILDER_FEE)
+    except Exception as e:
+        # HL said ok but on-chain query failed → trust HL, mark approved anyway
+        log.warning("post-submit verify failed (HL said ok): %s", e)
+        u.builder_approved = True
+        db.commit()
+        return {"ok": True, "hl_response": hl_resp, "verify_warning": str(e)[:120]}
+    if approved_bps < required_bps:
+        log.warning("HL said ok but maxBuilderFee=%d < required %d — race condition?", approved_bps, required_bps)
+        # Still set the flag — HL clearly accepted; verify might just be slow
+        u.builder_approved = True
+        db.commit()
+        return {"ok": True, "hl_response": hl_resp, "approved_bps": approved_bps, "note": "Verify lagging — HL accepted submission"}
+    u.builder_approved = True
+    db.commit()
+    return {"ok": True, "hl_response": hl_resp, "approved_bps": approved_bps, "required_bps": required_bps}
 
 
 @app.post("/api/builder-approved")

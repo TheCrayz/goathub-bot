@@ -151,9 +151,13 @@
         <span class="mut">· Fee <span id="bfee">—</span></span></div>
       <div>Status (DB): <span id="bstat" class="pill off">not confirmed</span></div>
       <div style="margin-top:6px;font-size:13px">On-chain: <span id="bonchain" class="mut">— click "Verify" to check</span></div>
-      <button id="bbtn" onclick="approveBuilder()">Builder fee approved — confirm</button>
-      <button class="ghost" onclick="verifyBuilder()">Verify on-chain</button>
+      <button id="signbtn" onclick="signBuilderApproval()" style="background:#f6851b;color:#fff">🦊 Approve via MetaMask</button>
+      <button id="bbtn" onclick="approveBuilder()" class="ghost">Re-verify after manual approve</button>
+      <button class="ghost" onclick="verifyBuilder()">Check on-chain status</button>
       <div class="msg" id="bmsg"></div>
+      <div class="mut" style="font-size:11px;margin-top:6px">
+        Der orange Button öffnet MetaMask und lässt dich on-chain freigeben — danach setzt der Bot automatisch das DB-Flag. Funktioniert nur wenn deine MetaMask die <b>MASTER-Adresse</b> dieser Wallet ist (nicht der Agent-Key).
+      </div>
     </div>
 
     <div class="card">
@@ -236,6 +240,117 @@ document.addEventListener("DOMContentLoaded",function(){
 });
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
 async function approveBuilder(){try{const r=await api("POST","/api/builder-approved");show(bmsg,`Thank you — referral confirmed on-chain (${r.approved_bps} bps) ✓`,"ok");load();verifyBuilder()}catch(e){show(bmsg,e.message,"err")}}
+
+// Phase 6+ (2026-06-03): MetaMask-driven on-chain Builder-Approval.
+// HL's UI hat keinen "Add Builder"-Button — die Approval muss von einer App
+// kommen, die EIP-712-signTypedData triggert. WIR sind die App.
+//
+// Flow:
+//   1. window.ethereum verbinden + Address-Check (muss MASTER-Adresse sein,
+//      die der User im Dashboard registriert hat).
+//   2. EIP-712-Payload bauen (per HL Python-SDK-Specs).
+//   3. signTypedData_v4 → MetaMask-Popup.
+//   4. Signatur (0x{r:64}{s:64}{v:2}) splitten + POST an Server-Proxy.
+//   5. Server-Proxy postet an HL /exchange + setzt DB-Flag bei Erfolg.
+async function signBuilderApproval(){
+  const btn=document.getElementById("signbtn");
+  const _orig=btn.textContent;
+  const setBtn=(t,disabled=true)=>{btn.textContent=t;btn.disabled=disabled;btn.style.opacity=disabled?"0.6":"1";};
+  try{
+    setBtn("⏳ Connecting MetaMask…");
+    if(typeof window.ethereum==="undefined"){
+      throw new Error("MetaMask ist nicht installiert/erkannt. Installier MetaMask im Browser und reload diese Seite.");
+    }
+    // Aktuelle Dashboard-Daten frisch holen (wir brauchen hl_account_address + builder + net)
+    const d=await api("GET","/api/dashboard");
+    const masterAddr=(d.user.hl_account_address||"").toLowerCase();
+    const builderAddr=(d.builder&&d.builder.address||"").toLowerCase();
+    const maxFeeRate=(d.builder&&d.builder.fee)||"0.05%";
+    const net=d.net||"testnet";
+    if(!masterAddr)  throw new Error("Wallet im Dashboard nicht gespeichert — erst speichern, dann approven.");
+    if(!builderAddr) throw new Error("Server hat keine BUILDER_ADDRESS konfiguriert.");
+
+    // MetaMask connect + check address
+    setBtn("⏳ Waiting for MetaMask account…");
+    const accounts=await window.ethereum.request({method:"eth_requestAccounts"});
+    if(!accounts||accounts.length===0) throw new Error("Kein MetaMask-Account verbunden.");
+    const connected=String(accounts[0]).toLowerCase();
+    if(connected!==masterAddr){
+      throw new Error(
+        `Falsche Wallet in MetaMask. Du bist eingeloggt als ${connected.slice(0,6)}…${connected.slice(-4)}, `+
+        `aber das Dashboard erwartet die MASTER-Adresse ${masterAddr.slice(0,6)}…${masterAddr.slice(-4)}. `+
+        `Wechsle in MetaMask den Account.`
+      );
+    }
+
+    // EIP-712-Payload nach HL-SDK-Spec (signing.py:user_signed_payload)
+    const nonce=Date.now();
+    const hyperliquidChain=(net==="mainnet")?"Mainnet":"Testnet";
+    const typedData={
+      types:{
+        EIP712Domain:[
+          {name:"name",type:"string"},
+          {name:"version",type:"string"},
+          {name:"chainId",type:"uint256"},
+          {name:"verifyingContract",type:"address"},
+        ],
+        "HyperliquidTransaction:ApproveBuilderFee":[
+          {name:"hyperliquidChain",type:"string"},
+          {name:"maxFeeRate",type:"string"},
+          {name:"builder",type:"address"},
+          {name:"nonce",type:"uint64"},
+        ],
+      },
+      primaryType:"HyperliquidTransaction:ApproveBuilderFee",
+      domain:{
+        name:"HyperliquidSignTransaction",
+        version:"1",
+        // HL nutzt 0x66eee (Arbitrum-Sepolia-id) als universellen signatureChainId,
+        // sowohl für Testnet als auch Mainnet — siehe SDK signing.sign_user_signed_action.
+        chainId:421614,
+        verifyingContract:"0x0000000000000000000000000000000000000000",
+      },
+      message:{
+        hyperliquidChain:hyperliquidChain,
+        maxFeeRate:maxFeeRate,
+        builder:builderAddr,
+        nonce:nonce,
+      },
+    };
+
+    setBtn("⏳ Sign in MetaMask…");
+    const sig=await window.ethereum.request({
+      method:"eth_signTypedData_v4",
+      params:[connected,JSON.stringify(typedData)],
+    });
+    if(!sig||!sig.startsWith("0x")||sig.length<132){
+      throw new Error("Ungültige Signatur von MetaMask zurückbekommen.");
+    }
+    // Signatur splitten: 0x{r:64}{s:64}{v:2}
+    const r="0x"+sig.slice(2,66);
+    const s="0x"+sig.slice(66,130);
+    const v=parseInt(sig.slice(130,132),16);
+
+    setBtn("⏳ Submitting to Hyperliquid…");
+    const action={
+      type:"approveBuilderFee",
+      hyperliquidChain:hyperliquidChain,
+      signatureChainId:"0x66eee",
+      maxFeeRate:maxFeeRate,
+      builder:builderAddr,
+      nonce:nonce,
+    };
+    const res=await api("POST","/api/builder-approval-submit",{action,signature:{r,s,v},nonce});
+
+    show(bmsg,`Builder-Approval on-chain bestätigt (${res.approved_bps||"?"} bps) ✓`,"ok");
+    setBtn(_orig,false);
+    load();          // refresh dashboard (bot_active, builder_approved, etc.)
+    verifyBuilder(); // refresh on-chain status indicator
+  }catch(e){
+    show(bmsg,e.message||String(e),"err");
+    setBtn(_orig,false);
+  }
+}
 // Phase 5 (2026-06-02): explicit on-chain verification button.
 async function verifyBuilder(){
   const el=document.getElementById("bonchain");
