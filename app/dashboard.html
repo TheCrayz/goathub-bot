@@ -283,6 +283,38 @@ async function signBuilderApproval(){
       );
     }
 
+    // HL erwartet EIP-712-Domain auf chainId 0x66eee (= 421614, Arb Sepolia)
+    // — unabhängig davon ob du auf Testnet oder Mainnet handelst. MetaMask
+    // blockiert signTypedData_v4 wenn domain.chainId nicht zur aktiven Chain
+    // passt, also vor dem Sign die Chain switchen (oder adden, falls fehlt).
+    setBtn("⏳ Switching network to Arbitrum Sepolia…");
+    const HL_CHAIN_ID_HEX="0x66eee"; // = 421614
+    try{
+      await window.ethereum.request({
+        method:"wallet_switchEthereumChain",
+        params:[{chainId:HL_CHAIN_ID_HEX}],
+      });
+    }catch(switchErr){
+      if(switchErr&&switchErr.code===4902){
+        // Chain noch nicht im Wallet — adden (MetaMask switched dann auto)
+        setBtn("⏳ Adding Arbitrum Sepolia to MetaMask…");
+        await window.ethereum.request({
+          method:"wallet_addEthereumChain",
+          params:[{
+            chainId:HL_CHAIN_ID_HEX,
+            chainName:"Arbitrum Sepolia",
+            nativeCurrency:{name:"ETH",symbol:"ETH",decimals:18},
+            rpcUrls:["https://sepolia-rollup.arbitrum.io/rpc"],
+            blockExplorerUrls:["https://sepolia.arbiscan.io"],
+          }],
+        });
+      }else if(switchErr&&switchErr.code===4001){
+        throw new Error("Du hast den Chain-Switch abgelehnt. HL signiert auf chainId 0x66eee (Arb Sepolia) — das muss in MetaMask aktiv sein. Du kannst jederzeit zurück auf Arb One switchen.");
+      }else{
+        throw switchErr;
+      }
+    }
+
     // EIP-712-Payload nach HL-SDK-Spec (signing.py:user_signed_payload)
     const nonce=Date.now();
     const hyperliquidChain=(net==="mainnet")?"Mainnet":"Testnet";
