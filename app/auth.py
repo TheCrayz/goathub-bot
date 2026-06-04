@@ -1,5 +1,7 @@
-"""Auth: Passwort-Hashing (bcrypt) + JWT."""
+"""Auth: Passwort-Hashing (bcrypt mit SHA256-pre-hash) + JWT."""
+import base64
 import datetime
+import hashlib
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -23,9 +25,28 @@ SESSION_COOKIE_NAME = "ght_session"
 # selbst — UTF-8-Multibyte-Zeichen verbrauchen mehr als 1 Byte.
 MAX_PW_BYTES = 72
 
+# 2026-06-04 Restposten #3: BCrypt pre-hash mit Version-Prefix für saubere
+# Migration. Der 72-Byte-Limit von bcrypt wird durch SHA256-pre-hash umgangen
+# (SHA256-Output ist immer 32 Bytes → safe für bcrypt). Bei Bedarf später auf
+# argon2 etc. erweiterbar via neuem Prefix.
+#
+# Format der gespeicherten Hashes:
+#   "v2:<base64-44-char>$<bcrypt-60-char>" → SHA256(pw) → base64 → bcrypt
+#   "<bcrypt-60-char>"                     → legacy (direkt-bcrypt, ≤72 Bytes)
+#
+# Beim verify_pw transparent beide Wege probieren. Bei erfolgreichem Login
+# eines legacy-Hashes kann der Caller via `_needs_rehash()` prüfen und einen
+# v2-Hash zurückschreiben (siehe main.py:login).
+_PREHASH_PREFIX = "v2:"
+
 
 class PasswordTooLongError(ValueError):
-    """Eingabe > 72 Bytes UTF-8 — bcrypt würde sie sonst still truncieren."""
+    """Eingabe > 72 Bytes UTF-8 — bcrypt würde sie sonst still truncieren.
+
+    Bleibt erhalten für Backward-Compat, wird aber mit der v2-pre-hash-Pfad
+    NICHT mehr ausgelöst (sha256 → 32 byte, immer unter 72). Nur noch bei
+    expliziten legacy-Calls oder wenn jemand _pw_bytes() direkt nutzt.
+    """
 
 
 def _pw_bytes(p: str) -> bytes:
@@ -35,16 +56,39 @@ def _pw_bytes(p: str) -> bytes:
     return b
 
 
+def _prehash(p: str) -> bytes:
+    """SHA256(password) base64-encoded — 44 ASCII bytes, sicher unter 72-Limit."""
+    digest = hashlib.sha256(p.encode("utf-8")).digest()
+    return base64.b64encode(digest)
+
+
 def hash_pw(p: str) -> str:
-    return bcrypt.hashpw(_pw_bytes(p), bcrypt.gensalt()).decode()
+    """v2-Hash: SHA256-pre-hash → bcrypt. Keine 72-Byte-Grenze für den User."""
+    return _PREHASH_PREFIX + bcrypt.hashpw(_prehash(p), bcrypt.gensalt()).decode()
+
+
+def needs_rehash(stored: str) -> bool:
+    """True wenn der gespeicherte Hash legacy (kein v2-Prefix) ist → beim
+    nächsten erfolgreichen Login transparent re-hashen."""
+    return not (stored or "").startswith(_PREHASH_PREFIX)
 
 
 def verify_pw(p: str, h: str) -> bool:
+    """v2-Hashes via SHA256→bcrypt; legacy-Hashes direkt-bcrypt (≤72 bytes).
+
+    User mit altem Hash UND langem Passwort (>72 bytes) waren schon vorher kaputt
+    (PasswordTooLongError) — bleibt false. Nach erfolgreichem Login auf v2
+    migrieren um diese Klasse zu beseitigen.
+    """
     try:
+        if (h or "").startswith(_PREHASH_PREFIX):
+            return bcrypt.checkpw(_prehash(p), h[len(_PREHASH_PREFIX):].encode())
+        # legacy direkt-bcrypt path
         return bcrypt.checkpw(_pw_bytes(p), h.encode())
     except PasswordTooLongError:
-        # Eine Authentifizierung mit zu langem PW ist immer falsch — wir
-        # KÖNNEN nicht prüfen ob es passt (truncate wäre Collision).
+        # Eine Authentifizierung mit zu langem PW gegen legacy-Hash ist
+        # immer falsch — wir können nicht prüfen ob es passt (truncate wäre
+        # Collision-Class). Nur via v2-Pfad lösbar.
         return False
     except Exception:
         return False

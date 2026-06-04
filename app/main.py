@@ -16,7 +16,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import config
-from app.auth import MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw, make_token, verify_pw
+from app.auth import MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw, make_token, needs_rehash, verify_pw
 from app.db import get_db, init_db
 from app.models import Activity, User
 from app.schemas import Login, Register, SettingsIn, WalletIn
@@ -111,6 +111,12 @@ async def lifespan(app: FastAPI):
     # HL via SL/TP autonom schließt (siehe SOL id=24 vom 03:38 UTC).
     from app.sync import position_sync_loop
     tasks.append(asyncio.create_task(position_sync_loop()))
+    # 2026-06-04 Restposten #5: Token-Usage-Scrape-Loop — persistet signal-bot
+    # TOKEN_USAGE-Zeilen in unsere DB, damit Historie auch nach Log-Rotation
+    # erhalten bleibt. Liest bot.log alle 5 Minuten, idempotent (skip wenn
+    # ts+counts schon in DB).
+    from app.token_usage_scraper import token_usage_scrape_loop
+    tasks.append(asyncio.create_task(token_usage_scrape_loop()))
     yield
     for t in tasks:
         t.cancel()
@@ -196,6 +202,15 @@ def login(request: Request, body: Login, db: Session = Depends(get_db)):
     u = db.query(User).filter(User.email == body.email.strip().lower()).first()
     if not u or not verify_pw(body.password, u.password_hash):
         raise HTTPException(401, "Wrong email or password")
+    # 2026-06-04 Restposten #3: transparente Migration legacy → v2 (SHA256+bcrypt).
+    # Wir haben das Plain-PW gerade verifiziert und im Speicher, also können
+    # wir den Hash sofort upgraden. User merkt nichts.
+    if needs_rehash(u.password_hash):
+        try:
+            u.password_hash = hash_pw(body.password)
+            db.commit()
+        except Exception:
+            pass  # rehash-fail darf den login nicht blockieren
     tok = make_token(u.id, getattr(u, "token_version", 0))
     response = JSONResponse({"access_token": tok, "token_type": "bearer"})
     _set_session_cookie(response, tok)  # Phase 2 #18: hybrid auth

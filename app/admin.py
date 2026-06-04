@@ -315,6 +315,50 @@ def admin_cost(_: User = Depends(current_admin_user)):
     return out
 
 
+@router.get("/cost-history")
+def admin_cost_history(
+    days: int = 7,
+    _: User = Depends(current_admin_user),
+    db: Session = Depends(get_db),
+):
+    """2026-06-04 Restposten #5: Historische Cost-Daten aus DB.
+
+    Vorher: nur was im aktuellen bot.log lag (max ~24h-48h vor Rotation).
+    Jetzt: TokenUsage-Tabelle aggregated per day + model, beliebig lang.
+    """
+    from app.models import TokenUsage
+    days = max(1, min(90, days))
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    rows = (
+        db.query(TokenUsage)
+          .filter(TokenUsage.ts >= cutoff)
+          .all()
+    )
+    # Aggregate per (date, model)
+    per_day_model = {}
+    total_usd = 0.0
+    for r in rows:
+        key = (r.ts.date().isoformat(), r.model)
+        a = per_day_model.setdefault(key, {"calls": 0, "prompt": 0, "output": 0, "thoughts": 0, "cached": 0, "usd": 0.0})
+        a["calls"] += 1
+        a["prompt"] += r.prompt
+        a["output"] += r.output
+        a["thoughts"] += r.thoughts
+        a["cached"] += r.cached
+        a["usd"] += r.usd or 0.0
+        total_usd += r.usd or 0.0
+    series = [
+        {"date": k[0], "model": k[1], **{kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()}}
+        for k, v in sorted(per_day_model.items())
+    ]
+    return {
+        "days": days,
+        "total_rows": len(rows),
+        "total_usd": round(total_usd, 4),
+        "per_day_model": series,
+    }
+
+
 @router.get("/per-coin")
 def admin_per_coin(_: User = Depends(current_admin_user), db: Session = Depends(get_db)):
     """Per-Coin Win/Loss-Statistik je aktivem User aus HL-Fills (cached via engine._per_coin_stats).

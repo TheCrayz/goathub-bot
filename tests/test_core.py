@@ -44,34 +44,40 @@ def test_parser():
 
 
 def test_bcrypt_max_length():
-    """Phase 4: 72-Byte-Collision-Schutz. >72 Bytes muss abgelehnt werden,
-    72 Bytes selbst muss funktionieren (Grenzwert)."""
-    from app.auth import hash_pw, verify_pw, PasswordTooLongError, MAX_PW_BYTES
+    """2026-06-04 Restposten #3: SHA256-pre-hash macht das 72-Byte-Limit
+    obsolet. v2-Hashes (mit 'v2:'-Prefix) akzeptieren beliebig lange PWs,
+    legacy-Hashes (ohne Prefix) behalten die alte 72-Byte-Semantik bis sie
+    auf Login transparent re-hashed werden."""
+    from app.auth import hash_pw, verify_pw, needs_rehash, PasswordTooLongError, MAX_PW_BYTES
+    import bcrypt
 
-    # 72 ASCII Bytes — am Limit, muss funktionieren
+    # v2-Hash: alle Längen funktionieren
     pw_max = "a" * MAX_PW_BYTES
     h = hash_pw(pw_max)
-    assert h and len(h) > 50
+    assert h.startswith("v2:"), f"expected v2-prefix on new hash, got: {h[:5]}"
     assert verify_pw(pw_max, h) is True
+    assert needs_rehash(h) is False
 
-    # 73 Bytes — über dem Limit, muss ablehnen
-    try:
-        hash_pw("a" * (MAX_PW_BYTES + 1))
-        assert False, "expected PasswordTooLongError on 73-byte input"
-    except PasswordTooLongError:
-        pass
+    # v2 mit langem (>72b) PW funktioniert (vorher: PasswordTooLongError)
+    pw_long = "🔥" * 200          # 800 Bytes UTF-8
+    h_long = hash_pw(pw_long)
+    assert h_long.startswith("v2:")
+    assert verify_pw(pw_long, h_long) is True
+    assert verify_pw("wrong", h_long) is False
 
-    # UTF-8 multibyte: 36 emoji-Zeichen × 4 Bytes = 144 Bytes — auch ablehnen
-    try:
-        hash_pw("🔥" * 36)
-        assert False, "expected PasswordTooLongError on multi-byte UTF-8 input"
-    except PasswordTooLongError:
-        pass
+    # legacy-Hash (ohne Prefix) — simuliere alten DB-Eintrag
+    legacy_h = bcrypt.hashpw(b"oldpw", bcrypt.gensalt()).decode()
+    assert needs_rehash(legacy_h) is True
+    assert verify_pw("oldpw", legacy_h) is True
+    assert verify_pw("wrong", legacy_h) is False
 
-    # verify_pw mit zu langem PW: muss False zurückgeben (kein crash)
-    assert verify_pw("a" * (MAX_PW_BYTES + 1), h) is False
+    # legacy + >72b PW: bleibt False (kein crash, einfach falsch)
+    assert verify_pw("a" * 100, legacy_h) is False
 
-    print("bcrypt-max: OK -> 72-byte hashes, >72 raises, multibyte counted in bytes")
+    # verify_pw mit zu langem PW gegen v2-Hash für *anderes* PW: False
+    assert verify_pw("y" * 100, h_long) is False
+
+    print("bcrypt-max: OK -> v2 hashes beliebig lang, legacy weiter unterstützt, needs_rehash detect")
 
 
 if __name__ == "__main__":

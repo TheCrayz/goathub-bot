@@ -54,6 +54,27 @@ class Activity(Base):
     text = Column(Text)
 
 
+class TokenUsage(Base):
+    """Persisted Gemini API token-usage events.
+
+    2026-06-04 Restposten #5: bot.log wird rotiert; ohne Persistierung sind
+    historische Daten weg nach paar Tagen. Wir scrapen TOKEN_USAGE-Zeilen alle
+    paar Minuten in den Hintergrund-Loop, INSERT-OR-IGNORE auf (ts, model,
+    prompt, output) damit Re-Scan idempotent ist. Admin-Endpoint zeigt
+    aggregates aus DB (lang) + live-log (frisch).
+    """
+    __tablename__ = "token_usage"
+    id = Column(Integer, primary_key=True)
+    ts = Column(DateTime, index=True, default=datetime.datetime.utcnow)
+    model = Column(String, index=True)
+    prompt = Column(Integer, default=0)
+    output = Column(Integer, default=0)
+    thoughts = Column(Integer, default=0)
+    cached = Column(Integer, default=0)
+    usd = Column(Float, default=0.0)             # berechnet aus Pricing-Tabelle beim Insert
+    source = Column(String, default="bot.log")   # bot.log | docker.logs | manual
+
+
 class ManagedTrade(Base):
     """Ein laufend verwalteter Trade pro Nutzer+Coin (NEW -> UPDATE -> CLOSE)."""
     __tablename__ = "managed_trades"
