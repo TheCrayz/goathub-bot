@@ -110,26 +110,49 @@ async def _activity_purge_loop():
 async def lifespan(app: FastAPI):
     init_db()
     tasks = []
+
+    # 2026-06-04 audit-find: vorher hatten die lifespan-tasks keinen
+    # done_callback. Wenn ein outer-loop einer dieser Background-Tasks crashed
+    # (z.B. unhandled Exception nach Deploy, syntax-Bug, oder corner-case),
+    # sterben sie lautlos — keiner sieht's, ungeschützte Positionen denkbar.
+    # Jetzt: identisches Pattern wie engine._spawn — task.exception() wird
+    # geloggt mit Stacktrace, damit ein crashed Loop sichtbar wird.
+    def _attach_logger(task, name):
+        def _on_done(t):
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    log.error("lifespan task %r crashed: %r", name, exc, exc_info=exc)
+        task.add_done_callback(_on_done)
+
     if config.ENABLE_LISTENER:
         from app.discord_listener import start_listener
-        tasks.append(asyncio.create_task(start_listener()))
+        t = asyncio.create_task(start_listener())
+        _attach_logger(t, "discord_listener")
+        tasks.append(t)
         log.info("Discord-Listener gestartet.")
     else:
         log.info("Listener AUS (ENABLE_LISTENER=false) — API/Dashboard laufen, kein Live-Trading.")
     # Activity-Purge läuft IMMER (auch wenn Listener aus ist) — die Tabelle
     # wächst auch über manuelle Settings-Änderungen, Login-Events etc.
-    tasks.append(asyncio.create_task(_activity_purge_loop()))
+    t = asyncio.create_task(_activity_purge_loop())
+    _attach_logger(t, "activity_purge_loop")
+    tasks.append(t)
     # Phase 6+ (2026-06-03): Position-Sync-Loop — reconcilet managed_trades
     # gegen die echte HL-Position-State. Verhindert "stale open"-Rows wenn
     # HL via SL/TP autonom schließt (siehe SOL id=24 vom 03:38 UTC).
     from app.sync import position_sync_loop
-    tasks.append(asyncio.create_task(position_sync_loop()))
+    t = asyncio.create_task(position_sync_loop())
+    _attach_logger(t, "position_sync_loop")
+    tasks.append(t)
     # 2026-06-04 Restposten #5: Token-Usage-Scrape-Loop — persistet signal-bot
     # TOKEN_USAGE-Zeilen in unsere DB, damit Historie auch nach Log-Rotation
     # erhalten bleibt. Liest bot.log alle 5 Minuten, idempotent (skip wenn
     # ts+counts schon in DB).
     from app.token_usage_scraper import token_usage_scrape_loop
-    tasks.append(asyncio.create_task(token_usage_scrape_loop()))
+    t = asyncio.create_task(token_usage_scrape_loop())
+    _attach_logger(t, "token_usage_scrape_loop")
+    tasks.append(t)
     yield
     for t in tasks:
         t.cancel()
