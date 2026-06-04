@@ -482,6 +482,17 @@ async function load(){
     const ba=d.user.builder_approved; bstat.textContent=ba?"confirmed":"not confirmed"; bstat.className="pill "+(ba?"on":"off");
     // Phase 6 (2026-06-02): hide "confirm"-button wenn schon bestätigt; zeige stattdessen "Re-verify".
     const bbtn=document.getElementById("bbtn"); if(bbtn){bbtn.textContent=ba?"Re-verify on-chain":"Builder fee approved — confirm";}
+    // 2026-06-04: wenn der Server keine BUILDER_ADDRESS hat, ist die ganze Sektion off.
+    // Trades laufen dann ohne Builder-Code, also disable Buttons + zeig klaren Status.
+    const builderOff=!(d.builder&&d.builder.address);
+    const signbtn=document.getElementById("signbtn");
+    const verifybtn=document.querySelector('button[onclick="verifyBuilder()"]');
+    [signbtn,bbtn,verifybtn].forEach(b=>{if(b){b.disabled=builderOff;b.style.opacity=builderOff?"0.4":"1";b.style.cursor=builderOff?"not-allowed":"";}});
+    if(builderOff){
+      bstat.textContent="disabled (Testnet)";bstat.className="pill mut";
+      const onchain=document.getElementById("bonchain");
+      if(onchain){onchain.textContent="Builder-Fee aktuell deaktiviert — Trades laufen ohne Builder-Code.";onchain.style.color="";}
+    }
     const pb=document.querySelector("#postbl tbody");pb.innerHTML="";
     (d.account.positions||[]).forEach(p=>{pb.insertAdjacentHTML("beforeend",`<tr><td>${esc(p.coin)}</td><td>${esc(p.size)}</td><td>${esc(p.entry)}</td><td>${esc(p.uPnl)}</td></tr>`)});
     posempty.style.display=(d.account.positions||[]).length?"none":"block";
