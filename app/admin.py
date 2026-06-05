@@ -450,6 +450,8 @@ async def admin_test_signal(
         for t in tps if t.get("price")
     )
     # Baue synthetisches Embed im exakten Format das parser.parse_signal liest
+    # 2026-06-05 fix: parser erwartet field-names MIT SPACE ('stop loss', 'take profits'),
+    # nicht underscore. Vorher: parse_signal → None → silent skip in handle_signal.
     embed = {
         "title": f"{asset.split('/')[0]} — {action}",
         "description": f"manual test signal `{signal_id}`",
@@ -458,8 +460,8 @@ async def admin_test_signal(
             {"name": "action", "value": action},
             {"name": "direction", "value": direction},
             {"name": "entry", "value": str(entry) if entry is not None else ""},
-            {"name": "stop_loss", "value": str(stop_loss) if stop_loss is not None else ""},
-            {"name": "take_profits", "value": tps_str},
+            {"name": "stop loss", "value": str(stop_loss) if stop_loss is not None else ""},
+            {"name": "take profits", "value": tps_str},
             {"name": "confidence", "value": str(confidence)},
         ],
     }
