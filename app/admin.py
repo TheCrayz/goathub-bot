@@ -407,6 +407,78 @@ def admin_per_coin(_: User = Depends(current_admin_user), db: Session = Depends(
     }
 
 
+@router.post("/test-signal")
+async def admin_test_signal(
+    body: dict,
+    _: User = Depends(current_admin_user),
+):
+    """2026-06-05: Manuelles Test-Signal direkt durch die Engine schicken,
+    ohne auf den signal-bot's 60min-Cycle oder Discord-Channel zu warten.
+
+    Body (JSON, alle Felder die der Parser erwartet — siehe parser.py):
+      {
+        "type": "NEW_TRADE",                  # action; auch UPDATE_TRADE / CANCEL_TRADE
+        "asset": "SOL/USDT",                  # ticker
+        "direction": "LONG",                  # LONG | SHORT
+        "entry": 140,
+        "stop_loss": 135,
+        "take_profits": [{"price":150,"percent":50}, {"price":160,"percent":50}],
+        "signal_id": "manual-test-001",       # optional, sonst auto-gen
+        "confidence": 0.85                    # optional, default = MIN_CONFIDENCE
+      }
+
+    Baut einen synthetischen Discord-Embed im Format das parser.parse_signal
+    erwartet (title, fields) und ruft handle_signal direkt — alle aktiven
+    User mit bot_active=True bekommen das Signal, exakt wie wenn es von
+    Bot 1 in #signals gekommen wäre.
+    """
+    from app.engine import handle_signal
+    action = str(body.get("type") or "NEW_TRADE").upper()
+    asset = str(body.get("asset") or "")
+    if "/" not in asset:
+        raise HTTPException(400, "asset muss Format 'COIN/USDT' haben, z.B. 'SOL/USDT'")
+    direction = str(body.get("direction") or "LONG").upper()
+    entry = body.get("entry")
+    stop_loss = body.get("stop_loss")
+    tps = body.get("take_profits") or []
+    signal_id = str(body.get("signal_id") or f"manual-{int(datetime.datetime.utcnow().timestamp())}")
+    confidence = body.get("confidence", 0.90)
+
+    # Format take_profits zu "50% @ 150, 50% @ 160" string (parser-erwartet)
+    tps_str = ", ".join(
+        f"{t.get('percent', 100)}% @ {t.get('price')}"
+        for t in tps if t.get("price")
+    )
+    # Baue synthetisches Embed im exakten Format das parser.parse_signal liest
+    embed = {
+        "title": f"{asset.split('/')[0]} — {action}",
+        "description": f"manual test signal `{signal_id}`",
+        "fields": [
+            {"name": "ticker", "value": asset},
+            {"name": "action", "value": action},
+            {"name": "direction", "value": direction},
+            {"name": "entry", "value": str(entry) if entry is not None else ""},
+            {"name": "stop_loss", "value": str(stop_loss) if stop_loss is not None else ""},
+            {"name": "take_profits", "value": tps_str},
+            {"name": "confidence", "value": str(confidence)},
+        ],
+    }
+    # handle_signal ist async + spawned interne tasks via _spawn
+    # (asyncio.create_task) — laufen im FastAPI-Event-Loop weiter, kein
+    # await nötig auf die spawned trade-tasks. Wir kehren sofort zurück.
+    await handle_signal(embed)
+    return {
+        "ok": True,
+        "dispatched": {
+            "action": action, "asset": asset, "direction": direction,
+            "entry": entry, "stop_loss": stop_loss, "tps": tps,
+            "signal_id": signal_id, "confidence": confidence,
+        },
+        "note": "Check /api/admin/health or journalctl -u goathub for results. "
+                "Engine spawned background tasks per active user — trades may take 5-30s.",
+    }
+
+
 @router.get("/health")
 def admin_health(_: User = Depends(current_admin_user)):
     """Live-Health beider Bots: signal-bot (Docker) + goathub (this).
