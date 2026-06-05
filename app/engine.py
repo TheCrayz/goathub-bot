@@ -432,9 +432,16 @@ async def _open_new(trader, u, sig):
         prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, sz, sig.stop_loss, tps)
         if not prot.get("sl_ok"):
             # SL konnte NICHT gesetzt werden -> keine ungeschützte Position riskieren -> sofort schließen
+            # 2026-06-05 diag: log die ECHTE HL-Antwort
+            sl_resp = prot.get("sl")
+            err_detail = str(sl_resp)[:300] if sl_resp else "no response"
+            log.error("place_protection sl fail (new) user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
+                      u.id, coin, sig.stop_loss, sz, is_buy, err_detail)
             await asyncio.to_thread(trader.close_position, coin)
             await asyncio.to_thread(trader.cancel_orders, coin)
-            _log_activity(u.id, "error", f"{coin}: Stop-Loss fehlgeschlagen — Position sofort geschlossen (kein ungeschützter Trade)")
+            _log_activity(u.id, "error",
+                          f"{coin}: SL nach Entry fehlgeschlagen — Position geschlossen. "
+                          f"HL response: {err_detail[:180]}")
             return
         _log_activity(u.id, "order", f"{sig.direction} {coin} eröffnet (qty {sz:.6g}), SL+TP gesetzt")
         _save_managed(u.id, coin, sig, status="open")
@@ -489,12 +496,41 @@ async def _adjust(trader, u, sig, pos):
             return
 
     tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
+
+    # 2026-06-05: Preflight SL-vs-Mark-Check VOR cancel_orders.
+    # Wenn SL auf falscher Seite des Mark → HL würde rejecten + wir hätten den
+    # alten Schutz weggeräumt. Stattdessen: skip update, alter SL bleibt aktiv.
+    # Selbe Logik in place_protection als Sicherheitsnetz wenn jemand direkt
+    # ohne den engine-Preflight aufruft.
+    try:
+        from app.hyperliquid_exec import get_info
+        mark = float(get_info(config.HL_TESTNET).all_mids().get(coin) or 0)
+    except Exception:
+        mark = 0
+    if mark > 0:
+        sl_invalid = (is_buy and sig.stop_loss >= mark) or ((not is_buy) and sig.stop_loss <= mark)
+        if sl_invalid:
+            side = "LONG" if is_buy else "SHORT"
+            _log_activity(
+                u.id, "update",
+                f"{coin}: SL-Update {sig.stop_loss} skipped (würde sofort triggern — "
+                f"{side} mark={mark}, regel: {'LONG SL<mark' if is_buy else 'SHORT SL>mark'}). "
+                f"Bestehender Schutz bleibt unverändert."
+            )
+            return  # alter SL bleibt aktiv, kein cancel, keine Position-Close
+
     await asyncio.to_thread(trader.cancel_orders, coin)            # alte SL/TP weg
     prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sig.stop_loss, tps)
     if not prot.get("sl_ok"):
+        # Falls noch ein anderer Grund fail (tickSize/etc) — log + close-Net.
+        sl_resp = prot.get("sl"); skip_reason = prot.get("skip_reason")
+        err_detail = skip_reason or (str(sl_resp)[:300] if sl_resp else "no response")
+        log.error("place_protection sl fail user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
+                  u.id, coin, sig.stop_loss, abs(pos), is_buy, err_detail)
         await asyncio.to_thread(trader.close_position, coin)
         await asyncio.to_thread(trader.cancel_orders, coin)
-        _log_activity(u.id, "error", f"{coin}: SL beim Update fehlgeschlagen — Position geschlossen (kein ungeschützter Trade)")
+        _log_activity(u.id, "error",
+                      f"{coin}: SL-Update failed → Position geschlossen. HL response: {err_detail[:180]}")
         return
     _log_activity(u.id, "update", f"{coin}: These angepasst — SL {sig.stop_loss}, TP nachgezogen (qty {abs(pos):.6g})")
     _save_managed(u.id, coin, sig, status="open")
@@ -559,9 +595,13 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
         if abs(psz) > 0:
             prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(psz), sig.stop_loss, tps)
             if not prot.get("sl_ok"):
+                # 2026-06-05 diag
+                sl_resp = prot.get("sl"); err = str(sl_resp)[:300] if sl_resp else "no response"
+                log.error("place_protection sl fail (watcher) user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
+                          user_id, coin, sig.stop_loss, abs(psz), is_buy, err)
                 await asyncio.to_thread(trader.close_position, coin)
                 await asyncio.to_thread(trader.cancel_orders, coin)
-                _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen")
+                _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen. HL: {err[:180]}")
                 _close_managed(user_id, coin)
                 return
             _log_activity(user_id, "order", f"{coin} gefüllt (qty {abs(psz):.6g}) — SL+TP gesetzt")

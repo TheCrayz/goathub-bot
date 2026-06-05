@@ -207,13 +207,20 @@ class HyperliquidTrader:
         isMarket=true das gleiche wie triggerPx → HL nutzte default-Slippage und SL
         füllte in dünnen Märkten beliebig schlecht (SOL -30 USDC am 2026-06-03 mit
         7.94 % Slippage trotz SL bei 72.5 → exit 66.74). Jetzt setzen wir explizit
-        den Worst-Case-Preis SLIPPAGE_CAP schlechter als triggerPx. Trade-off:
-        Gaps > Cap → Order füllt nicht (Position bleibt offen bis Position-Sync /
-        manueller Eingriff). Auf Testnet besser 3 %, auf Mainnet ggf. 1.5 %.
+        den Worst-Case-Preis SLIPPAGE_CAP schlechter als triggerPx.
+
+        2026-06-05: Preflight SL/TP-vs-Mark-Validation. HL lehnt Trigger-Orders ab
+        die SOFORT feuern würden (z.B. SHORT-SL unter aktuellem Mark = würde sofort
+        market-close). Signale aus MEXC-Daten driften vs HL-Testnet ständig in
+        diese Situation; auf Mainnet kann das bei Volatilität auch passieren.
+        Vorher: jeder UPDATE_TRADE → cancel → reject → close → reopen-cycle (wasteful).
+        Jetzt: Preflight prüft Side-vs-Mark; invalid SL → return mit sl_ok=False
+        UND skip_reason="sl_would_trigger_now", caller skipped Update statt close.
+        Invalid TPs werden einzeln gefiltert + geloggt.
         """
         coin = coin_of(coin)
         sz = self._round_sz(coin, sz)
-        res = {"sl": None, "tp": [], "sl_ok": False}
+        res = {"sl": None, "tp": [], "sl_ok": False, "skip_reason": None}
         # cap defaults aus app.config; getattr-Fallback damit das Module ohne config importierbar bleibt
         if slippage_cap is None:
             try:
@@ -221,6 +228,25 @@ class HyperliquidTrader:
                 slippage_cap = float(getattr(_cfg, "SL_SLIPPAGE_CAP", 0.02))
             except Exception:
                 slippage_cap = 0.02
+
+        # Preflight: aktuellen Mark holen für SL/TP-Side-Check
+        try:
+            mark = float(self.info.all_mids().get(coin) or 0)
+        except Exception:
+            mark = 0
+        # is_buy hier ist die ENTRY-Richtung (True=LONG, False=SHORT).
+        # Trigger-Side-Regel:
+        #   LONG SL  muss UNTER mark sein (close-sell wenn Preis fällt)
+        #   SHORT SL muss ÜBER mark sein  (close-buy wenn Preis steigt)
+        if mark > 0:
+            invalid = (is_buy and sl_px >= mark) or ((not is_buy) and sl_px <= mark)
+            if invalid:
+                side = "LONG" if is_buy else "SHORT"
+                res["skip_reason"] = (
+                    f"sl_would_trigger_now: {side} SL={sl_px} vs mark={mark} "
+                    f"(LONG needs SL<mark, SHORT needs SL>mark)"
+                )
+                return res  # sl_ok=False, caller entscheidet (skip statt close)
 
         # Schutz-Order-Richtung = umgekehrt zur Entry-Position
         is_buy_protection = not is_buy
@@ -235,6 +261,14 @@ class HyperliquidTrader:
                                 reduce_only=True)
         res["sl_ok"] = self._status_ok(res["sl"])
         for px, frac in (tps or []):
+            # Gleicher Side-Check für TPs:
+            #   LONG TP  muss ÜBER mark sein  (close-sell wenn Preis steigt)
+            #   SHORT TP muss UNTER mark sein (close-buy wenn Preis fällt)
+            if mark > 0:
+                tp_invalid = (is_buy and px <= mark) or ((not is_buy) and px >= mark)
+                if tp_invalid:
+                    log.warning("TP %s skipped (would-trigger-now vs mark=%s, is_buy=%s)", px, mark, is_buy)
+                    continue
             tp_sz = self._round_sz(coin, sz * frac)
             if tp_sz > 0:
                 tp_worst = round_sig(px * (1 + sign * slippage_cap))
