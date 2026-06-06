@@ -86,11 +86,12 @@ def test_auto_leverage():
     Formel: safe_lev = 1 / (sl_dist * liq_safety) ; chosen = safe × max(conf_floor, confidence)
     Default liq_safety=2 → SL liegt auf halbem Weg zur Liquidation.
     """
-    # SL 2% from entry, confidence 0.90, max 50 → safe = 1/(0.02*2) = 25, *0.90 = 22.5 → 23
+    # Python's round() uses banker's rounding (round half to even).
+    # SL 2% from entry, confidence 0.90, max 50 → safe=25, *0.90=22.5 → 22 (banker)
     lev, reason = auto_leverage(entry=100, stop_loss=98, confidence=0.90, max_cap=50)
-    assert lev == 23, f"expected 23x, got {lev} ({reason})"
+    assert lev == 22, f"expected 22x, got {lev} ({reason})"
 
-    # SL 1% from entry, confidence 0.95 → safe = 50, *0.95 = 47.5 → 48
+    # SL 1% from entry, confidence 0.95 → safe=50, *0.95=47.5 → 48 (banker rounds .5 to even)
     lev, _ = auto_leverage(entry=100, stop_loss=99, confidence=0.95, max_cap=50)
     assert lev == 48, f"expected 48x, got {lev}"
 
@@ -102,9 +103,9 @@ def test_auto_leverage():
     lev, _ = auto_leverage(entry=100, stop_loss=90, confidence=0.80, max_cap=50)
     assert lev == 4, f"expected 4x, got {lev}"
 
-    # No confidence → conf_floor (0.5) — SL 2% safe 25 × 0.5 = 12.5 → 13
+    # No confidence → conf_floor (0.5) — SL 2% safe=25 × 0.5 = 12.5 → 12 (banker)
     lev, _ = auto_leverage(entry=100, stop_loss=98, confidence=None, max_cap=50)
-    assert lev == 13, f"expected 13x (no conf), got {lev}"
+    assert lev == 12, f"expected 12x (no conf), got {lev}"
 
     # User-cap niedriger als safe — z.B. cap 10x für konservativen User, SL 1%, conf 0.95
     # safe=50, *0.95=48 → capped at 10
@@ -113,7 +114,7 @@ def test_auto_leverage():
 
     # SHORT direction (entry < stop_loss) — gleiches SL-distance
     lev, _ = auto_leverage(entry=100, stop_loss=102, confidence=0.90, max_cap=50)
-    assert lev == 23, f"SHORT setup should equal LONG mirror: expected 23x, got {lev}"
+    assert lev == 22, f"SHORT setup should equal LONG mirror: expected 22x, got {lev}"
 
     # Invalid: entry == sl
     try:
