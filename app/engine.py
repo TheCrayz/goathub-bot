@@ -173,24 +173,36 @@ def _get_current_sl(user_id, coin):
         db.close()
 
 
-def _pause_user_bad_key(user_id, err_msg):
-    """Bot AUS schalten wenn der Agent-Key nicht parsebar ist (Adresse-statt-Key).
-    Genau EINE Activity-Zeile statt 100 Tracebacks pro Tag."""
+def _pause_user_bad_key(user_id, err_msg, reason="invalid_key"):
+    """Bot AUS schalten wenn Agent-Key kaputt ODER nicht autorisiert.
+    Genau EINE Activity-Zeile statt 100 Tracebacks pro Tag.
+
+    reason="invalid_key"   → Key-Format kaputt (42 statt 66 chars etc)
+    reason="not_authorized" → Key technisch ok aber HL kennt ihn nicht
+                              (User hat ExtraAgent revoked / nicht autorisiert)
+    """
     db = SessionLocal()
     try:
         u = db.get(User, user_id)
         if not u or not u.bot_active:
             return  # idempotent — schon pausiert oder weg
         u.bot_active = False
-        db.add(Activity(
-            user_id=user_id,
-            kind="error",
-            text=("Agent-Key ungültig (sieht aus wie eine 42-Zeichen-Adresse, "
-                  "erwartet wird der 66-Zeichen-Agent-Key). Bot pausiert. "
-                  "Im Dashboard den korrekten Agent-Key neu speichern, dann selbst wieder aktivieren."),
-        ))
+        if reason == "not_authorized":
+            text = (
+                "Bot pausiert: Agent-Key ist gültig, aber NICHT als ExtraAgent "
+                "auf Hyperliquid autorisiert (HL: 'User or API Wallet does not exist'). "
+                "Im HL UI → API → 'Approve API Wallet' für den existierenden Agent klicken, "
+                "ODER neuen Agent generieren und im Dashboard speichern. Dann Bot manuell wieder aktivieren."
+            )
+        else:
+            text = (
+                "Agent-Key ungültig (sieht aus wie eine 42-Zeichen-Adresse, "
+                "erwartet wird der 66-Zeichen-Agent-Key). Bot pausiert. "
+                "Im Dashboard den korrekten Agent-Key neu speichern, dann selbst wieder aktivieren."
+            )
+        db.add(Activity(user_id=user_id, kind="error", text=text))
         db.commit()
-        log.warning("user %s auto-paused: invalid agent key (%s)", user_id, err_msg[:120])
+        log.warning("user %s auto-paused (%s): %s", user_id, reason, err_msg[:120])
     except Exception as e:
         log.error("auto-pause failed for user %s: %s", user_id, e)
     finally:
@@ -203,6 +215,15 @@ def _is_bad_key_error(exc):
     s = str(exc).lower()
     return ("private key must be exactly 32 bytes" in s
             or "unexpected private key length" in s)
+
+
+def _is_unauthorized_agent_response(resp_text):
+    """Erkennt HL's "User or API Wallet 0x... does not exist." Antwort.
+    Bedeutet: Key ist gültig, aber HL kennt diesen Agent nicht (mehr).
+    User hat ExtraAgent revoked oder nie autorisiert.
+    """
+    s = str(resp_text or "").lower()
+    return "does not exist" in s and ("user or api wallet" in s or "api wallet" in s)
 
 
 def _per_coin_stats(user_addr: str, coin: str):
@@ -437,6 +458,10 @@ async def _open_new(trader, u, sig):
             err_detail = str(sl_resp)[:300] if sl_resp else "no response"
             log.error("place_protection sl fail (new) user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
                       u.id, coin, sig.stop_loss, sz, is_buy, err_detail)
+            # 2026-06-06: Bad-Agent → auto-pause statt closing (close würde gleich failen)
+            if _is_unauthorized_agent_response(err_detail):
+                _pause_user_bad_key(u.id, err_detail, reason="not_authorized")
+                return
             await asyncio.to_thread(trader.close_position, coin)
             await asyncio.to_thread(trader.cancel_orders, coin)
             _log_activity(u.id, "error",
@@ -527,6 +552,12 @@ async def _adjust(trader, u, sig, pos):
         err_detail = skip_reason or (str(sl_resp)[:300] if sl_resp else "no response")
         log.error("place_protection sl fail user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
                   u.id, coin, sig.stop_loss, abs(pos), is_buy, err_detail)
+        # 2026-06-06: Wenn HL "User or API Wallet does not exist" returnt → Agent
+        # ist nicht autorisiert. close_position würde mit gleichem Fehler scheitern
+        # (gleicher Agent). Auto-pause statt im Kreis weiter trying.
+        if _is_unauthorized_agent_response(err_detail):
+            _pause_user_bad_key(u.id, err_detail, reason="not_authorized")
+            return
         await asyncio.to_thread(trader.close_position, coin)
         await asyncio.to_thread(trader.cancel_orders, coin)
         _log_activity(u.id, "error",
@@ -599,6 +630,10 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
                 sl_resp = prot.get("sl"); err = str(sl_resp)[:300] if sl_resp else "no response"
                 log.error("place_protection sl fail (watcher) user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
                           user_id, coin, sig.stop_loss, abs(psz), is_buy, err)
+                # 2026-06-06: Bad-Agent → auto-pause statt closing
+                if _is_unauthorized_agent_response(err):
+                    _pause_user_bad_key(user_id, err, reason="not_authorized")
+                    return
                 await asyncio.to_thread(trader.close_position, coin)
                 await asyncio.to_thread(trader.cancel_orders, coin)
                 _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen. HL: {err[:180]}")
