@@ -468,7 +468,11 @@ def update_settings(body: SettingsIn, u: User = Depends(current_user), db: Sessi
     if body.risk_pct is not None:
         u.risk_pct = max(0.001, min(0.05, body.risk_pct))   # max 5% Risiko/Trade (war 50%)
     if body.leverage is not None:
-        u.leverage = max(1, min(20, body.leverage))          # max 20x Hebel (war 50x)
+        # 2026-06-06: leverage = USER-MAX-CAP für Auto-Leverage.
+        # Bot rechnet pro Trade aus SL+Confidence den optimalen Hebel, gecappt
+        # an diesem Wert. 50 = HL Perps Max. Niedrigere Werte = User will
+        # konservativer fahren (z.B. 10x als persönliches Maximum).
+        u.leverage = max(1, min(50, body.leverage))
     if body.max_open_positions is not None:
         u.max_open_positions = max(1, min(50, body.max_open_positions))
     if body.capital_cap_usdc is not None:

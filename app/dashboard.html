@@ -205,13 +205,19 @@
       <h2>2. Risk Management &amp; Capital Cap</h2>
       <div class="row">
         <div><label>Risk % / Trade</label><input id="risk" type="number" step="0.005"></div>
-        <div><label>Leverage</label><input id="lev" type="number" step="1"></div>
+        <div><label>Max Leverage Cap (Auto)</label><input id="lev" type="number" step="1" min="1" max="50"></div>
         <div><label>Max Open Positions</label><input id="maxp" type="number" step="1"></div>
         <div><label>Capital Cap (USDC, 0 = full account)</label><input id="cap" type="number" step="50"></div>
       </div>
       <button id="saveSettingsBtn">Save Settings</button>
       <div class="msg" id="smsg"></div>
-      <div class="mut" style="margin-top:8px">Example: Cap 1000 = even with 100,000 in your account, only 1,000 will be traded.</div>
+      <div class="mut" style="margin-top:8px">
+        <b>Auto-Leverage:</b> der Bot wählt pro Trade selbst den optimalen Hebel aus SL-Distanz × Signal-Confidence,
+        gedeckelt durch deinen <i>Max Leverage Cap</i> (1-50, default 50 = HL-Maximum).
+        Beispiel SL 2% von Entry → safe ~25x; SL 0.5% → cap 50x; SL 5% → ~9x.
+        <br>Risk-Amount (% × Account) bleibt bei jedem Trade gleich — Hebel ändert nur margin-usage, nicht Verlustpotenzial bei SL-Trigger.
+        <br>Cap 1000 = bei 100k Account werden nur 1000 USDC fürs Sizing genutzt.
+      </div>
     </div>
 
     <div class="card">

@@ -419,12 +419,26 @@ async def _open_new(trader, u, sig):
     except Exception:
         withdrawable = balance  # Fallback — wir lassen es laufen, HL rejected sonst
     sl_distance = abs(sig.entry - sig.stop_loss)
+    # 2026-06-06: Auto-Leverage statt user-fixed. Bot rechnet aus SL-Distanz +
+    # Signal-Confidence den optimalen Hebel; u.leverage wird zur Max-Cap.
+    # Vorteile: tight-SL setups nutzen ihre Margin-Efficiency, wide-SL setups
+    # werden konservativ — Risiko (risk_pct × balance) ist in beiden Fällen
+    # gleich, aber margin-usage adaptiert.
+    from app.sizing import auto_leverage
+    try:
+        chosen_lev, lev_reason = auto_leverage(
+            entry=sig.entry, stop_loss=sig.stop_loss,
+            confidence=sig.confidence, max_cap=int(u.leverage or 50),
+        )
+    except ValueError as e:
+        _log_activity(u.id, "error", f"{coin}: auto-lev failed ({e}) — skipping")
+        return
     if sl_distance > 0:
         # Schätzung: required_notional = risk_amount/sl_dist * entry; required_margin = notional/leverage
         risk_amount = balance * u.risk_pct
         est_qty = risk_amount / sl_distance
         est_notional = est_qty * sig.entry
-        est_margin = est_notional / max(1, u.leverage)
+        est_margin = est_notional / max(1, chosen_lev)
         # 10% safety puffer für Fees, Spread, Mark-Price-Drift bis zum Order
         if est_margin > withdrawable * 0.9:
             _log_activity(
@@ -435,14 +449,15 @@ async def _open_new(trader, u, sig):
             )
             return
     plan = size_trade(account_value=balance, capital_cap=u.capital_cap_usdc, risk_pct=u.risk_pct,
-                      entry=sig.entry, stop_loss=sig.stop_loss, leverage=u.leverage)
+                      entry=sig.entry, stop_loss=sig.stop_loss, leverage=chosen_lev)
     if plan.notional < config.MIN_NOTIONAL_USDC:
         _log_activity(u.id, "skip", f"{coin}: Notional {plan.notional:.2f} < {config.MIN_NOTIONAL_USDC}")
         return
 
     is_buy = (sig.direction == "LONG")
     tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
-    await asyncio.to_thread(trader.set_leverage, coin, u.leverage)
+    await asyncio.to_thread(trader.set_leverage, coin, chosen_lev)
+    _log_activity(u.id, "update", f"{coin}: {lev_reason}")
     entry = await asyncio.to_thread(trader.place_entry, coin, is_buy, plan.qty, sig.entry)
     if not entry["ok"]:
         _log_activity(u.id, "error", f"Entry-Fehler {coin}: {entry.get('error')}")

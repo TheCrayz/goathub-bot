@@ -7,7 +7,7 @@ import os
 os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef")
 os.environ.setdefault("ENCRYPTION_KEY", "AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=")
 
-from app.sizing import size_trade
+from app.sizing import size_trade, auto_leverage
 from app.parser import parse_signal
 
 
@@ -80,9 +80,55 @@ def test_bcrypt_max_length():
     print("bcrypt-max: OK -> v2 hashes beliebig lang, legacy weiter unterstützt, needs_rehash detect")
 
 
+def test_auto_leverage():
+    """2026-06-06: Bot wählt Hebel aus SL-Distanz × Confidence, gecappt am User-Max.
+
+    Formel: safe_lev = 1 / (sl_dist * liq_safety) ; chosen = safe × max(conf_floor, confidence)
+    Default liq_safety=2 → SL liegt auf halbem Weg zur Liquidation.
+    """
+    # SL 2% from entry, confidence 0.90, max 50 → safe = 1/(0.02*2) = 25, *0.90 = 22.5 → 23
+    lev, reason = auto_leverage(entry=100, stop_loss=98, confidence=0.90, max_cap=50)
+    assert lev == 23, f"expected 23x, got {lev} ({reason})"
+
+    # SL 1% from entry, confidence 0.95 → safe = 50, *0.95 = 47.5 → 48
+    lev, _ = auto_leverage(entry=100, stop_loss=99, confidence=0.95, max_cap=50)
+    assert lev == 48, f"expected 48x, got {lev}"
+
+    # Very tight SL 0.4% → safe = 125, capped at 50 (even with full conf)
+    lev, _ = auto_leverage(entry=100, stop_loss=99.6, confidence=1.0, max_cap=50)
+    assert lev == 50, f"expected 50x (capped), got {lev}"
+
+    # Wide SL 10% → safe = 5, conf 0.80 → 4
+    lev, _ = auto_leverage(entry=100, stop_loss=90, confidence=0.80, max_cap=50)
+    assert lev == 4, f"expected 4x, got {lev}"
+
+    # No confidence → conf_floor (0.5) — SL 2% safe 25 × 0.5 = 12.5 → 13
+    lev, _ = auto_leverage(entry=100, stop_loss=98, confidence=None, max_cap=50)
+    assert lev == 13, f"expected 13x (no conf), got {lev}"
+
+    # User-cap niedriger als safe — z.B. cap 10x für konservativen User, SL 1%, conf 0.95
+    # safe=50, *0.95=48 → capped at 10
+    lev, _ = auto_leverage(entry=100, stop_loss=99, confidence=0.95, max_cap=10)
+    assert lev == 10, f"expected 10x (cap), got {lev}"
+
+    # SHORT direction (entry < stop_loss) — gleiches SL-distance
+    lev, _ = auto_leverage(entry=100, stop_loss=102, confidence=0.90, max_cap=50)
+    assert lev == 23, f"SHORT setup should equal LONG mirror: expected 23x, got {lev}"
+
+    # Invalid: entry == sl
+    try:
+        auto_leverage(entry=100, stop_loss=100, confidence=0.9)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+    print("auto_leverage: OK -> SL-distance×confidence scaling, max_cap honored, floor & errors handled")
+
+
 if __name__ == "__main__":
     test_cap_limits_capital()
     test_no_cap_uses_full()
     test_parser()
     test_bcrypt_max_length()
+    test_auto_leverage()
     print("\nALLE CORE-TESTS BESTANDEN ✅")
