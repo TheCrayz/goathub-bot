@@ -16,7 +16,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import config
-from app.auth import MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw, make_token, needs_rehash, verify_pw
+from app.auth import (MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw,
+                      make_token, needs_rehash, verify_pw, _user_identity)
 from app.db import get_db, init_db
 from app.models import Activity, User
 from app.schemas import Login, Register, SettingsIn, WalletIn
@@ -250,7 +251,7 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
     db.add(u)
     db.commit()
     db.refresh(u)
-    tok = make_token(u.id, getattr(u, "token_version", 0))
+    tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
     response = JSONResponse({"access_token": tok, "token_type": "bearer"})
     _set_session_cookie(response, tok)  # Phase 2 #18: hybrid auth
     return response
@@ -271,7 +272,7 @@ def login(request: Request, body: Login, db: Session = Depends(get_db)):
             db.commit()
         except Exception:
             pass  # rehash-fail darf den login nicht blockieren
-    tok = make_token(u.id, getattr(u, "token_version", 0))
+    tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
     response = JSONResponse({"access_token": tok, "token_type": "bearer"})
     _set_session_cookie(response, tok)  # Phase 2 #18: hybrid auth
     return response
@@ -380,7 +381,7 @@ async def discord_callback(request: Request, code: str = None, state: str = None
             u.discord_avatar = avatar
             db.commit()
 
-        jwt_token = make_token(u.id, getattr(u, "token_version", 0))
+        jwt_token = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
         # Phase 2 #18 (2026-06-02): NEUE Strategie — Session-Cookie (httpOnly).
         # Das URL-Fragment-Token bleibt zusätzlich für Backward-Compat erhalten,
         # aber das Dashboard wird's nicht mehr in localStorage stecken — der

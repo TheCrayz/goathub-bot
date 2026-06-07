@@ -94,10 +94,17 @@ def verify_pw(p: str, h: str) -> bool:
         return False
 
 
-def make_token(uid: int, token_version: int = 0) -> str:
+def make_token(uid: int, token_version: int = 0, identity: str = "") -> str:
     """JWT minten. `token_version` mit-einbacken, damit Logout/Pw-Change alle
     alten Tokens unbrauchbar machen kann (Phase 1, 2026-06-02).
     Phase 6 (2026-06-02): datetime.now(timezone.utc) statt deprecated utcnow().
+
+    2026-06-07 BUG-FIX: SQLite recycelt gelöschte IDs (kein AUTOINCREMENT).
+    Wenn User #4 (og_b1312) gelöscht wird und ein neuer Discord-OAuth-Login
+    User #4 als saptor324 erstellt, validiert ein altes Cookie mit sub=4
+    gegen den NEUEN User → Account-Mixup. Lösung: JWT bindet zusätzlich an
+    `identity` (discord_id für OAuth-User, email für E-Mail-User). Beim
+    Decode prüfen wir dass die identity zum User passt.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     exp = now + datetime.timedelta(hours=config.JWT_EXPIRE_HOURS)
@@ -108,10 +115,19 @@ def make_token(uid: int, token_version: int = 0) -> str:
             "iat": now,                                   # Phase 6: issued-at
             "jti": __import__("secrets").token_hex(8),    # Phase 6: unique token id
             "tv": int(token_version),
+            "id": str(identity or ""),                    # 2026-06-07: identity binding
         },
         config.JWT_SECRET,
         algorithm="HS256",
     )
+
+
+def _user_identity(u: User) -> str:
+    """Stabile, unveränderliche Identität für JWT-Binding.
+    discord_id für OAuth-User, email für E-Mail-User. NIE die user_id, weil
+    die nach delete+create recycled werden kann.
+    """
+    return str(u.discord_id) if u.discord_id else (u.email or "")
 
 
 def current_user(
@@ -130,6 +146,7 @@ def current_user(
         payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
         uid = int(payload["sub"])
         tv = int(payload.get("tv", 0))
+        jwt_identity = str(payload.get("id", ""))
     except (JWTError, KeyError, ValueError):
         raise HTTPException(401, "Ungültiger Token")
     u = db.get(User, uid)
@@ -138,4 +155,12 @@ def current_user(
     # Phase 1: stale tokens nach Logout/Pw-Change abweisen.
     if int(getattr(u, "token_version", 0) or 0) != tv:
         raise HTTPException(401, "Session abgelaufen — bitte neu einloggen")
+    # 2026-06-07: Identity-binding gegen Recycled-ID-Bug. JWT ohne `id`-Field
+    # (alte Tokens) werden als ungültig abgewiesen — User loggt sich neu ein.
+    if not jwt_identity:
+        raise HTTPException(401, "Session muss erneuert werden — bitte neu einloggen")
+    if jwt_identity != _user_identity(u):
+        # Token zeigt auf user_id X, aber X gehört jetzt einem anderen Identitäts-Owner
+        # → Account-Recycling oder versuchter Account-Takeover.
+        raise HTTPException(401, "Session ungültig (Identity-Mismatch) — bitte neu einloggen")
     return u
