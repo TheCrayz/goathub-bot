@@ -79,6 +79,13 @@ class User(Base):
     # Nutzer pausieren / Errors einsehen. Default False; per SQL gesetzt.
     is_admin = Column(Boolean, default=False, nullable=False)
 
+    # 2026-06-08 Mainnet-Hardening C1: Per-User Max-Drawdown Lifetime-Cap.
+    # Wenn account_value < peak * (1 - max_drawdown_pct) → auto-pause + alert.
+    # max_drawdown_pct=0 deaktiviert das Feature.
+    # peak_account_value wird bei jedem _open_new auf max(peak, current) gehoben.
+    max_drawdown_pct = Column(Float, default=0.30, nullable=False)   # 30% default = pretty lenient
+    peak_account_value = Column(Float, default=0.0, nullable=False)
+
 
 class Activity(Base):
     __tablename__ = "activity"

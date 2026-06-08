@@ -291,6 +291,22 @@ def logout(u: User = Depends(current_user), db: Session = Depends(get_db)):
     return response
 
 
+# 2026-06-08 Mainnet-Hardening B4: JWT-Refresh-Endpoint.
+# JWT_EXPIRE_HOURS ist auf 24h gekürzt (statt 168h = 7d). Dashboard pollt
+# diesen Endpoint alle paar Stunden, bekommt einen neuen JWT mit frischem
+# exp. Solange der aktuelle noch valid + < 1h vor expiry, wird refreshed.
+@app.post("/api/refresh")
+@limiter.limit("60/minute")
+def refresh_token(request: Request, u: User = Depends(current_user)):
+    """Mintet einen neuen JWT für den aktuellen User. Voraussetzung: alter
+    JWT noch valid (current_user dependency erfüllt) — bei expired wird's
+    durch current_user ohnehin 401."""
+    new_tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
+    response = JSONResponse({"access_token": new_tok, "token_type": "bearer"})
+    _set_session_cookie(response, new_tok)
+    return response
+
+
 @app.get("/auth/discord")
 def discord_login():
     """Redirect to Discord OAuth2 with a CSRF-protecting `state` parameter.
@@ -412,7 +428,10 @@ def _user_public(u: User):
             "is_admin": bool(getattr(u, "is_admin", False)),   # Phase 3 (2026-06-02)
             "settings": {"risk_pct": u.risk_pct, "leverage": u.leverage,
                          "max_open_positions": u.max_open_positions,
-                         "capital_cap_usdc": u.capital_cap_usdc}}
+                         "capital_cap_usdc": u.capital_cap_usdc,
+                         # 2026-06-08 C1: Drawdown-Cap
+                         "max_drawdown_pct": float(getattr(u, "max_drawdown_pct", 0.30) or 0.30),
+                         "peak_account_value": float(getattr(u, "peak_account_value", 0) or 0)}}
 
 
 @app.get("/api/me")
@@ -464,8 +483,12 @@ def per_coin_status(u: User = Depends(current_user)):
 
 
 # ── Settings & Wallet ────────────────────────────────────────────────────────
+# 2026-06-08 Mainnet-Hardening B2: rate-limit auf authenticated state-mutating
+# routes (60/min) und auf häufig gepollte read-routes (30/min). Verhindert
+# resource-exhaust via authed user, schützt unsere IP gegen HL-info-DoS.
 @app.put("/api/settings")
-def update_settings(body: SettingsIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def update_settings(request: Request, body: SettingsIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
     if body.risk_pct is not None:
         u.risk_pct = max(0.001, min(0.05, body.risk_pct))   # max 5% Risiko/Trade (war 50%)
     if body.leverage is not None:
@@ -482,12 +505,16 @@ def update_settings(body: SettingsIn, u: User = Depends(current_user), db: Sessi
         if body.bot_active and not u.hl_api_secret_enc:
             raise HTTPException(400, "Connect your wallet before activating the bot")
         u.bot_active = body.bot_active
+    if body.max_drawdown_pct is not None:
+        # 2026-06-08 C1: 0 = disabled, max 0.95 (95% drawdown cap)
+        u.max_drawdown_pct = max(0.0, min(0.95, body.max_drawdown_pct))
     db.commit()
     return _user_public(u)
 
 
 @app.post("/api/wallet")
-def set_wallet(body: WalletIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def set_wallet(request: Request, body: WalletIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
     from app.crypto import encrypt
     addr = body.hl_account_address.strip()
     sec = body.hl_api_secret.strip()
@@ -662,8 +689,24 @@ def mark_builder_approved(u: User = Depends(current_user), db: Session = Depends
 
 
 # ── Dashboard-Daten (Live-PNL/Positionen + Aktivität) ────────────────────────
+# 2026-06-08 Mainnet-Hardening C2: Snapshot-Cache.
+# Vorher: jeder /api/dashboard call → 2-3 HL-Info-API-Calls. Bei 30 User
+# × 10s poll = 5400 calls/min an HL-Info → Rate-Limit + Latenz.
+# Jetzt: per-address Cache mit TTL=10s. Mehrere User mit gleicher Master
+# (Familie/Friends) bekommen den gleichen Snapshot ohne extra HL-Call.
+import time as _time
+_snapshot_cache: dict = {}    # address → (timestamp, snapshot_dict)
+_SNAPSHOT_TTL_S = 10
+
+
 def _snapshot(address: str):
-    """Read-only Konto-Snapshot + PnL-Statistik über die Info-API (kein Key nötig)."""
+    """Read-only Konto-Snapshot + PnL-Statistik über die Info-API (kein Key nötig).
+    Cached per address für _SNAPSHOT_TTL_S Sekunden.
+    """
+    now = _time.time()
+    cached = _snapshot_cache.get(address)
+    if cached and now - cached[0] < _SNAPSHOT_TTL_S:
+        return cached[1]
     from app.hyperliquid_exec import get_info
     info = get_info(config.HL_TESTNET)
     st = info.user_state(address)
@@ -736,11 +779,14 @@ def _snapshot(address: str):
         ]
     except Exception as e:
         log.warning("stats failed: %s", e)
-    return {"balance": round(bal, 2), "positions": positions, "stats": stats}
+    result = {"balance": round(bal, 2), "positions": positions, "stats": stats}
+    _snapshot_cache[address] = (now, result)
+    return result
 
 
 @app.get("/api/dashboard")
-def dashboard(u: User = Depends(current_user), db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def dashboard(request: Request, u: User = Depends(current_user), db: Session = Depends(get_db)):
     acct = {"balance": None, "positions": []}
     stats = {"total_pnl": 0.0, "win_rate": 0, "closed_trades": 0,
              "active_trades": 0, "pnl_series": [], "recent": []}

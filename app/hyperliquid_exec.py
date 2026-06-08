@@ -56,6 +56,12 @@ def round_sig(x, sig=5):
     return 0.0 if not x else round(x, -int(floor(log10(abs(x)))) + (sig - 1))
 
 
+# 2026-06-08 Mainnet-Hardening A5: HL-Retry-Wrapper.
+# hl_retry und is_transient_error sind in app/hl_retry.py (standalone, kein
+# eth_account-dep, damit lokal testbar). Hier nur Re-Export für convenience.
+from app.hl_retry import hl_retry, is_transient_error  # noqa: F401
+
+
 def _f(x, d=0.0):
     try:
         return float(x)
@@ -160,21 +166,31 @@ class HyperliquidTrader:
             return False
 
     def set_leverage(self, coin, lev):
+        # 2026-06-08 A5: 3 retries auf transient errors. Wenn final fail, return
+        # err-dict (Engine cancelt entry sauber, statt naked-place).
         try:
-            return self.exchange.update_leverage(int(round(lev)), coin_of(coin), is_cross=True)
+            return hl_retry(
+                lambda: self.exchange.update_leverage(int(round(lev)), coin_of(coin), is_cross=True),
+                max_attempts=3, label=f"update_leverage {coin}",
+            )
         except Exception as e:
-            log.warning("update_leverage(%s): %s", coin, e)
+            log.warning("update_leverage(%s) final fail: %s", coin, e)
             return {"status": "err", "response": str(e)}
 
     def _order(self, coin, is_buy, sz, px, otype, reduce_only=False):
         kwargs = {"reduce_only": reduce_only}
         if self.builder:
             kwargs["builder"] = self.builder
-        try:
-            return self.exchange.order(coin, is_buy, sz, px, otype, **kwargs)
-        except TypeError:
-            # SDK ohne builder-Param -> ohne Builder erneut
-            return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only)
+        # 2026-06-08 A5: reduce_only orders (SL/TP/close) sind must-succeed → 5 retries.
+        # Normale entries: 3 retries reichen (User-Signal kann auch nochmal kommen).
+        max_attempts = 5 if reduce_only else 3
+        label = f"order {coin} {'reduceOnly' if reduce_only else 'entry'}"
+        def _do():
+            try:
+                return self.exchange.order(coin, is_buy, sz, px, otype, **kwargs)
+            except TypeError:
+                return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only)
+        return hl_retry(_do, max_attempts=max_attempts, label=label)
 
     def place_entry(self, coin, is_buy, sz, px):
         coin = coin_of(coin)
@@ -278,19 +294,24 @@ class HyperliquidTrader:
         return res
 
     def cancel_orders(self, coin):
-        """Alle offenen Orders (Entry + SL/TP) für einen Coin canceln. -> Anzahl."""
+        """Alle offenen Orders (Entry + SL/TP) für einen Coin canceln. -> Anzahl.
+        2026-06-08 A5: jeder cancel mit retry (must-succeed-ish).
+        """
         coin = coin_of(coin)
         n = 0
         try:
-            for o in self.info.open_orders(self.address):
+            orders = hl_retry(lambda: self.info.open_orders(self.address),
+                              max_attempts=3, label="open_orders")
+            for o in orders or []:
                 if o.get("coin") == coin and o.get("oid") is not None:
                     try:
-                        self.exchange.cancel(coin, o["oid"])
+                        hl_retry(lambda: self.exchange.cancel(coin, o["oid"]),
+                                 max_attempts=5, label=f"cancel {coin}")
                         n += 1
                     except Exception as e:
-                        log.warning("cancel %s oid %s: %s", coin, o.get("oid"), e)
+                        log.warning("cancel %s oid %s final fail: %s", coin, o.get("oid"), e)
         except Exception as e:
-            log.warning("open_orders(%s): %s", coin, e)
+            log.warning("open_orders(%s) final fail: %s", coin, e)
         return n
 
     def close_position(self, coin, slippage_cap=None):

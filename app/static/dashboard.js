@@ -424,3 +424,19 @@ async function load(){
 // Phase 2 #18: immer load() probieren — auth läuft via Cookie. Wenn 401,
 // fängt load() das ab und zeigt Login-Form (auth section ist by default sichtbar).
 load();
+
+// 2026-06-08 Mainnet-Hardening B4: JWT-Refresh-Loop.
+// JWT_EXPIRE_HOURS=24 (statt 168). Damit Tester nicht alle 24h re-loggen
+// müssen, pollen wir alle 12h /api/refresh wenn user eingeloggt ist.
+// Wenn der refresh failt (401 = Session abgelaufen während AFK), bleibt
+// der bisherige Cookie tot und nächster load() zeigt Login-Form.
+setInterval(async function(){
+  try {
+    const me = await api("GET", "/api/me");
+    if (me && me.email) {  // eingeloggt
+      await api("POST", "/api/refresh");
+    }
+  } catch (e) {
+    // silent — beim nächsten load() landet User auf Login wenn nötig
+  }
+}, 12 * 60 * 60 * 1000);  // 12h

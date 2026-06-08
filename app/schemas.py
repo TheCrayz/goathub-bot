@@ -20,6 +20,7 @@ class SettingsIn(BaseModel):
     max_open_positions: Optional[int] = None
     capital_cap_usdc: Optional[float] = None
     bot_active: Optional[bool] = None
+    max_drawdown_pct: Optional[float] = None   # 2026-06-08 C1: lifetime drawdown cap
 
 
 class WalletIn(BaseModel):

@@ -41,7 +41,7 @@ if not JWT_SECRET or JWT_SECRET == "dev-insecure-change-me":
         "JWT_SECRET fehlt oder ist der unsichere Default. In der .env setzen, z.B.:\n"
         "  JWT_SECRET=$(openssl rand -hex 32)\n"
         "Ohne sicheres Secret sind alle Login-Tokens fälschbar (Account-Übernahme).")
-JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 168)   # 7 Tage statt 30 (kürzere Token-Lebensdauer)
+JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 24)   # 2026-06-08 B4: 24h statt 168h (war 7 Tage). Refresh-Endpoint extends.
 ENCRYPTION_KEY = _g("ENCRYPTION_KEY")        # Fernet-Key; nötig zum Speichern der HL-Agent-Keys
 
 # Hyperliquid
@@ -57,9 +57,12 @@ SIGNALS_CHANNEL_ID = _i("SIGNALS_CHANNEL_ID", 0)
 ENABLE_LISTENER = _b("ENABLE_LISTENER", "false")   # für localhost-Test ohne Discord = false
 
 # Defaults für neue Nutzer
-DEFAULT_RISK_PCT = _f("DEFAULT_RISK_PCT", 0.01)
-DEFAULT_LEVERAGE = _f("DEFAULT_LEVERAGE", 50)   # 2026-06-06: jetzt Max-Cap für Auto-Lev (war 3x fixed)
-DEFAULT_MAX_OPEN = _i("DEFAULT_MAX_OPEN", 10)
+# 2026-06-08 Mainnet-Hardening B1: konservative Defaults für neue User.
+# Können per env-var höher gesetzt werden (Power-User), neue User starten
+# mit den Werten unten = safe. Vorher waren die testnet-aggressiv.
+DEFAULT_RISK_PCT = _f("DEFAULT_RISK_PCT", 0.005)   # 0.5% statt 1% — half so aggressive
+DEFAULT_LEVERAGE = _f("DEFAULT_LEVERAGE", 20)     # Max-Cap 20 für neue User (war 50). Auto-Lev passt sich an SL+conf an.
+DEFAULT_MAX_OPEN = _i("DEFAULT_MAX_OPEN", 5)      # max 5 concurrent positions statt 10
 MIN_NOTIONAL_USDC = _f("MIN_NOTIONAL_USDC", 10)
 MIN_CONFIDENCE = _f("MIN_CONFIDENCE", 0.75)
 ENTRY_FILL_TIMEOUT_S = _i("ENTRY_FILL_TIMEOUT_S", 300)   # 5 min (Phase 2 von 15→5 Min)
@@ -84,6 +87,24 @@ PERCOIN_CACHE_TTL_S = _i("PERCOIN_CACHE_TTL_S", 600)     # HL-fills nur alle 10 
 # bis Position-Sync sie aufpickt oder manueller Eingriff. Für Mainnet kann
 # das tighter sein, für Testnet (dünne Bücher) eher 3 %.
 SL_SLIPPAGE_CAP = _f("SL_SLIPPAGE_CAP", 0.02)            # 2 %, env: SL_SLIPPAGE_CAP=0.03 für mehr Toleranz
+
+# 2026-06-08 Mainnet-Hardening A1/A2/A3: Cost-Cap + Alert + Panic-Halt
+# Wenn signal-bot amok läuft (z.B. 200 NEW_TRADEs/h), löst jeder Trade
+# echte Fees aus. Auf Mainnet → echtes Geld. MAX_SIGNALS_PER_HOUR cappt
+# das pro Stunde, MIN_TRADE_INTERVAL_S verhindert Trade-Storms pro
+# (user, coin).
+MAX_SIGNALS_PER_HOUR = _i("MAX_SIGNALS_PER_HOUR", 30)   # global
+MIN_TRADE_INTERVAL_S = _i("MIN_TRADE_INTERVAL_S", 60)   # per (user, coin)
+
+# Discord-Webhook URL für Error-Alerts. Leer = aus.
+ALERT_WEBHOOK_URL = _g("ALERT_WEBHOOK_URL", "")
+ALERT_THROTTLE_S = _i("ALERT_THROTTLE_S", 60)           # max 1 Alert pro 60s pro (user, coin)
+
+# EMERGENCY_HALT-Flag — wenn True, ignoriert handle_signal alle Signale.
+# Wird gesetzt durch /api/admin/halt oder durch automatic-Trigger
+# (MAX_SIGNALS_PER_HOUR überschritten). Pfad zur Datei statt env-var damit
+# wir's zur Laufzeit toggeln können ohne Service-Restart.
+EMERGENCY_HALT_FLAG_PATH = _g("EMERGENCY_HALT_FLAG_PATH", "/tmp/goathub-emergency-halt")
 
 # Discord OAuth2
 DISCORD_CLIENT_ID = _g("DISCORD_CLIENT_ID", "1508987342482837524")

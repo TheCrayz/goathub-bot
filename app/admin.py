@@ -125,6 +125,72 @@ def admin_resume_user(
     return {"ok": True, "user_id": u.id, "bot_active": True}
 
 
+# 2026-06-08 Mainnet-Hardening A3: Panic-Halt-Endpoints.
+# Notfall-Switch um SOFORT alle User zu pausieren + EMERGENCY_HALT setzen
+# damit handle_signal jeden weiteren Signal ignoriert. Single-Click in
+# unter 5 Sekunden.
+@router.get("/halt-status")
+def admin_halt_status(_: User = Depends(current_admin_user)):
+    """Aktueller Status: ist Emergency-Halt aktiv? Wie viele user bot_active?"""
+    from app.engine import _emergency_halt_active
+    from app.db import SessionLocal
+    db = SessionLocal()
+    try:
+        active = db.query(User).filter(User.bot_active.is_(True)).count()
+        total = db.query(User).count()
+    finally:
+        db.close()
+    halt = _emergency_halt_active()
+    halt_reason = None
+    if halt:
+        try:
+            with open(config.EMERGENCY_HALT_FLAG_PATH) as f:
+                halt_reason = f.read()[:500]
+        except Exception:
+            pass
+    return {
+        "emergency_halt_active": halt,
+        "halt_reason": halt_reason,
+        "users_bot_active": active,
+        "users_total": total,
+    }
+
+
+@router.post("/halt")
+def admin_halt(admin: User = Depends(current_admin_user), db: Session = Depends(get_db)):
+    """🚨 PANIC-HALT: pause ALL bot_active users + set EMERGENCY_HALT-Flag.
+
+    Idempotent. Sofort-Stop für die ganze Plattform — handle_signal ignoriert
+    alle weiteren Signale bis /halt/clear aufgerufen wird ODER der Flag-File
+    manuell gelöscht.
+    """
+    from app.engine import _set_emergency_halt
+    paused = db.query(User).filter(User.bot_active.is_(True)).update({"bot_active": False})
+    db.add(Activity(
+        user_id=admin.id, kind="error",
+        text=f"🚨 PANIC-HALT triggered by admin {admin.email or admin.discord_username}: "
+             f"{paused} user(s) paused + EMERGENCY_HALT-Flag gesetzt."
+    ))
+    db.commit()
+    _set_emergency_halt(reason=f"Manuell durch admin {admin.email or admin.discord_username}")
+    return {"ok": True, "users_paused": paused, "emergency_halt": True}
+
+
+@router.post("/halt/clear")
+def admin_halt_clear(admin: User = Depends(current_admin_user), db: Session = Depends(get_db)):
+    """Hebe EMERGENCY_HALT auf. User selbst müssen sich danach wieder
+    aktivieren (bot_active) — wir setzen es NICHT automatisch zurück."""
+    from app.engine import _clear_emergency_halt
+    _clear_emergency_halt()
+    db.add(Activity(
+        user_id=admin.id, kind="order",
+        text=f"EMERGENCY_HALT cleared by admin {admin.email or admin.discord_username}. "
+             f"User müssen sich selbst wieder aktivieren."
+    ))
+    db.commit()
+    return {"ok": True, "emergency_halt": False}
+
+
 @router.get("/activity")
 def admin_activity(
     limit: int = 100,

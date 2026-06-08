@@ -10,11 +10,22 @@ engine = create_engine(config.DATABASE_URL, connect_args=_connect, future=True)
 
 # Phase 4 (2026-06-02): SQLite enforced FK-constraints AUS by default.
 # Bei jeder neuen Connection PRAGMA setzen.
+#
+# 2026-06-08 Mainnet-Hardening A4: WAL-Mode + synchronous=NORMAL.
+# Vorher (DELETE-journal): jeder Writer hält exklusiven Lock → andere Reader
+# blockieren bis Write fertig → bei 4 Background-Loops + N FastAPI-Requests
+# = `database is locked` Errors mid-trade. WAL erlaubt parallele Reads
+# während Writes laufen, plus mehrere Writer können gleichzeitig commit
+# vorbereiten. synchronous=NORMAL = OK für unsere Use-Case (Crashrecovery
+# bleibt, nur fsync nach jedem Block statt nach jedem Commit).
 if config.DATABASE_URL.startswith("sqlite"):
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, _):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")  # 5s warten bei locked statt sofort fail
         cursor.close()
 
 
@@ -37,6 +48,9 @@ def init_db():
             ("token_version", "INTEGER NOT NULL DEFAULT 0"),
             # Phase 3 (2026-06-02): Admin-Flag für /api/admin/*-Endpoints.
             ("is_admin", "BOOLEAN NOT NULL DEFAULT 0"),
+            # 2026-06-08 C1: Max-Drawdown-Lifetime-Cap.
+            ("max_drawdown_pct", "FLOAT NOT NULL DEFAULT 0.30"),
+            ("peak_account_value", "FLOAT NOT NULL DEFAULT 0.0"),
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef}"))
@@ -49,6 +63,23 @@ def init_db():
     # recreate-and-copy. Einmal-Aktion; idempotent via FK-Existenz-Check.
     _migrate_add_fk("activity", "user_id", "users(id)", on_delete="CASCADE")
     _migrate_add_fk("managed_trades", "user_id", "users(id)", on_delete="CASCADE")
+    # 2026-06-08 Mainnet-Hardening C3: Admin-Bootstrap.
+    # Falls INITIAL_ADMIN_EMAIL gesetzt ist UND der User mit dieser Email
+    # existiert UND noch nicht admin ist → is_admin=True setzen.
+    # Erspart manuelle SQL-Patches nach Fresh-Deploy.
+    import os
+    bootstrap_email = (os.getenv("INITIAL_ADMIN_EMAIL") or "").strip().lower()
+    if bootstrap_email:
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            try:
+                r = conn.execute(_text("UPDATE users SET is_admin=1 WHERE email=:e AND is_admin=0"),
+                                 {"e": bootstrap_email})
+                conn.commit()
+                if r.rowcount > 0:
+                    print(f"[init_db] Bootstrap: {bootstrap_email} promoted to is_admin=True")
+            except Exception:
+                pass
 
 
 def _migrate_add_fk(table_name: str, column: str, ref: str, on_delete: str = "CASCADE"):

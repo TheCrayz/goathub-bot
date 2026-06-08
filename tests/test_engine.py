@@ -217,10 +217,193 @@ def test_sl_ratchet_math():
     print("sl_ratchet_math: OK")
 
 
+def test_emergency_halt_helpers():
+    """2026-06-08 Mainnet-Hardening A3: file-based emergency halt flag."""
+    import os
+    # Override path to avoid touching prod
+    engine.config.EMERGENCY_HALT_FLAG_PATH = "/tmp/test-halt-flag-engine"
+    if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
+        os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
+
+    assert engine._emergency_halt_active() is False, "no flag yet"
+    engine._set_emergency_halt("test reason")
+    assert engine._emergency_halt_active() is True, "set should activate"
+    engine._set_emergency_halt("second set — idempotent")
+    assert engine._emergency_halt_active() is True, "still active"
+    engine._clear_emergency_halt()
+    assert engine._emergency_halt_active() is False, "clear deactivates"
+    engine._clear_emergency_halt()  # idempotent clear
+    assert engine._emergency_halt_active() is False
+    print("emergency_halt_helpers: OK")
+
+
+def test_signal_rate_cap_and_autohalt():
+    """2026-06-08 Mainnet-Hardening A1: sliding-window rate cap auto-aktiviert halt."""
+    import os
+    engine.config.EMERGENCY_HALT_FLAG_PATH = "/tmp/test-halt-flag-rate"
+    if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
+        os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
+    engine.config.MAX_SIGNALS_PER_HOUR = 3
+    engine._signal_timestamps.clear()
+
+    assert engine._signal_rate_check() is True, "1/3"
+    assert engine._signal_rate_check() is True, "2/3"
+    assert engine._signal_rate_check() is True, "3/3"
+    assert engine._signal_rate_check() is False, "4th should block"
+    assert engine._emergency_halt_active() is True, "auto-halt set"
+
+    engine._clear_emergency_halt()
+    engine._signal_timestamps.clear()
+    print("signal_rate_cap_and_autohalt: OK")
+
+
+def test_trade_interval_throttle():
+    """2026-06-08 Mainnet-Hardening A1: min interval pro (user, coin) gegen storms."""
+    engine.config.MIN_TRADE_INTERVAL_S = 60
+    engine._trade_intervals.clear()
+
+    assert engine._trade_interval_ok(1, "BTC") is True
+    assert engine._trade_interval_ok(1, "BTC") is False, "<60s elapsed"
+    assert engine._trade_interval_ok(2, "BTC") is True, "different user OK"
+    assert engine._trade_interval_ok(1, "ETH") is True, "different coin OK"
+    print("trade_interval_throttle: OK")
+
+
+def test_hl_retry():
+    """2026-06-08 Mainnet-Hardening A5: retry on transient errors,
+    fail-fast on non-transient, exhausts after max_attempts."""
+    from app.hl_retry import hl_retry, is_transient_error
+
+    # Transient classification
+    assert is_transient_error("HTTP 429 Too Many Requests")
+    assert is_transient_error("connection reset by peer")
+    assert is_transient_error("Service unavailable (503)")
+    assert is_transient_error("Request timed out")
+    assert not is_transient_error("Invalid API key")
+    assert not is_transient_error("Insufficient margin")
+
+    # Retry succeeds eventually
+    attempts = [0]
+    def flaky():
+        attempts[0] += 1
+        if attempts[0] < 3:
+            raise RuntimeError("HTTP 429 rate limit")
+        return "ok"
+    result = hl_retry(flaky, max_attempts=5, backoff=1.0, initial_delay=0.01)
+    assert result == "ok"
+    assert attempts[0] == 3, f"expected 3 attempts, got {attempts[0]}"
+
+    # Non-transient fails immediately
+    attempts2 = [0]
+    def hard_fail():
+        attempts2[0] += 1
+        raise ValueError("Invalid signature")
+    try:
+        hl_retry(hard_fail, max_attempts=5, initial_delay=0.01)
+        assert False, "should have raised"
+    except ValueError:
+        pass
+    assert attempts2[0] == 1, f"non-transient should fail-fast, got {attempts2[0]} attempts"
+
+    # Exhausts retries
+    attempts3 = [0]
+    def always_fail():
+        attempts3[0] += 1
+        raise RuntimeError("503 service unavailable")
+    try:
+        hl_retry(always_fail, max_attempts=3, backoff=1.0, initial_delay=0.01)
+        assert False, "should have raised"
+    except RuntimeError as e:
+        assert "503" in str(e)
+    assert attempts3[0] == 3, f"expected 3 attempts before giving up, got {attempts3[0]}"
+
+    # Soft-fail handling (dict with status="err")
+    attempts4 = [0]
+    def soft_then_ok():
+        attempts4[0] += 1
+        if attempts4[0] < 2:
+            return {"status": "err", "response": "rate limit exceeded"}
+        return {"status": "ok", "response": {"data": "fine"}}
+    res = hl_retry(soft_then_ok, max_attempts=5, initial_delay=0.01)
+    assert res["status"] == "ok"
+    assert attempts4[0] == 2
+
+    print("hl_retry: OK")
+
+
+def test_alert_throttle_without_url():
+    """2026-06-08 Mainnet-Hardening A2: alert ohne URL macht nichts (graceful)."""
+    engine.config.ALERT_WEBHOOK_URL = ""
+    engine._alert_throttle.clear()
+    # Sollte nicht raisen, einfach silently no-op
+    engine._post_alert("test message", key=("u1", "BTC"))
+    engine._post_alert("another", key=None)  # ungethrottled
+    assert engine._alert_throttle == {}, "no throttle entries when url disabled"
+    print("alert_throttle_without_url: OK")
+
+
+def test_pause_user_idempotency_race():
+    """2026-06-08 Mainnet-Hardening C7: 2 concurrent pause-calls für gleichen user
+    → nur EINE Activity-Zeile."""
+    _reset_db()
+    db = SessionLocal()
+    _make_user(db, user_id=1, bot_active=True)
+    db.close()
+
+    engine._recent_pause_keys.clear()
+    # Erste Pause-Call: muss durchgehen
+    engine._pause_user_bad_key(1, "first call", reason="invalid_key")
+    db = SessionLocal()
+    n1 = db.query(Activity).filter(Activity.user_id == 1, Activity.kind == "error").count()
+    db.close()
+    assert n1 == 1, f"first call should create 1 activity, got {n1}"
+
+    # Zweite Pause-Call ~ms später (concurrent simulator): muss SUPPRESSED sein
+    engine._pause_user_bad_key(1, "second call from concurrent task", reason="invalid_key")
+    db = SessionLocal()
+    n2 = db.query(Activity).filter(Activity.user_id == 1, Activity.kind == "error").count()
+    db.close()
+    assert n2 == 1, f"concurrent second call should NOT add activity, got {n2}"
+    print("pause_user_idempotency_race: OK")
+
+
+def test_sl_slippage_cap_math():
+    """Phase 6+ H-8: place_protection's worst-case-price-Berechnung.
+    Verifiziert dass die Sign-Konvention für LONG/SHORT korrekt ist.
+
+    SL-Order ist immer REDUCE-ONLY in entgegengesetzter Richtung:
+      - LONG-position SL  → SELL bei trigger (Preis fällt)
+        → worst = trigger * (1 - slip)   (akzeptiere bis zu slip% unter trigger)
+      - SHORT-position SL → BUY bei trigger (Preis steigt)
+        → worst = trigger * (1 + slip)   (akzeptiere bis zu slip% über trigger)
+    """
+    def worst_case_price(trigger, is_buy_position, slip):
+        # is_buy_protection = entgegengesetzt zur entry
+        is_buy_protection = not is_buy_position
+        sign = 1 if is_buy_protection else -1
+        return trigger * (1 + sign * slip)
+
+    # LONG SL bei 1800, slip 2% → SELL worst @ 1764 (1800 * 0.98)
+    assert abs(worst_case_price(1800, True, 0.02) - 1764) < 0.001
+    # SHORT SL bei 2000, slip 2% → BUY worst @ 2040 (2000 * 1.02)
+    assert abs(worst_case_price(2000, False, 0.02) - 2040) < 0.001
+    # Edge: slip=0 → worst = trigger
+    assert worst_case_price(100, True, 0) == 100
+    assert worst_case_price(100, False, 0) == 100
+    print("sl_slippage_cap_math: OK")
+
+
 if __name__ == "__main__":
     test_is_bad_key_error()
     test_pause_user_bad_key_idempotent()
     test_get_current_sl()
     test_per_coin_filter_threshold()
     test_sl_ratchet_math()
+    test_emergency_halt_helpers()
+    test_signal_rate_cap_and_autohalt()
+    test_trade_interval_throttle()
+    test_alert_throttle_without_url()
+    test_hl_retry()
+    test_pause_user_idempotency_race()
+    test_sl_slippage_cap_math()
     print("\nALLE ENGINE-TESTS BESTANDEN ✅")

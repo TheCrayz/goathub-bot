@@ -26,6 +26,96 @@ _percoin_cache: dict = {}
 
 log = logging.getLogger("goathub.engine")
 
+# 2026-06-08 Mainnet-Hardening A1/A2: Rate-Counter + Alert-Throttle.
+# In-Memory (lost on restart, OK — counters reset = fail-open, safer than
+# false-block; emergency-halt-flag persistent in file).
+import os
+_signal_timestamps: list = []                          # sliding-window aller Signal-Empfänge
+_trade_intervals: dict = {}                            # (user_id, coin) -> last_trade_ts
+_alert_throttle: dict = {}                             # (user_id, coin) -> last_alert_ts
+
+
+def _emergency_halt_active() -> bool:
+    """True wenn die Halt-Datei existiert. Datei statt env-var weil zur Laufzeit toggelbar."""
+    try:
+        return os.path.exists(config.EMERGENCY_HALT_FLAG_PATH)
+    except Exception:
+        return False
+
+
+def _set_emergency_halt(reason: str = ""):
+    """Setze die Halt-Datei mit Begründung. Idempotent."""
+    try:
+        with open(config.EMERGENCY_HALT_FLAG_PATH, "w") as f:
+            f.write(f"{time.time()}\n{reason}\n")
+        log.error("EMERGENCY_HALT activated: %s", reason)
+    except Exception as e:
+        log.error("Failed to set EMERGENCY_HALT flag: %s", e)
+
+
+def _clear_emergency_halt():
+    """Entferne die Halt-Datei. Bot reagiert wieder auf Signale."""
+    try:
+        if os.path.exists(config.EMERGENCY_HALT_FLAG_PATH):
+            os.remove(config.EMERGENCY_HALT_FLAG_PATH)
+        log.info("EMERGENCY_HALT cleared")
+    except Exception as e:
+        log.error("Failed to clear EMERGENCY_HALT flag: %s", e)
+
+
+def _post_alert(text: str, key: tuple = None):
+    """Schickt eine Discord-Alert wenn ALERT_WEBHOOK_URL gesetzt ist.
+    `key` (z.B. (user_id, coin)) → Throttle: max 1 Alert pro key pro
+    ALERT_THROTTLE_S Sekunden. None = nicht throttled (für globale Halts).
+    Nicht-blockierend (best-effort, swallowt Fehler).
+    """
+    url = config.ALERT_WEBHOOK_URL
+    if not url:
+        return
+    if key is not None:
+        now = time.time()
+        last = _alert_throttle.get(key, 0)
+        if now - last < config.ALERT_THROTTLE_S:
+            return
+        _alert_throttle[key] = now
+    try:
+        import httpx
+        # Fire-and-forget; <2s timeout damit Engine nicht blockiert
+        httpx.post(url, json={"content": text[:1900]}, timeout=2.5)
+    except Exception as e:
+        log.warning("alert webhook failed: %s", e)
+
+
+def _signal_rate_check() -> bool:
+    """True wenn signal-rate unter MAX_SIGNALS_PER_HOUR liegt. False = blocken.
+    Bei block: setze EMERGENCY_HALT (kann manuell wieder gecleart werden).
+    Sliding-window über die letzten 3600s.
+    """
+    now = time.time()
+    # Garbage-collect alte timestamps (>1h alt)
+    cutoff = now - 3600
+    _signal_timestamps[:] = [t for t in _signal_timestamps if t > cutoff]
+    if len(_signal_timestamps) >= config.MAX_SIGNALS_PER_HOUR:
+        msg = (f"🚨 EMERGENCY_HALT: {len(_signal_timestamps)} signals in last hour "
+               f"(cap {config.MAX_SIGNALS_PER_HOUR}). Auto-halt activated. "
+               f"Untersuche signal-bot, dann manuell DELETE {config.EMERGENCY_HALT_FLAG_PATH}.")
+        _set_emergency_halt(msg)
+        _post_alert(msg)
+        return False
+    _signal_timestamps.append(now)
+    return True
+
+
+def _trade_interval_ok(user_id: int, coin: str) -> bool:
+    """True wenn der letzte Trade für (user, coin) länger als MIN_TRADE_INTERVAL_S her ist."""
+    key = (user_id, coin)
+    now = time.time()
+    last = _trade_intervals.get(key, 0)
+    if now - last < config.MIN_TRADE_INTERVAL_S:
+        return False
+    _trade_intervals[key] = now
+    return True
+
 # Laufende Tasks festhalten (sonst kann der GC sie mitten im Trade abräumen)
 _tasks = set()
 
@@ -72,6 +162,12 @@ def _log_activity(user_id, kind, text):
         log.error("activity log failed: %s", e)
     finally:
         db.close()
+    # 2026-06-08 Mainnet-Hardening A2: error-activity zusätzlich an Discord-Webhook.
+    # Throttled per (user_id, ersten 20 chars des text) damit nicht der gleiche
+    # Fehler 100× in einer Stunde alerted wird.
+    if kind == "error":
+        throttle_key = (user_id, str(text)[:30])
+        _post_alert(f"🚨 [user {user_id}] {text}", key=throttle_key)
 
 
 def _save_managed(user_id, coin, sig, status, resting_oid=None):
@@ -173,6 +269,9 @@ def _get_current_sl(user_id, coin):
         db.close()
 
 
+_recent_pause_keys: dict = {}  # user_id → ts der letzten Pause-Aktion (Idempotenz)
+
+
 def _pause_user_bad_key(user_id, err_msg, reason="invalid_key"):
     """Bot AUS schalten wenn Agent-Key kaputt ODER nicht autorisiert.
     Genau EINE Activity-Zeile statt 100 Tracebacks pro Tag.
@@ -180,7 +279,17 @@ def _pause_user_bad_key(user_id, err_msg, reason="invalid_key"):
     reason="invalid_key"   → Key-Format kaputt (42 statt 66 chars etc)
     reason="not_authorized" → Key technisch ok aber HL kennt ihn nicht
                               (User hat ExtraAgent revoked / nicht autorisiert)
+
+    2026-06-08 C7: Idempotenz-Race-Fix. Bei 2 concurrent signals für gleichen
+    kaputten User können beide Tasks _pause_user_bad_key parallel aufrufen.
+    `db.get(u).bot_active` zeigt für beide noch True → 2 Activity-Zeilen.
+    In-memory suppression-Set verhindert das für die ersten 30s nach Pause.
     """
+    now = time.time()
+    last = _recent_pause_keys.get(user_id, 0)
+    if now - last < 30:
+        return  # vor max 30s schon pausiert — concurrent caller, skip
+    _recent_pause_keys[user_id] = now
     db = SessionLocal()
     try:
         u = db.get(User, user_id)
@@ -285,6 +394,13 @@ def _per_coin_blocked(user_addr: str, coin: str):
 
 # ── Signal-Eingang ───────────────────────────────────────────────────────────
 async def handle_signal(embed: dict):
+    # 2026-06-08 Mainnet-Hardening A1+A3: EMERGENCY_HALT-Check zuerst.
+    # File-basiert damit zur Laufzeit toggelbar (durch /api/admin/halt
+    # oder durch _signal_rate_check bei Rate-Storm).
+    if _emergency_halt_active():
+        log.warning("Signal ignoriert: EMERGENCY_HALT aktiv (file %s exists)",
+                    config.EMERGENCY_HALT_FLAG_PATH)
+        return
     sig = parse_signal(embed)
     if sig is None:
         return
@@ -294,6 +410,12 @@ async def handle_signal(embed: dict):
     is_cancel = action in CANCEL_ACTIONS
     is_entry = action in ("NEW_TRADE", "UPDATE_TRADE")
     if not is_cancel and not is_entry:
+        return
+    # 2026-06-08 Mainnet-Hardening A1: Signal-Rate-Cap. Bei Überschreitung →
+    # auto-Halt + Discord-Alert + dieses Signal wird verworfen.
+    if not _signal_rate_check():
+        log.error("Signal %s %s VERWORFEN — auto-halt triggered (rate exceeded)",
+                  action, coin_of(sig.ticker))
         return
     # Confidence-Gate für ALLE Aktionen (Phase 1: vorher nur Einstiege).
     # Low-confidence CANCEL hat zuvor offene Positionen mid-trade geschlossen
@@ -315,6 +437,15 @@ async def handle_signal(embed: dict):
     coin = coin_of(sig.ticker)
     log.info("Signal %s %s %s -> %d aktive Nutzer", action, sig.direction, coin, len(user_ids))
     for uid in user_ids:
+        # 2026-06-08 Mainnet-Hardening A1: per-(user, coin) min-Trade-Interval.
+        # Verhindert Trade-Storm wenn signal-bot sekundenschnell mehrere Signale
+        # für gleichen coin schickt (z.B. bei restart-induced re-replays).
+        if is_entry and not _trade_interval_ok(uid, coin):
+            log.info("Skip %s/%s for user %s — min-trade-interval not elapsed (%ds)",
+                     action, coin, uid, config.MIN_TRADE_INTERVAL_S)
+            _log_activity(uid, "skip",
+                          f"{coin}: trade-interval-throttle aktiv (min {config.MIN_TRADE_INTERVAL_S}s), skip.")
+            continue
         if is_cancel:
             _spawn(_cancel(uid, sig))
         else:
@@ -401,6 +532,43 @@ async def _open_new(trader, u, sig):
     if balance <= 0:
         _log_activity(u.id, "skip", f"{coin}: kein handelbares Guthaben")
         return
+
+    # 2026-06-08 Mainnet-Hardening C1: Max-Drawdown Lifetime-Cap.
+    # Wenn aktueller account_value mehr als max_drawdown_pct unter dem
+    # historischen peak liegt → auto-pause + alert. Schützt User vor
+    # Streak-Verlusten ("hätt ich mal früher aufgehört").
+    # max_drawdown_pct=0 deaktiviert das Feature.
+    max_dd = float(getattr(u, "max_drawdown_pct", 0) or 0)
+    peak = float(getattr(u, "peak_account_value", 0) or 0)
+    if max_dd > 0 and peak > 0:
+        threshold = peak * (1 - max_dd)
+        if balance < threshold:
+            _log_activity(
+                u.id, "error",
+                f"🚨 MAX-DRAWDOWN-CAP: balance ${balance:.2f} < threshold ${threshold:.2f} "
+                f"(peak ${peak:.2f}, cap {max_dd:.0%}). Bot pausiert. Sieh dir die Trades "
+                f"an, justiere risk_pct/leverage, dann selbst wieder aktivieren."
+            )
+            _db = SessionLocal()
+            try:
+                uu = _db.get(User, u.id)
+                if uu:
+                    uu.bot_active = False
+                    _db.commit()
+            finally:
+                _db.close()
+            return
+    # Update peak-tracker (im Code; persist nur wenn höher)
+    if balance > peak:
+        _db = SessionLocal()
+        try:
+            uu = _db.get(User, u.id)
+            if uu:
+                uu.peak_account_value = balance
+                _db.commit()
+        finally:
+            _db.close()
+
     open_pos = await asyncio.to_thread(trader.open_positions_count)
     if open_pos >= u.max_open_positions:
         _log_activity(u.id, "skip", f"{coin}: max. Positionen ({open_pos}/{u.max_open_positions})")
