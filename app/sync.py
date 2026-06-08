@@ -46,13 +46,22 @@ async def position_sync_loop():
 
 
 async def _reconcile_all_users():
-    """One full reconcile pass over all users with at least one open managed_trade."""
+    """One full reconcile pass over all users with at least one open managed_trade.
+
+    2026-06-08 bug-fix: Reconcile ist nur für status='open'. Trades mit
+    status='resting' (Limit-Order wartet auf Fill) haben naturgemäß NOCH
+    keine HL-Position — die werden vom fill-watch-Loop in engine._protect_when_filled
+    verwaltet. Wenn sync auch resting prüft, sieht es 'HL hat nichts' → flippt
+    nach 2 strikes fälschlich zu 'closed', noch BEVOR die Limit-Order
+    gefüllt werden konnte. Konkret beobachtet: user 5 SUI 2026-06-08 08:09
+    → 08:11 (2 strikes × 60s) sync-killed während fill-watch noch lief.
+    """
     db = SessionLocal()
     try:
-        # Effizient: nur User, die a) Wallet verbunden haben, b) >=1 non-closed managed_trade
+        # Nur status='open' reconcilen — 'resting' = noch nicht gefillt, gehört dem fill-watch
         user_ids_with_open = {
             row[0] for row in
-            db.query(ManagedTrade.user_id).filter(ManagedTrade.status != "closed").distinct().all()
+            db.query(ManagedTrade.user_id).filter(ManagedTrade.status == "open").distinct().all()
         }
         users = (
             db.query(User)
@@ -80,7 +89,7 @@ async def _reconcile_one_user(user_id: int, address: str):
     try:
         open_mts = (
             db.query(ManagedTrade)
-              .filter(ManagedTrade.user_id == user_id, ManagedTrade.status != "closed")
+              .filter(ManagedTrade.user_id == user_id, ManagedTrade.status == "open")
               .all()
         )
         # Detach: wir lesen nur, schreiben mit fresh-query unten
