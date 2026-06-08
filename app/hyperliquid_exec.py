@@ -122,7 +122,16 @@ class HyperliquidTrader:
             spot = 0.0
             for b in self.info.spot_user_state(self.address).get("balances", []):
                 if b.get("coin") == "USDC":
-                    spot = _f(b.get("total"))
+                    # 2026-06-08 Unified-Account-Fix: NUR die FREIE Spot-USDC
+                    # addieren (total − hold), nicht die volle. Bei einem Unified-
+                    # Account ist `hold` die als Perps-Margin reservierte USDC —
+                    # die steckt bereits in marginSummary.accountValue (=perps).
+                    # Volles `total` zu addieren doppelzählte die Margin, sobald
+                    # Positionen offen waren → balance ~$1582 statt HL-Equity
+                    # ~$1083 → Sizing ~46% zu groß. (total−hold) + perps_AV trifft
+                    # HLs autoritativen accountValue und stimmt auch für klassische
+                    # Accounts (dort hold=0 → unverändert perps + voller Spot).
+                    spot = _f(b.get("total")) - _f(b.get("hold"))
                     break
         except Exception as e:
             log.warning("spot_user_state: %s", e)

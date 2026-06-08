@@ -714,7 +714,12 @@ def _snapshot(address: str):
     try:
         for b in info.spot_user_state(address).get("balances", []):
             if b.get("coin") == "USDC":
-                bal += float(b.get("total", 0) or 0)
+                # 2026-06-08 Unified-Account-Fix: nur FREIE Spot-USDC (total−hold).
+                # `hold` ist die als Perps-Margin reservierte USDC und steckt schon
+                # in marginSummary.accountValue — volles total doppelzählte sie,
+                # sobald Positionen offen waren (Dashboard zeigte ~$1582 statt der
+                # echten HL-Equity ~$1083). Siehe HyperliquidTrader.account_value.
+                bal += float(b.get("total", 0) or 0) - float(b.get("hold", 0) or 0)
     except Exception:
         pass
     positions = []
