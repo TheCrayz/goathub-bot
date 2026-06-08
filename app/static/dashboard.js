@@ -355,7 +355,36 @@ document.querySelectorAll(".tfbtn").forEach(function(b){b.onclick=function(){
 async function load(){
   try{const d=await api("GET","/api/dashboard");
     auth.classList.add("hide");app.classList.remove("hide");
-    netbadge.textContent=d.net; netbadge.className="pill "+(d.net==="testnet"?"on":"off");
+    // 2026-06-08: Mainnet-aware UI. Testnet = grün/safe, Mainnet = rot/REAL MONEY warning.
+    const isMain = (d.net === "mainnet");
+    netbadge.textContent = isMain ? "MAINNET 🚨" : "testnet";
+    netbadge.className = "pill " + (isMain ? "off" : "on");
+    const banner = document.getElementById("netbanner");
+    const banTitle = document.getElementById("netbanner-title");
+    if (banner && banTitle) {
+      if (isMain) {
+        banTitle.textContent = "🚨 MAINNET — REAL MONEY at risk.";
+        banner.style.borderColor = "#ff8a8a";
+        banner.style.background = "#1a0a0a";
+        banner.style.color = "#ffd2d2";
+      } else {
+        banTitle.textContent = "Beta — Testnet (no real money).";
+        banner.style.borderColor = "";
+        banner.style.background = "";
+        banner.style.color = "";
+      }
+    }
+    const hlUrl = document.getElementById("hl-url");
+    if (hlUrl) {
+      hlUrl.href = isMain ? "https://app.hyperliquid.xyz" : "https://app.hyperliquid-testnet.xyz";
+      hlUrl.textContent = isMain ? "app.hyperliquid.xyz" : "app.hyperliquid-testnet.xyz";
+    }
+    const foot = document.getElementById("foot-net");
+    if (foot) {
+      foot.textContent = isMain
+        ? "GoatHub Trading Bot · MAINNET (real money)"
+        : "GoatHub Trading Bot · Beta · Testnet (no real money)";
+    }
     // Show Discord username + avatar if available, else email
     const displayName=d.user.discord_username||d.user.email;
     document.getElementById("uname").textContent=displayName;

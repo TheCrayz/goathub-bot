@@ -78,7 +78,7 @@
   <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill on">testnet</span></h1>
   <div class="sub" id="netline">Community Copy-Trading on Hyperliquid</div>
 
-  <div class="card warn">⚠️ <b>Beta — Testnet (no real money).</b> This is <b>not financial advice</b>.
+  <div class="card warn" id="netbanner">⚠️ <b id="netbanner-title">Beta — Testnet (no real money).</b> This is <b>not financial advice</b>.
     Trading involves risk; use entirely at your own risk. Your key is an Agent-Key
     <b>without withdrawal rights</b> and is stored encrypted.</div>
 
@@ -162,8 +162,8 @@
       <details id="walletWizard" style="margin-top:10px;background:#0e1a14;border:1px solid #1f2e23;border-radius:8px;padding:8px 12px">
         <summary style="cursor:pointer;color:#7ce0a8;font-weight:600">📖 Wie hole ich Master-Adresse + Agent-Key? (Klick für Anleitung)</summary>
         <ol style="font-size:13px;line-height:1.7;color:#cfe6d4;margin:8px 0 4px 18px;padding:0">
-          <li>Geh auf <a href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> und logge dich mit MetaMask ein.</li>
-          <li>Oben rechts auf dein Wallet-Icon → <b>„API"</b>. (Auf Mainnet identisch unter <a href="https://app.hyperliquid.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid.xyz</a>)</li>
+          <li>Geh auf <a id="hl-url" href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> und logge dich mit MetaMask ein. <span class="mut">(URL passt sich automatisch an deinen Netzwerk-Modus an)</span></li>
+          <li>Oben rechts auf dein Wallet-Icon → <b>„API"</b>.</li>
           <li>Klick <b>„Generate"</b> bei „API Wallet". Es erscheint eine rote Warnung-Box mit einem Private-Key — das ist dein <b>Agent-Key</b> (lang, 66 Zeichen mit „0x"). <b style="color:#ff8a8a">Kopier ihn jetzt — du siehst ihn nur einmal!</b></li>
           <li>Im selben Dialog steht oben eine <b>Address</b> (42 Zeichen) — das ist die Agent-Adresse (NICHT was wir brauchen). Schließ den Dialog.</li>
           <li>Auf der HL-Seite oben rechts steht jetzt deine richtige <b>Master-Adresse</b> (z.B. <code>0x12E3…9D95</code>). Die kopierst du ebenfalls.</li>
@@ -269,7 +269,7 @@
     </div>
   </div>
 
-  <div class="foot">GoatHub Trading Bot · Beta · Testnet (no real money) · not financial advice<br>
+  <div class="foot"><span id="foot-net">GoatHub Trading Bot · Beta · Testnet (no real money)</span> · not financial advice<br>
     Trading involves risk. You trade at your own risk with your own Hyperliquid account.</div>
 </div>
 <script src="/static/dashboard.js" defer></script>
