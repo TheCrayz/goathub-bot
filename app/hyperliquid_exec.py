@@ -131,6 +131,42 @@ class HyperliquidTrader:
             raise HLOutageError("Hyperliquid Info-API unreachable (perps+spot both failed)")
         return (perps or 0.0) + (spot or 0.0)
 
+    def available_margin(self):
+        """Handelbare USDC-Margin für eine NEUE Position.
+
+        Hyperliquid UNIFIED-Account (Standard; beide GoatHub-User 2026-06-08):
+        Spot- und Perps-USDC teilen EINE Collateral-Basis, der Spot⇄Perps-
+        Transfer ist deaktiviert, und der alte Perps-`withdrawable` ist dann
+        IMMER 0 (es gibt kein isoliertes Perps-Guthaben mehr). Die echte freie
+        Margin steht in spotClearinghouseState.tokenToAvailableAfterMaintenance
+        für USDC (token 0) — dieser Wert zieht die Maintenance-Margin offener
+        Positionen bereits ab und ist deshalb der richtige Pre-Check-Wert.
+
+        Bug-Historie: Vorher las der Pre-Check nur Perps-`withdrawable`. Bei
+        Unified-Accounts ist das 0 → JEDER Trade wurde geskippt, obwohl das
+        ganze Kapital handelbar im Konto lag (User 2 $1076, User 4 $8.58, beide
+        0 offene Positionen, alte Meldung log ein hardcodiertes '6 positions').
+
+        Wir nehmen max(withdrawable, spot_available), damit es für unified UND
+        klassische (getrennte) Accounts stimmt: unified → spot_available greift,
+        klassisch-mit-Perps-Guthaben → withdrawable greift.
+        """
+        wd = 0.0
+        try:
+            wd = _f(self.info.user_state(self.address).get("withdrawable"))
+        except Exception as e:
+            log.warning("user_state(withdrawable): %s", e)
+        spot_avail = 0.0
+        try:
+            # tokenToAvailableAfterMaintenance: [[tokenId, amountStr], ...]; token 0 == USDC
+            for entry in self.info.spot_user_state(self.address).get("tokenToAvailableAfterMaintenance", []):
+                if entry and entry[0] == 0:
+                    spot_avail = _f(entry[1])
+                    break
+        except Exception as e:
+            log.warning("spot tokenToAvailableAfterMaintenance: %s", e)
+        return max(wd, spot_avail)
+
     def open_positions_count(self):
         try:
             aps = self.info.user_state(self.address).get("assetPositions", [])

@@ -574,18 +574,6 @@ async def _open_new(trader, u, sig):
         _log_activity(u.id, "skip", f"{coin}: max. Positionen ({open_pos}/{u.max_open_positions})")
         return
 
-    # Phase 6+ (2026-06-03, H-9): Margin Pre-Check.
-    # Vorher haben wir blind place_entry aufgerufen und HL's "Insufficient
-    # margin"-Reject als error geloggt (2× am 2026-06-03 für BTC bei User 2:
-    # 6 offene Positionen × 3× Leverage + Phase-2-SL-Min = kein Platz für BTC).
-    # Jetzt berechnen wir das erforderliche Margin im Voraus und skippen sauber.
-    # `withdrawable` aus user_state ist die freie Margin — sicherer als
-    # accountValue, weil das schon offene Positionen abzieht.
-    try:
-        st_info = await asyncio.to_thread(trader.info.user_state, trader.address)
-        withdrawable = float(st_info.get("withdrawable", 0) or 0)
-    except Exception:
-        withdrawable = balance  # Fallback — wir lassen es laufen, HL rejected sonst
     sl_distance = abs(sig.entry - sig.stop_loss)
     # 2026-06-06: Auto-Leverage statt user-fixed. Bot rechnet aus SL-Distanz +
     # Signal-Confidence den optimalen Hebel; u.leverage wird zur Max-Cap.
@@ -601,19 +589,33 @@ async def _open_new(trader, u, sig):
     except ValueError as e:
         _log_activity(u.id, "error", f"{coin}: auto-lev failed ({e}) — skipping")
         return
+
+    # Phase 6+ Margin Pre-Check (2026-06-08, korrigiert für Unified-Accounts).
+    # Vorher las der Check nur Perps-`withdrawable`. Bei Hyperliquid Unified-
+    # Accounts (Standard, beide GoatHub-User) ist das IMMER 0 — Spot- und Perps-
+    # USDC teilen eine Collateral-Basis, ein Transfer existiert nicht. Resultat:
+    # JEDER Trade wurde geskippt, obwohl das volle Kapital handelbar war. Die
+    # alte Skip-Meldung log sogar ein hardcodiertes "6 positions" (gelogen, es
+    # waren 0). trader.available_margin() liest jetzt die echte Unified-
+    # Collateral (tokenToAvailableAfterMaintenance) und funktioniert für unified
+    # UND klassische Accounts.
     if sl_distance > 0:
         # Schätzung: required_notional = risk_amount/sl_dist * entry; required_margin = notional/leverage
         risk_amount = balance * u.risk_pct
         est_qty = risk_amount / sl_distance
         est_notional = est_qty * sig.entry
         est_margin = est_notional / max(1, chosen_lev)
-        # 10% safety puffer für Fees, Spread, Mark-Price-Drift bis zum Order
-        if est_margin > withdrawable * 0.9:
+        needed = est_margin / 0.9  # 10% Puffer für Fees, Spread, Mark-Drift bis zum Order
+        try:
+            avail = await asyncio.to_thread(trader.available_margin)
+        except Exception:
+            avail = balance  # Fallback — HL gated sonst beim place_entry
+        if avail < needed:
             _log_activity(
                 u.id, "skip",
-                f"{coin}: insufficient margin pre-check — "
-                f"need ~{est_margin:.2f} USDC, withdrawable {withdrawable:.2f} "
-                f"(6 positions blocken margin) — NEW_TRADE skipped clean"
+                f"{coin}: insufficient margin — need ~${est_margin:.2f} "
+                f"(mit Puffer ${needed:.2f}), available ${avail:.2f}. "
+                f"Funde dein HL-Konto. NEW_TRADE skipped clean"
             )
             return
     plan = size_trade(account_value=balance, capital_cap=u.capital_cap_usdc, risk_pct=u.risk_pct,
