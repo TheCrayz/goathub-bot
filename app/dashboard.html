@@ -78,13 +78,33 @@
   <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill on">testnet</span></h1>
   <div class="sub" id="netline">Community Copy-Trading on Hyperliquid</div>
 
-  <div class="card warn" id="netbanner">⚠️ <b id="netbanner-title">Beta — Testnet (no real money).</b> This is <b>not financial advice</b>.
-    Trading involves risk; use entirely at your own risk. Your key is an Agent-Key
-    <b>without withdrawal rights</b> and is stored encrypted.</div>
+  <!-- 2026-06-08: Risk-Disclosure — IMMER sichtbar (pre-login + logged-in).
+       Network-Toggle (Testnet/MAINNET) wird per JS in load() updaten. -->
+  <div class="card warn" id="netbanner">
+    ⚠️ <b id="netbanner-title">High-Risk Trading — read before using</b><br>
+    <span style="display:block;margin-top:6px;font-size:13px;line-height:1.6">
+      <b>You can lose all your deposited capital, including more than you put in due to leverage and liquidation.</b>
+      Crypto perpetual futures trading is highly speculative and not suitable for everyone. Past performance does not
+      guarantee future results. Signals are AI-generated and may be wrong. This bot executes trades automatically on
+      your Hyperliquid account using a stored Agent-Key (<b>no withdrawal rights</b>, encrypted at rest) — you are
+      solely responsible for the funds you allocate.
+      <br><br>
+      <b>This is not financial advice.</b> Nothing on this site constitutes investment, legal, or tax advice. Trade
+      only with capital you can afford to lose. Verify your local regulations before using — Hyperliquid restricts
+      certain jurisdictions. By using this service you acknowledge that you understand these risks and accept full
+      responsibility for any losses.
+    </span>
+  </div>
 
   <!-- AUTH -->
   <div class="card" id="auth">
     <h2>Sign In</h2>
+    <div class="msg err" style="margin-bottom:14px;min-height:0;background:#3b1e1e;color:#ffd2d2;padding:10px 12px;border-radius:8px;border:1px solid #ff8a8a;font-size:13px;line-height:1.5">
+      🚨 <b>Risk Acknowledgment</b><br>
+      By signing in you confirm you've read the warning above, understand that <b>automated leveraged trading can
+      result in total loss of capital</b>, and accept full responsibility. This is not financial advice. Start small.
+      Test before scaling up.
+    </div>
     <div id="autherror" class="msg err" style="margin-bottom:10px;min-height:0"></div>
 
     <!-- Primary: Discord login -->
@@ -269,8 +289,8 @@
     </div>
   </div>
 
-  <div class="foot"><span id="foot-net">GoatHub Trading Bot · Beta · Testnet (no real money)</span> · not financial advice<br>
-    Trading involves risk. You trade at your own risk with your own Hyperliquid account.</div>
+  <div class="foot"><span id="foot-net">GoatHub Trading Bot</span> · not financial advice · trade at your own risk<br>
+    Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>
 </div>
 <script src="/static/dashboard.js" defer></script>
 </body></html>

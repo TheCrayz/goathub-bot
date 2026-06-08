@@ -355,23 +355,25 @@ document.querySelectorAll(".tfbtn").forEach(function(b){b.onclick=function(){
 async function load(){
   try{const d=await api("GET","/api/dashboard");
     auth.classList.add("hide");app.classList.remove("hide");
-    // 2026-06-08: Mainnet-aware UI. Testnet = grün/safe, Mainnet = rot/REAL MONEY warning.
+    // 2026-06-08: Mainnet-aware UI — Pille + Banner-Style switch. Banner-text
+    // selbst ist immer der Risk-Warning (siehe HTML); auf Mainnet zusätzlich
+    // roter Style + 'real money' emphasis.
     const isMain = (d.net === "mainnet");
     netbadge.textContent = isMain ? "MAINNET 🚨" : "testnet";
     netbadge.className = "pill " + (isMain ? "off" : "on");
     const banner = document.getElementById("netbanner");
     const banTitle = document.getElementById("netbanner-title");
-    if (banner && banTitle) {
+    if (banner) {
       if (isMain) {
-        banTitle.textContent = "🚨 MAINNET — REAL MONEY at risk.";
-        banner.style.borderColor = "#ff8a8a";
-        banner.style.background = "#1a0a0a";
+        banner.style.borderColor = "#ff5555";
+        banner.style.background = "#1a0707";
         banner.style.color = "#ffd2d2";
+        if (banTitle) banTitle.innerHTML = "🚨 MAINNET — REAL MONEY at risk. Read carefully before trading.";
       } else {
-        banTitle.textContent = "Beta — Testnet (no real money).";
         banner.style.borderColor = "";
         banner.style.background = "";
         banner.style.color = "";
+        if (banTitle) banTitle.innerHTML = "High-Risk Trading — read before using";
       }
     }
     const hlUrl = document.getElementById("hl-url");
@@ -382,8 +384,8 @@ async function load(){
     const foot = document.getElementById("foot-net");
     if (foot) {
       foot.textContent = isMain
-        ? "GoatHub Trading Bot · MAINNET (real money)"
-        : "GoatHub Trading Bot · Beta · Testnet (no real money)";
+        ? "GoatHub Trading Bot · MAINNET — real money"
+        : "GoatHub Trading Bot · Testnet — no real money";
     }
     // Show Discord username + avatar if available, else email
     const displayName=d.user.discord_username||d.user.email;
