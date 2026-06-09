@@ -145,6 +145,20 @@ def _lock_for(user_id, coin):
         _locks[k] = lk
     return lk
 
+# C2 (2026-06-09): Ein Lock pro user_id. Serialisiert ALLE Entries eines Users,
+# damit der Aggregat-Margin-Cap (C1) atomar greift — sonst lesen N parallele
+# Signale verschiedener Coins denselben Margin-/Positions-Stand VOR dem ersten
+# Fill und überrennen jeden Cap gemeinsam. IMMER vor _lock_for(user,coin)
+# nehmen (konsistente Reihenfolge user->coin => kein Deadlock).
+_user_locks = {}
+
+def _user_lock_for(user_id):
+    lk = _user_locks.get(user_id)
+    if lk is None:
+        lk = asyncio.Lock()
+        _user_locks[user_id] = lk
+    return lk
+
 
 def coin_of(t):
     return (t or "").split("/")[0].strip().upper()
@@ -214,6 +228,63 @@ def _close_managed(user_id, coin):
         db.commit()
     except Exception as e:
         log.warning("close managed: %s", e)
+    finally:
+        db.close()
+
+
+def _signal_already_done(user_id, signal_id):
+    """C3 (2026-06-09): True, wenn (user, signal_id) bereits erfolgreich
+    ausgeführt wurde (persistent, überlebt Restart)."""
+    if not signal_id:
+        return False
+    from app.models import ProcessedSignal
+    db = SessionLocal()
+    try:
+        return (db.query(ProcessedSignal)
+                .filter(ProcessedSignal.user_id == user_id,
+                        ProcessedSignal.signal_id == signal_id).first() is not None)
+    except Exception as e:
+        log.warning("signal dedup check: %s", e)
+        return False   # fail-open: lieber evtl. doppelt als gar nicht traden
+    finally:
+        db.close()
+
+
+def _mark_signal_done(user_id, signal_id):
+    """C3: (user, signal_id) als ausgeführt markieren. Idempotent dank UNIQUE."""
+    if not signal_id:
+        return
+    from app.models import ProcessedSignal
+    db = SessionLocal()
+    try:
+        db.add(ProcessedSignal(user_id=user_id, signal_id=signal_id))
+        db.commit()
+    except Exception:
+        db.rollback()   # UNIQUE-Verletzung = schon vorhanden, ok
+    finally:
+        db.close()
+
+
+def _load_protection_params(user_id, coin):
+    """H1: SL + TP-Liste aus dem letzten offenen managed_trade für (user, coin).
+    Returns (sl_float_or_None, [(px, fraction), ...]) — Format wie place_protection."""
+    db = SessionLocal()
+    try:
+        mt = (db.query(ManagedTrade)
+              .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                      ManagedTrade.status != "closed")
+              .order_by(ManagedTrade.id.desc()).first())
+        if mt is None or mt.stop_loss is None:
+            return (None, [])
+        sl = float(mt.stop_loss)
+        tps = []
+        if mt.take_profits:
+            try:
+                for px, pct in json.loads(mt.take_profits):
+                    tps.append((float(px), float(pct) / 100.0))
+            except Exception:
+                tps = []
+        return (sl, tps)
     finally:
         db.close()
 
@@ -467,7 +538,9 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
     if not u:
         return
     coin = coin_of(sig.ticker)
-    async with _lock_for(user_id, coin):                  # serialisiert gleiche (User,Coin)
+    # C2 (2026-06-09): per-User-Lock ZUERST (atomarer Aggregat-Margin-Cap),
+    # dann per-(User,Coin)-Lock. Reihenfolge user->coin => kein Deadlock.
+    async with _user_lock_for(user_id), _lock_for(user_id, coin):
         try:
             trader = await _build_trader(u)
             if not trader.is_tradable(coin):
@@ -502,6 +575,15 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
 async def _open_new(trader, u, sig):
     from app.sizing import size_trade
     coin = coin_of(sig.ticker)
+
+    # C3 (2026-06-09): Replay-Dedup. Wurde dieses signal_id für den User schon
+    # erfolgreich ausgeführt (persistent, überlebt Restart) → nicht erneut
+    # öffnen. Schützt gegen Doppel-Entries durch re-emittierte Signale nach
+    # Neustart, wenn der In-Memory-Throttle weg ist.
+    if sig.signal_id and _signal_already_done(u.id, sig.signal_id):
+        _log_activity(u.id, "skip",
+                      f"{coin}: signal_id {sig.signal_id} bereits ausgeführt — Replay übersprungen")
+        return
 
     # Phase 2 #27 (2026-06-02): Per-Coin Auto-Filter. Schaut auf den User's
     # Track-Record für DIESES Coin auf Hyperliquid (cached 10 min). Wenn >=10
@@ -574,6 +656,18 @@ async def _open_new(trader, u, sig):
         _log_activity(u.id, "skip", f"{coin}: max. Positionen ({open_pos}/{u.max_open_positions})")
         return
 
+    # C1 (2026-06-09): Aggregat-Margin-Cap. Skip neue Entries, sobald die
+    # Gesamt-Margin-Auslastung den Cap erreicht — lässt einen Liquidations-
+    # Puffer, statt blind bis zur Erschöpfung zu stapeln. Atomar dank
+    # per-User-Lock in _open_or_update (sonst überrennt ein Burst den Cap).
+    util = await asyncio.to_thread(trader.margin_utilization)
+    if util >= config.MAX_MARGIN_UTILIZATION:
+        _log_activity(
+            u.id, "skip",
+            f"{coin}: Margin-Auslastung {util*100:.0f}% ≥ Cap {config.MAX_MARGIN_UTILIZATION*100:.0f}% "
+            f"— kein neuer Entry (Aggregat-Risiko-Schutz). NEW_TRADE skipped clean")
+        return
+
     sl_distance = abs(sig.entry - sig.stop_loss)
     # 2026-06-06: Auto-Leverage statt user-fixed. Bot rechnet aus SL-Distanz +
     # Signal-Confidence den optimalen Hebel; u.leverage wird zur Max-Cap.
@@ -632,6 +726,11 @@ async def _open_new(trader, u, sig):
     if not entry["ok"]:
         _log_activity(u.id, "error", f"Entry-Fehler {coin}: {entry.get('error')}")
         return
+
+    # C3 (2026-06-09): Order ist platziert (filled ODER resting) → signal_id als
+    # ausgeführt markieren, damit ein Replay (z.B. nach Restart) nicht doppelt
+    # öffnet. Geskippte Signale (Margin/Filter, oben) bleiben retry-bar.
+    _mark_signal_done(u.id, sig.signal_id)
 
     if entry["filled"]:
         sz = entry["filled_sz"] or plan.qty
@@ -849,3 +948,67 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
     await asyncio.to_thread(trader.cancel_orders, coin)
     _log_activity(user_id, "skip", f"{coin} nicht gefüllt — kein Trade")
     _close_managed(user_id, coin)
+
+
+# ── H1: Startup-Reconciler ───────────────────────────────────────────────────
+async def reconcile_protection_on_startup():
+    """H1 (2026-06-09): nach jedem (Re)Start prüfen, ob jede offene HL-Position
+    eine reduce-only Stop-Order hat. Fehlt sie — typischer Fall: der Prozess
+    starb im Fill-Fenster eines ruhenden Entries, bevor _protect_when_filled
+    die Protection setzen konnte, und sync.py überspringt resting-Rows — ziehen
+    wir den Schutz aus dem managed_trade nach.
+
+    Sicher by design: schließt NIE selbst (würde Verlust gegen User-Willen
+    festnageln); kennt es keine SL-Params → lauter ERROR-Alert für manuellen
+    Eingriff. Idempotent: tut nichts, wenn schon ein Stop existiert. Per
+    STARTUP_PROTECTION_RECONCILE abschaltbar.
+    """
+    if not config.STARTUP_PROTECTION_RECONCILE:
+        return
+    db = SessionLocal()
+    try:
+        user_ids = [u.id for u in (db.query(User)
+                    .filter(User.bot_active.is_(True), User.hl_api_secret_enc != "").all())]
+    finally:
+        db.close()
+    log.info("Startup-Reconciler: prüfe Schutz-Orders für %d aktive User", len(user_ids))
+    for user_id in user_ids:
+        u = _get_user(user_id)
+        if not u:
+            continue
+        try:
+            trader = await _build_trader(u)
+            positions = await asyncio.to_thread(trader.open_positions)
+        except Exception as e:
+            log.warning("reconcile: trader/positions failed user %s: %s", user_id, e)
+            continue
+        for p in positions:
+            coin = coin_of(p.get("coin"))
+            szi = p.get("szi") or 0.0
+            if abs(szi) == 0:
+                continue
+            try:
+                if await asyncio.to_thread(trader.has_protective_stop, coin):
+                    continue  # geschützt — nichts zu tun
+                sl, tps = _load_protection_params(user_id, coin)
+                if sl is None:
+                    _log_activity(
+                        user_id, "error",
+                        f"{coin}: NACKTE Position nach Restart (qty {szi:.6g}), KEIN bekannter SL "
+                        f"im managed_trade — bitte manuell absichern oder schließen.")
+                    continue
+                is_buy = szi > 0
+                sz = abs(szi)
+                prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, sz, sl, tps)
+                if prot.get("sl_ok"):
+                    _log_activity(
+                        user_id, "update",
+                        f"{coin}: Startup-Reconciler hat fehlenden Schutz nachgezogen "
+                        f"(qty {sz:.6g}, SL {sl}).")
+                else:
+                    _log_activity(
+                        user_id, "error",
+                        f"{coin}: NACKTE Position — Schutz nachziehen FEHLGESCHLAGEN "
+                        f"({str(prot.get('sl'))[:120]}). Manuell absichern!")
+            except Exception as e:
+                log.warning("reconcile: protect failed user %s coin %s: %s", user_id, coin, e)

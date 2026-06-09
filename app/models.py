@@ -2,7 +2,7 @@
 import datetime
 import decimal
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.types import TypeDecorator
 
 from app.db import Base
@@ -136,3 +136,22 @@ class ManagedTrade(Base):
     signal_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class ProcessedSignal(Base):
+    """C3 (2026-06-09): persistenter Dedup-Schlüssel pro (user, signal_id).
+
+    `managed_trades.signal_id` ist last-writer-wins (wird pro Coin überschrieben)
+    und taugt NICHT zum Dedup. Diese Tabelle hält jede tatsächlich AUSGEFÜHRTE
+    (user, signal_id)-Kombi mit UNIQUE-Constraint. Vor einem NEW_TRADE prüft die
+    Engine, ob die Kombi schon existiert → Replay (z.B. nach Restart, wenn der
+    In-Memory-Throttle weg ist) wird übersprungen statt doppelt eröffnet.
+    Nur bei ERFOLGREICHEM Entry geschrieben — geskippte Signale (Margin/Filter)
+    bleiben retry-bar.
+    """
+    __tablename__ = "processed_signal"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    signal_id = Column(String, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "signal_id", name="uq_processed_user_signal"),)

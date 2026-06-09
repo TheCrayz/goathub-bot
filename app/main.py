@@ -146,6 +146,13 @@ async def lifespan(app: FastAPI):
     t = asyncio.create_task(position_sync_loop())
     _attach_logger(t, "position_sync_loop")
     tasks.append(t)
+    # H1 (2026-06-09): einmaliger Startup-Reconciler — zieht fehlende Schutz-
+    # Orders (SL/TP) für offene Positionen nach, die ein Restart im Fill-Fenster
+    # ungeschützt zurückgelassen haben könnte. Läuft einmal, dann fertig.
+    from app.engine import reconcile_protection_on_startup
+    t = asyncio.create_task(reconcile_protection_on_startup())
+    _attach_logger(t, "startup_protection_reconcile")
+    tasks.append(t)
     # 2026-06-04 Restposten #5: Token-Usage-Scrape-Loop — persistet signal-bot
     # TOKEN_USAGE-Zeilen in unsere DB, damit Historie auch nach Log-Rotation
     # erhalten bleibt. Liest bot.log alle 5 Minuten, idempotent (skip wenn
@@ -750,8 +757,14 @@ def _snapshot(address: str):
                 series.append({"t": int(f.get("time", 0) or 0), "cum": round(cum, 2)})
 
         # 2) Echte Trade-Events: cluster nach (coin, side) innerhalb 60s.
+        # 2026-06-09 #WR-Fix: PRO (coin,side)-Key gruppieren, NICHT über einen
+        # einzigen rollenden `current`. HL liefert Partial-Fills mehrerer Coins
+        # zeitlich verschränkt (BTC, ETH, BTC, ...); der alte Code flushte beim
+        # Coin-Wechsel und zerlegte einen Multi-Fill-Close in mehrere "Trades"
+        # → falsche Win-Rate/Trade-Anzahl ("0% (1 closed trade)"). Jetzt hält
+        # jedes Key sein eigenes laufendes Event.
         events = []
-        current = None
+        open_ev = {}  # (coin,side) -> laufendes Event-Dict
         for f in fills:
             pnl = float(f.get("closedPnl", 0) or 0)
             if pnl == 0:
@@ -761,15 +774,15 @@ def _snapshot(address: str):
             d = (f.get("dir") or "")
             side = "Long" if "Long" in d else ("Short" if "Short" in d else "?")
             key = (coin, side)
-            if current and current["key"] == key and t - current["t_last"] <= 60_000:
-                current["pnl"] += pnl
-                current["t_last"] = t
+            ev = open_ev.get(key)
+            if ev is not None and t - ev["t_last"] <= 60_000:
+                ev["pnl"] += pnl
+                ev["t_last"] = t
             else:
-                if current is not None:
-                    events.append(current)
-                current = {"key": key, "t": t, "t_last": t, "pnl": pnl}
-        if current is not None:
-            events.append(current)
+                if ev is not None:
+                    events.append(ev)
+                open_ev[key] = {"key": key, "t": t, "t_last": t, "pnl": pnl}
+        events.extend(open_ev.values())
 
         closed = len(events)
         wins = sum(1 for e in events if e["pnl"] > 0)

@@ -183,6 +183,53 @@ class HyperliquidTrader:
         except Exception:
             return 0
 
+    def margin_utilization(self):
+        """C1 (2026-06-09): Anteil der Equity, der als Initial-Margin in offenen
+        Positionen gebunden ist (totalMarginUsed / accountValue). 0 = nichts
+        offen, ~1 = voll ausgelastet. Für den Aggregat-Margin-Cap. Fail-open
+        (0.0) bei API-Fehler — der per-Trade available_margin-Check bleibt als
+        Backstop, also kein Over-Leverage durch einen Read-Fehler hier."""
+        try:
+            ms = self.info.user_state(self.address).get("marginSummary", {})
+            av = _f(ms.get("accountValue"))
+            mu = _f(ms.get("totalMarginUsed"))
+            return (mu / av) if av > 0 else 0.0
+        except Exception as e:
+            log.warning("margin_utilization: %s", e)
+            return 0.0
+
+    def open_positions(self):
+        """H1: offene Perps-Positionen als [{'coin', 'szi'}], szi signiert."""
+        out = []
+        try:
+            for p in self.info.user_state(self.address).get("assetPositions", []):
+                pos = p.get("position", {})
+                szi = _f(pos.get("szi"))
+                if abs(szi) > 0:
+                    out.append({"coin": pos.get("coin"), "szi": szi})
+        except Exception as e:
+            log.warning("open_positions: %s", e)
+        return out
+
+    def has_protective_stop(self, coin):
+        """H1 (2026-06-09): True, wenn für `coin` eine reduce-only STOP-Trigger-
+        Order offen ist (= Position hat einen Stop-Loss). TP allein zählt NICHT
+        als Schutz. Fail-SAFE: bei Read-Fehler True (lieber annehmen geschützt
+        als fälschlich eine zweite Schutz-Order setzen)."""
+        coin = coin_of(coin)
+        try:
+            orders = self.info.frontend_open_orders(self.address) or []
+        except Exception as e:
+            log.warning("has_protective_stop(%s): %s", coin, e)
+            return True
+        for o in orders:
+            if coin_of(o.get("coin")) != coin:
+                continue
+            ot = str(o.get("orderType", "")).lower()
+            if o.get("reduceOnly") and "stop" in ot:
+                return True
+        return False
+
     def position_size(self, coin):
         coin = coin_of(coin)
         try:

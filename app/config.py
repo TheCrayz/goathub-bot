@@ -96,6 +96,19 @@ SL_SLIPPAGE_CAP = _f("SL_SLIPPAGE_CAP", 0.02)            # 2 %, env: SL_SLIPPAGE
 MAX_SIGNALS_PER_HOUR = _i("MAX_SIGNALS_PER_HOUR", 30)   # global
 MIN_TRADE_INTERVAL_S = _i("MIN_TRADE_INTERVAL_S", 60)   # per (user, coin)
 
+# 2026-06-09 C1: Aggregat-Margin-Cap. NEUE Entries werden geskippt, sobald die
+# Gesamt-Margin-Auslastung (totalMarginUsed/accountValue) diesen Anteil erreicht.
+# Verhindert blindes Stapeln bis zur Margin-Erschöpfung und lässt einen
+# Sicherheitspuffer gegen Liquidationen bei korrelierten Adverse-Moves. Atomar
+# erzwungen via per-User-Lock (sonst überrennt ein Signal-Burst den Cap).
+# 0.85 = bei 85% Auslastung keine neuen Trades mehr. Höher = aggressiver.
+MAX_MARGIN_UTILIZATION = _f("MAX_MARGIN_UTILIZATION", 0.85)
+
+# 2026-06-09 H1: Startup-Reconciler. Nach jedem (Re)Start prüfen, ob jede offene
+# HL-Position eine reduce-only Stop-Order hat; fehlt sie (Prozess starb im Fill-
+# Fenster), Schutz aus dem managed_trade nachziehen. true = an.
+STARTUP_PROTECTION_RECONCILE = _b("STARTUP_PROTECTION_RECONCILE", "true")
+
 # Discord-Webhook URL für Error-Alerts. Leer = aus.
 ALERT_WEBHOOK_URL = _g("ALERT_WEBHOOK_URL", "")
 ALERT_THROTTLE_S = _i("ALERT_THROTTLE_S", 60)           # max 1 Alert pro 60s pro (user, coin)
