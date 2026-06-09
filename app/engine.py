@@ -656,16 +656,22 @@ async def _open_new(trader, u, sig):
         _log_activity(u.id, "skip", f"{coin}: max. Positionen ({open_pos}/{u.max_open_positions})")
         return
 
-    # C1 (2026-06-09): Aggregat-Margin-Cap. Skip neue Entries, sobald die
-    # Gesamt-Margin-Auslastung den Cap erreicht — lässt einen Liquidations-
-    # Puffer, statt blind bis zur Erschöpfung zu stapeln. Atomar dank
-    # per-User-Lock in _open_or_update (sonst überrennt ein Burst den Cap).
-    util = await asyncio.to_thread(trader.margin_utilization)
+    # C1 (2026-06-09, korrigiert): Aggregat-Margin-Cap gegen die GESAMT-Equity.
+    # util = 1 - frei/equity. WICHTIG: NICHT marginSummary-Ratio — dessen
+    # accountValue ist im Unified-Account nur die Perps-Seite und bei viel freiem
+    # Spot viel kleiner als die Gesamt-Equity (zeigte 75% statt echter ~50%).
+    # `balance` = account_value() = Gesamt-Equity; `avail` wird unten im Margin-
+    # Pre-Check wiederverwendet (nur EIN HL-Read).
+    try:
+        avail = await asyncio.to_thread(trader.available_margin)
+    except Exception:
+        avail = balance
+    util = (1.0 - avail / balance) if balance > 0 else 0.0
     if util >= config.MAX_MARGIN_UTILIZATION:
         _log_activity(
             u.id, "skip",
             f"{coin}: Margin-Auslastung {util*100:.0f}% ≥ Cap {config.MAX_MARGIN_UTILIZATION*100:.0f}% "
-            f"— kein neuer Entry (Aggregat-Risiko-Schutz). NEW_TRADE skipped clean")
+            f"(frei ${avail:.0f} von ${balance:.0f}) — kein neuer Entry. NEW_TRADE skipped clean")
         return
 
     sl_distance = abs(sig.entry - sig.stop_loss)
@@ -700,10 +706,7 @@ async def _open_new(trader, u, sig):
         est_notional = est_qty * sig.entry
         est_margin = est_notional / max(1, chosen_lev)
         needed = est_margin / 0.9  # 10% Puffer für Fees, Spread, Mark-Drift bis zum Order
-        try:
-            avail = await asyncio.to_thread(trader.available_margin)
-        except Exception:
-            avail = balance  # Fallback — HL gated sonst beim place_entry
+        # `avail` kommt aus dem C1-Block oben (ein HL-Read, wiederverwendet).
         if avail < needed:
             _log_activity(
                 u.id, "skip",

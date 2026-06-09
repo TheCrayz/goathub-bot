@@ -165,16 +165,22 @@ class HyperliquidTrader:
             wd = _f(self.info.user_state(self.address).get("withdrawable"))
         except Exception as e:
             log.warning("user_state(withdrawable): %s", e)
-        spot_avail = 0.0
+        # 2026-06-09 KORREKTUR: freie Spot-USDC = total - hold (hold = bereits als
+        # Initial-Margin offener Positionen gebundene USDC). Das ist HLs "available
+        # to trade". Vorher tokenToAvailableAfterMaintenance — das zieht nur die
+        # MAINTENANCE-Margin ab (Liquidations-Puffer) und ÜBERSCHÄTZT, was für
+        # einen NEUEN Entry (Initial-Margin) frei ist, sobald Positionen offen
+        # sind (zeigte $3291 statt echter ~$1939). Idle (0 Positionen, hold=0)
+        # => total, also identisch zum Unified-Fix für den leeren Fall.
+        free_spot = 0.0
         try:
-            # tokenToAvailableAfterMaintenance: [[tokenId, amountStr], ...]; token 0 == USDC
-            for entry in self.info.spot_user_state(self.address).get("tokenToAvailableAfterMaintenance", []):
-                if entry and entry[0] == 0:
-                    spot_avail = _f(entry[1])
+            for b in self.info.spot_user_state(self.address).get("balances", []):
+                if b.get("coin") == "USDC":
+                    free_spot = _f(b.get("total")) - _f(b.get("hold"))
                     break
         except Exception as e:
-            log.warning("spot tokenToAvailableAfterMaintenance: %s", e)
-        return max(wd, spot_avail)
+            log.warning("spot free USDC: %s", e)
+        return max(wd, free_spot)
 
     def open_positions_count(self):
         try:
@@ -182,21 +188,6 @@ class HyperliquidTrader:
             return sum(1 for p in aps if abs(_f(p.get("position", {}).get("szi"))) > 0)
         except Exception:
             return 0
-
-    def margin_utilization(self):
-        """C1 (2026-06-09): Anteil der Equity, der als Initial-Margin in offenen
-        Positionen gebunden ist (totalMarginUsed / accountValue). 0 = nichts
-        offen, ~1 = voll ausgelastet. Für den Aggregat-Margin-Cap. Fail-open
-        (0.0) bei API-Fehler — der per-Trade available_margin-Check bleibt als
-        Backstop, also kein Over-Leverage durch einen Read-Fehler hier."""
-        try:
-            ms = self.info.user_state(self.address).get("marginSummary", {})
-            av = _f(ms.get("accountValue"))
-            mu = _f(ms.get("totalMarginUsed"))
-            return (mu / av) if av > 0 else 0.0
-        except Exception as e:
-            log.warning("margin_utilization: %s", e)
-            return 0.0
 
     def open_positions(self):
         """H1: offene Perps-Positionen als [{'coin', 'szi'}], szi signiert."""
