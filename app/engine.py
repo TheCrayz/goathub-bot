@@ -902,52 +902,76 @@ async def _cancel(user_id, sig):
 
 # ── Fill-Watch für ruhende Limit-Orders ──────────────────────────────────────
 async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
+    """H2-Fix (2026-06-09): Schutz NACH JEDEM neuen Fill nachlegen (Delta-Add),
+    statt nur den ersten Teil-Fill zu schützen und sofort zu returnen.
+
+    Bug-Historie: ein ruhender Limit-Entry kann in mehreren Partial-Fills über
+    Sekunden füllen. Der alte Watcher feuerte beim ERSTEN Mini-Fill und sicherte
+    nur diese Menge ab → der Rest blieb NACKT (BTC 2026-06-09: SL deckte 0.00138
+    von 0.1151 BTC). Jetzt: wächst die Position über die bereits abgedeckte
+    Größe, legen wir Schutz für die DELTA-Menge nach. reduce-only Stops/TPs
+    stacken bei gleichem Trigger → die Summe deckt die volle Position; KEIN
+    cancel → die ruhende Rest-Entry-Order bleibt unangetastet.
+    """
     coin = coin_of(sig.ticker)
     deadline = time.monotonic() + config.ENTRY_FILL_TIMEOUT_S
+    protected = 0.0   # bereits mit Schutz-Orders abgedeckte Positionsgröße
+    stable = 0        # Anzahl Polls ohne neuen Fill (→ Order fertig gefüllt)
+
+    def _protect_delta(psz):
+        """Schutz für (psz - protected) nachlegen. Returnt (ok, fatal)."""
+        delta = psz - protected
+        prot = trader.place_protection(coin, is_buy, delta, sig.stop_loss, tps)
+        if prot.get("sl_ok"):
+            return True, False
+        sl_resp = prot.get("sl"); err = str(sl_resp)[:300] if sl_resp else "no response"
+        log.error("place_protection sl fail (watcher) user=%s coin=%s sl=%s delta=%s is_buy=%s resp=%s",
+                  user_id, coin, sig.stop_loss, delta, is_buy, err)
+        if _is_unauthorized_agent_response(err):
+            _pause_user_bad_key(user_id, err, reason="not_authorized")
+            return False, True
+        # SL fehlgeschlagen → keine ungeschützte Position riskieren → schließen
+        trader.close_position(coin)
+        trader.cancel_orders(coin)
+        _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen. HL: {err[:180]}")
+        _close_managed(user_id, coin)
+        return False, True
+
     while time.monotonic() < deadline:
         await asyncio.sleep(config.ENTRY_POLL_S)
         try:
-            psz = await asyncio.to_thread(trader.position_size, coin)
+            psz = abs(await asyncio.to_thread(trader.position_size, coin))
         except Exception:
             continue
-        if abs(psz) > 0:
-            prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(psz), sig.stop_loss, tps)
-            if not prot.get("sl_ok"):
-                # 2026-06-05 diag
-                sl_resp = prot.get("sl"); err = str(sl_resp)[:300] if sl_resp else "no response"
-                log.error("place_protection sl fail (watcher) user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
-                          user_id, coin, sig.stop_loss, abs(psz), is_buy, err)
-                # 2026-06-06: Bad-Agent → auto-pause statt closing
-                if _is_unauthorized_agent_response(err):
-                    _pause_user_bad_key(user_id, err, reason="not_authorized")
-                    return
-                await asyncio.to_thread(trader.close_position, coin)
-                await asyncio.to_thread(trader.cancel_orders, coin)
-                _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen. HL: {err[:180]}")
-                _close_managed(user_id, coin)
+        if psz > protected * 1.001:
+            ok, fatal = await asyncio.to_thread(_protect_delta, psz)
+            if fatal:
                 return
-            _log_activity(user_id, "order", f"{coin} gefüllt (qty {abs(psz):.6g}) — SL+TP gesetzt")
-            _save_managed(user_id, coin, sig, status="open")
-            return
-    # 2026-06-04 audit-fix (B-#8): Vor dem cancel_orders FINAL prüfen ob die Order
-    # nicht doch noch in der allerletzten Iteration gefillt wurde. Sonst Race:
-    # zwischen letztem sleep und timeout könnte HL die Order matchen und wir
-    # cancellen eine bereits eröffnete Position → naked.
+            if ok:
+                protected = psz
+                stable = 0
+                _save_managed(user_id, coin, sig, status="open")
+                _log_activity(user_id, "order", f"{coin} gefüllt (qty {psz:.6g}) — SL+TP voll abgedeckt")
+        elif protected > 0:
+            stable += 1
+            if stable >= 2:   # 2 Polls keine neuen Fills → Order fertig gefüllt
+                return
+    # Timeout: letzter Delta-Check (last-second fill in der allerletzten Iteration).
     try:
-        psz_final = await asyncio.to_thread(trader.position_size, coin)
+        psz_final = abs(await asyncio.to_thread(trader.position_size, coin))
     except Exception:
-        psz_final = 0
-    if abs(psz_final) > 0:
-        prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(psz_final), sig.stop_loss, tps)
-        if not prot.get("sl_ok"):
-            await asyncio.to_thread(trader.close_position, coin)
-            await asyncio.to_thread(trader.cancel_orders, coin)
-            _log_activity(user_id, "error", f"{coin}: last-second fill, SL fehlgeschlagen → Position geschlossen")
-            _close_managed(user_id, coin)
+        psz_final = 0.0
+    if psz_final > protected * 1.001:
+        ok, fatal = await asyncio.to_thread(_protect_delta, psz_final)
+        if fatal:
             return
-        _log_activity(user_id, "order", f"{coin}: last-second fill (qty {abs(psz_final):.6g}) — SL+TP nachgesetzt")
-        _save_managed(user_id, coin, sig, status="open")
+        if ok:
+            protected = psz_final
+            _save_managed(user_id, coin, sig, status="open")
+            _log_activity(user_id, "order", f"{coin}: last-second fill (qty {psz_final:.6g}) — SL+TP nachgesetzt")
+    if protected > 0:
         return
+    # Nie gefüllt → ruhende Order canceln.
     await asyncio.to_thread(trader.cancel_orders, coin)
     _log_activity(user_id, "skip", f"{coin} nicht gefüllt — kein Trade")
     _close_managed(user_id, coin)
@@ -991,27 +1015,31 @@ async def reconcile_protection_on_startup():
             if abs(szi) == 0:
                 continue
             try:
-                if await asyncio.to_thread(trader.has_protective_stop, coin):
-                    continue  # geschützt — nichts zu tun
+                sz = abs(szi)
+                covered = await asyncio.to_thread(trader.covered_stop_size, coin)
+                if covered >= sz * 0.999:
+                    continue  # voll per SL gedeckt — nichts zu tun
+                uncovered = sz - covered
                 sl, tps = _load_protection_params(user_id, coin)
                 if sl is None:
                     _log_activity(
                         user_id, "error",
-                        f"{coin}: NACKTE Position nach Restart (qty {szi:.6g}), KEIN bekannter SL "
-                        f"im managed_trade — bitte manuell absichern oder schließen.")
+                        f"{coin}: Position qty {sz:.6g} nur zu {covered:.6g} per SL gedeckt, KEIN "
+                        f"SL-Preis im managed_trade bekannt — bitte manuell absichern/schließen.")
                     continue
                 is_buy = szi > 0
-                sz = abs(szi)
-                prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, sz, sl, tps)
+                # Schutz für die FEHLENDE Menge nachlegen (reduce-only stackt mit
+                # vorhandenen Stops bei gleichem Trigger → Summe deckt die Position).
+                prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, uncovered, sl, tps)
                 if prot.get("sl_ok"):
                     _log_activity(
                         user_id, "update",
-                        f"{coin}: Startup-Reconciler hat fehlenden Schutz nachgezogen "
-                        f"(qty {sz:.6g}, SL {sl}).")
+                        f"{coin}: Reconciler hat Unter-Deckung gefixt — SL/TP für fehlende "
+                        f"{uncovered:.6g} nachgelegt (war {covered:.6g}/{sz:.6g}, SL {sl}).")
                 else:
                     _log_activity(
                         user_id, "error",
-                        f"{coin}: NACKTE Position — Schutz nachziehen FEHLGESCHLAGEN "
-                        f"({str(prot.get('sl'))[:120]}). Manuell absichern!")
+                        f"{coin}: Unter-Deckung ({covered:.6g}/{sz:.6g}) — Schutz nachlegen "
+                        f"FEHLGESCHLAGEN ({str(prot.get('sl'))[:120]}). Manuell absichern!")
             except Exception as e:
                 log.warning("reconcile: protect failed user %s coin %s: %s", user_id, coin, e)

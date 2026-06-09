@@ -202,24 +202,28 @@ class HyperliquidTrader:
             log.warning("open_positions: %s", e)
         return out
 
-    def has_protective_stop(self, coin):
-        """H1 (2026-06-09): True, wenn für `coin` eine reduce-only STOP-Trigger-
-        Order offen ist (= Position hat einen Stop-Loss). TP allein zählt NICHT
-        als Schutz. Fail-SAFE: bei Read-Fehler True (lieber annehmen geschützt
-        als fälschlich eine zweite Schutz-Order setzen)."""
+    def covered_stop_size(self, coin):
+        """H1/H2 (2026-06-09): Summe der Größen ALLER reduce-only STOP-Orders für
+        `coin` = wie viel der Position durch Stop-Loss(e) abgedeckt ist. Der
+        Reconciler vergleicht das mit der Positionsgröße, um UNTER-gedeckte
+        Positionen zu erkennen (Partial-Fill-Bug: SL deckte nur den ersten Mini-
+        Fill — BTC 2026-06-09: 0.00138 von 0.1151). TP zählt NICHT als Schutz.
+        Fail-SAFE: bei Read-Fehler inf (= 'als gedeckt annehmen', kein
+        fälschliches Nachlegen)."""
         coin = coin_of(coin)
         try:
             orders = self.info.frontend_open_orders(self.address) or []
         except Exception as e:
-            log.warning("has_protective_stop(%s): %s", coin, e)
-            return True
+            log.warning("covered_stop_size(%s): %s", coin, e)
+            return float("inf")
+        total = 0.0
         for o in orders:
             if coin_of(o.get("coin")) != coin:
                 continue
             ot = str(o.get("orderType", "")).lower()
             if o.get("reduceOnly") and "stop" in ot:
-                return True
-        return False
+                total += _f(o.get("sz"))
+        return total
 
     def position_size(self, coin):
         coin = coin_of(coin)
