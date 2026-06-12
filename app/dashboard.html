@@ -62,6 +62,10 @@
   .discord-user{display:flex;align-items:center;font-weight:800;font-size:15px}
   .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
   .stat{flex:1;min-width:150px;background:linear-gradient(145deg, rgba(10,16,13,.96), rgba(8,13,10,.92)); border:1px solid rgba(255,255,255,.06); border-radius:18px; padding:16px; box-shadow:0 18px 34px rgba(0,0,0,.26); transition:transform .15s ease, border-color .2s ease}
+  .mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .mini-card{background:linear-gradient(145deg, rgba(12,19,16,.96), rgba(7,11,9,.96)); border:1px solid rgba(74,242,178,.12); border-radius:14px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+  .mini-label{color:#a7c6b6;font-size:11px;text-transform:uppercase;letter-spacing:.12em}
+  .mini-value{font-size:18px;font-weight:800;margin-top:3px}
   .stat:hover{transform:translateY(-2px); border-color:rgba(74,242,178,.18)}
   .stat-h{color:#b7d6ca;font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}
   .stat-v{font-size:26px;font-weight:800;line-height:1.1}
@@ -85,6 +89,7 @@
     .row > div { min-width: 0; width: 100%; }
     .stats { gap: 8px; }
     .stat { min-width: 0; padding: 10px 12px; flex: 1 1 calc(50% - 4px); }
+    .mini-grid{grid-template-columns:1fr 1fr;}
     .stat-v { font-size: 20px; }
     .stat-h { font-size: 10px; }
     button { padding: 12px 16px; font-size: 14px; width: auto; min-height: 44px; }
@@ -95,43 +100,7 @@
     .pill { font-size: 11px; }
     .foot { font-size: 10px; margin-top: 16px; }
   }
-  @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
-</style>  @media (max-width: 720px) {
-    .wrap { padding: 12px; }
-    h1 { font-size: 18px; }
-    .sub { font-size: 12px; }
-    .card { padding: 12px; margin: 10px 0; border-radius: 10px; }
-    .card h2 { font-size: 14px; margin-bottom: 8px; }
-    .row { flex-direction: column; gap: 8px; }
-    .row > div { min-width: 0; width: 100%; }
-    .stats { gap: 8px; }
-    .stat { min-width: 0; padding: 10px 12px; flex: 1 1 calc(50% - 4px); }
-    .stat-v { font-size: 20px; }
-    .stat-h { font-size: 10px; }
-    /* Buttons groß genug für Touch — 44px ist Apple HIG minimum */
-    button { padding: 12px 16px; font-size: 14px; width: auto; min-height: 44px; }
-    button:not(.ghost) + button { margin-top: 8px; }
-    /* Inputs: kein Auto-Zoom auf iOS — font-size ≥16px */
-    input { font-size: 16px; padding: 11px 12px; }
-    /* Tables scrollen horizontal statt sich zu zerquetschen */
-    .card table {
-      display: block;
-      overflow-x: auto;
-      white-space: nowrap;
-      -webkit-overflow-scrolling: touch;
-    }
-    /* Code-Blöcke (Adressen) auf Mobile wrap-bar */
-    code { font-size: 11px; word-break: break-all; }
-    /* Pills bleiben lesbar */
-    .pill { font-size: 11px; }
-    /* Footer kompakter */
-    .foot { font-size: 10px; margin-top: 16px; }
-  }
-  /* Sehr schmal (kleine Phones, Galaxy Fold etc.): Stats untereinander */
-  @media (max-width: 440px) {
-    .stat { flex: 1 1 100%; }
-    .stat-v { font-size: 22px; }
-  }
+  @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .mini-grid{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
 </style></head>
 <body><div class="wrap">
   <section class="hero">
@@ -219,9 +188,21 @@
         </div>
         <div id="statpnl" class="stat-v">—</div>
       </div>
-      <div class="stat"><div class="stat-h">✓ Win Rate</div><div id="statwin" class="stat-v">—</div>
-        <div class="mut" id="stattrades">—</div></div>
-      <div class="stat"><div class="stat-h">▦ Active Trades</div><div id="statact" class="stat-v">—</div></div>
+      <div class="stat"><div class="stat-h">💰 Account Value</div><div id="statAccount" class="stat-v">—</div><div class="mut">Live Hyperliquid equity snapshot</div></div>
+      <div class="stat"><div class="stat-h">📈 Unrealized PnL</div><div id="statUnrealized" class="stat-v">—</div><div class="mut">Open positions only</div></div>
+      <div class="stat"><div class="stat-h">🧭 Open Exposure</div><div id="statExposure" class="stat-v">—</div><div class="mut">Estimated notional exposure</div></div>
+      <div class="stat"><div class="stat-h">📍 Open Positions</div><div id="statOpen" class="stat-v">—</div><div class="mut">Active trades on the book</div></div>
+      <div class="stat"><div class="stat-h">✓ Win Rate</div><div id="statwin" class="stat-v">—</div><div class="mut" id="stattrades">—</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Trader At-a-Glance</h2>
+      <div class="mini-grid">
+        <div class="mini-card"><div class="mini-label">Account Value</div><div id="miniAccount" class="mini-value">—</div></div>
+        <div class="mini-card"><div class="mini-label">Unrealized PnL</div><div id="miniUnrealized" class="mini-value">—</div></div>
+        <div class="mini-card"><div class="mini-label">Open Positions</div><div id="miniOpen" class="mini-value">—</div></div>
+        <div class="mini-card"><div class="mini-label">Closed PnL</div><div id="miniClosed" class="mini-value">—</div></div>
+      </div>
     </div>
 
     <div class="card">

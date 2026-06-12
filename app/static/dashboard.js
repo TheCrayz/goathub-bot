@@ -295,8 +295,9 @@ async function verifyBuilder(){
   }catch(e){if(el){el.textContent="error: "+e.message; el.style.color="#ff8a8a"}}
 }
 async function toggleBot(){try{const me=await api("GET","/api/me");await api("PUT","/api/settings",{bot_active:!me.bot_active});load()}catch(e){alert(e.message)}}
-let STATS=null, TF=30;
+let STATS=null, ACCOUNT=null, TF=30;
 function fmtUsd(v){return (v>=0?"+$":"−$")+Math.abs(v).toFixed(2)}
+function fmtSigned(v){return (v>=0?"+":"−")+Math.abs(v).toFixed(2);}
 function seriesFor(days){
   const s=(STATS&&STATS.pnl_series)||[];
   if(!s.length) return {pts:[],total:0};
@@ -330,9 +331,21 @@ function drawChart(pts){
 }
 function renderStats(){
   if(!STATS) return;
+  const accountValue = ACCOUNT && ACCOUNT.account_value != null ? ACCOUNT.account_value : (ACCOUNT && ACCOUNT.balance != null ? ACCOUNT.balance : 0);
+  const unrealized = ACCOUNT && ACCOUNT.unrealized_pnl != null ? ACCOUNT.unrealized_pnl : 0;
+  const exposure = ACCOUNT && ACCOUNT.open_exposure != null ? ACCOUNT.open_exposure : 0;
+  const openCount = ACCOUNT && ACCOUNT.open_positions != null ? ACCOUNT.open_positions : (STATS.active_trades || 0);
   document.getElementById("statwin").textContent=(STATS.win_rate||0)+"%";
   document.getElementById("stattrades").textContent=(STATS.closed_trades||0)+" closed trades";
   document.getElementById("statact").textContent=STATS.active_trades||0;
+  const statAccount=document.getElementById("statAccount"); if(statAccount) statAccount.textContent="$"+accountValue.toFixed(2);
+  const statUnrealized=document.getElementById("statUnrealized"); if(statUnrealized){ statUnrealized.textContent=fmtSigned(unrealized); statUnrealized.className="stat-v "+(unrealized>=0?"pos":"neg"); }
+  const statExposure=document.getElementById("statExposure"); if(statExposure) statExposure.textContent="$"+exposure.toFixed(2);
+  const statOpen=document.getElementById("statOpen"); if(statOpen) statOpen.textContent=openCount;
+  const miniAccount=document.getElementById("miniAccount"); if(miniAccount) miniAccount.textContent="$"+accountValue.toFixed(2);
+  const miniUnrealized=document.getElementById("miniUnrealized"); if(miniUnrealized){ miniUnrealized.textContent=fmtSigned(unrealized); miniUnrealized.className="mini-value "+(unrealized>=0?"pos":"neg"); }
+  const miniOpen=document.getElementById("miniOpen"); if(miniOpen) miniOpen.textContent=openCount;
+  const miniClosed=document.getElementById("miniClosed"); if(miniClosed) miniClosed.textContent=(STATS.closed_trades||0);
   const w=seriesFor(TF);
   const el=document.getElementById("statpnl");
   el.textContent=fmtUsd(w.total); el.className="stat-v "+(w.total>=0?"pos":"neg");
@@ -438,7 +451,7 @@ async function load(){
     const ab=document.querySelector("#acttbl tbody");ab.innerHTML="";
     d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${esc((a.ts||"").replace("T"," "))}</td><td>${esc(a.kind)}</td><td>${esc(a.text)}</td></tr>`)});
     actempty.style.display=d.activity.length?"none":"block";
-    STATS=d.stats||null; renderStats();
+    ACCOUNT=d.account||null; STATS=d.stats||null; renderStats();
   }catch(e){localStorage.removeItem("ght")}
 }
 // Handle Discord OAuth redirect params

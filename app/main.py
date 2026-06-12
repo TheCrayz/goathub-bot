@@ -730,11 +730,18 @@ def _snapshot(address: str):
     except Exception:
         pass
     positions = []
+    unrealized_total = 0.0
+    exposure_total = 0.0
     for p in st.get("assetPositions", []):
         pos = p.get("position", {})
         if abs(float(pos.get("szi", 0) or 0)) > 0:
+            size = float(pos.get("szi", 0) or 0)
+            entry = float(pos.get("entryPx", 0) or 0)
+            upnl = float(pos.get("unrealizedPnl", 0) or 0)
             positions.append({"coin": pos.get("coin"), "size": pos.get("szi"),
                               "entry": pos.get("entryPx"), "uPnl": pos.get("unrealizedPnl")})
+            unrealized_total += upnl
+            exposure_total += abs(size * entry)
     # PnL-Statistik aus realisierten Fills (Total PnL, Win-Rate, Verlauf, History)
     # Phase 2 (2026-06-02): Win-Rate auf TRADE-EVENTS basieren, nicht auf einzelnen
     # closing-Fills. Eine Position schließt oft in mehreren Partial-Fills (z. B. BTC
@@ -797,7 +804,15 @@ def _snapshot(address: str):
         ]
     except Exception as e:
         log.warning("stats failed: %s", e)
-    result = {"balance": round(bal, 2), "positions": positions, "stats": stats}
+    result = {
+        "balance": round(bal, 2),
+        "account_value": round(bal, 2),
+        "unrealized_pnl": round(unrealized_total, 2),
+        "open_exposure": round(exposure_total, 2),
+        "open_positions": len(positions),
+        "positions": positions,
+        "stats": stats,
+    }
     _snapshot_cache[address] = (now, result)
     return result
 
