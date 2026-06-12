@@ -337,7 +337,7 @@ function renderStats(){
   const openCount = ACCOUNT && ACCOUNT.open_positions != null ? ACCOUNT.open_positions : (STATS.active_trades || 0);
   document.getElementById("statwin").textContent=(STATS.win_rate||0)+"%";
   document.getElementById("stattrades").textContent=(STATS.closed_trades||0)+" closed trades";
-  document.getElementById("statact").textContent=STATS.active_trades||0;
+  const statact=document.getElementById("statact"); if(statact) statact.textContent=STATS.active_trades||0;  // 2026-06-12 FIX: id="statact" gibt's im Redesign nicht mehr → Null-Guard, sonst warf renderStats hier ab und ALLE Karten danach blieben "—"
   const statAccount=document.getElementById("statAccount"); if(statAccount) statAccount.textContent="$"+accountValue.toFixed(2);
   const statUnrealized=document.getElementById("statUnrealized"); if(statUnrealized){ statUnrealized.textContent=fmtSigned(unrealized); statUnrealized.className="stat-v "+(unrealized>=0?"pos":"neg"); }
   const statExposure=document.getElementById("statExposure"); if(statExposure) statExposure.textContent="$"+exposure.toFixed(2);
@@ -372,8 +372,10 @@ async function load(){
     // selbst ist immer der Risk-Warning (siehe HTML); auf Mainnet zusätzlich
     // roter Style + 'real money' emphasis.
     const isMain = (d.net === "mainnet");
-    netbadge.textContent = isMain ? "MAINNET 🚨" : "testnet";
-    netbadge.className = "pill " + (isMain ? "off" : "on");
+    // 2026-06-12 FIX: redundantes netbadge-Update hier ENTFERNT — es nutzte
+    // `netbadge` VOR der `const netbadge`-Deklaration weiter unten (Temporal Dead
+    // Zone → ReferenceError → load() brach ab, ALLE Metriken blieben "—"). Das
+    // Badge wird unten (const-Block) korrekt gesetzt.
     const banner = document.getElementById("netbanner");
     const banTitle = document.getElementById("netbanner-title");
     if (banner) {
@@ -476,6 +478,22 @@ async function load(){
     history.replaceState(null,"","/");
   }
 })();
+// 2026-06-12: Öffentlicher Netzwerk-/Status-Badge — läuft VOR/ohne Login, damit
+// der Hero nie ein veraltetes "testnet" oder falschen Status zeigt. /api/health
+// ist auth-frei und liefert {ok, listener, net}.
+(async function publicStatus(){
+  try{
+    const h = await (await fetch("/api/health", {credentials:"include"})).json();
+    const isMain = h.net === "mainnet";
+    const nb=document.getElementById("netbadge");
+    if(nb){ nb.textContent = isMain?"MAINNET":"testnet"; nb.className = "pill "+(isMain?"off":"on")+" pulse"; }
+    const hn=document.getElementById("heroNet"); if(hn) hn.textContent = isMain?"Mainnet":"Testnet";
+    const hs=document.getElementById("heroStatus"); if(hs) hs.textContent = h.ok ? "Online" : "Offline";
+  }catch(e){
+    const hs=document.getElementById("heroStatus"); if(hs) hs.textContent = "Offline";
+  }
+})();
+
 // Phase 2 #18: immer load() probieren — auth läuft via Cookie. Wenn 401,
 // fängt load() das ab und zeigt Login-Form (auth section ist by default sichtbar).
 load();

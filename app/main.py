@@ -817,16 +817,70 @@ def _snapshot(address: str):
     return result
 
 
+def _demo_dashboard(u):
+    """DEMO_MODE-Mock: realistische Zahlen fürs Frontend-/iPhone-Testen, OHNE
+    echte HL-/DB-Abfragen (komplett getrennt vom Live-Bot)."""
+    import time as _t, random as _r
+    now_ms = int(_t.time() * 1000)
+    series, cum = [], 0.0
+    for i in range(30):
+        cum += _r.uniform(-18, 28)
+        series.append({"t": now_ms - (29 - i) * 86400000, "cum": round(cum, 2)})
+    positions = [
+        {"coin": "BTC", "size": "0.085", "entry": "61767.0", "uPnl": "42.10"},
+        {"coin": "ETH", "size": "-0.73", "entry": "1691.1", "uPnl": "24.30"},
+        {"coin": "SOL", "size": "-14.4", "entry": "64.53", "uPnl": "15.80"},
+        {"coin": "SUI", "size": "-2624", "entry": "0.7653", "uPnl": "65.20"},
+        {"coin": "DOGE", "size": "-4072", "entry": "0.0867", "uPnl": "-8.40"},
+    ]
+    upnl = round(sum(float(p["uPnl"]) for p in positions), 2)
+    exposure = round(sum(abs(float(p["size"]) * float(p["entry"])) for p in positions), 2)
+    acct_val = 3868.78
+    return {
+        "user": _user_public(u),
+        "account": {"balance": acct_val, "account_value": acct_val, "unrealized_pnl": upnl,
+                    "open_exposure": exposure, "open_positions": len(positions), "positions": positions},
+        "stats": {"total_pnl": round(cum, 2), "win_rate": 42, "closed_trades": 12,
+                  "active_trades": len(positions), "pnl_series": series,
+                  "recent": [
+                      {"t": now_ms - 3600000, "coin": "AVAX", "dir": "Open Short", "px": "6.70", "pnl": 0.0},
+                      {"t": now_ms - 9000000, "coin": "ETH", "dir": "Close Short", "px": "1624.6", "pnl": 24.27},
+                      {"t": now_ms - 18000000, "coin": "VIRTUAL", "dir": "Close Long", "px": "0.5646", "pnl": -110.64},
+                  ]},
+        "activity": [
+            {"ts": "2026-06-12 12:00:00", "kind": "order", "text": "SHORT SUI eröffnet (qty 2624), SL+TP gesetzt"},
+            {"ts": "2026-06-12 11:30:00", "kind": "update", "text": "ETH: These angepasst — SL 1645, TP nachgezogen"},
+            {"ts": "2026-06-12 11:00:00", "kind": "skip", "text": "ADA nicht gefüllt — kein Trade"},
+        ],
+        "net": "mainnet",   # Demo zeigt den echten Mainnet-Look
+        "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE},
+        "demo": True,
+    }
+
+
 @app.get("/api/dashboard")
 @limiter.limit("30/minute")
 def dashboard(request: Request, u: User = Depends(current_user), db: Session = Depends(get_db)):
-    acct = {"balance": None, "positions": []}
+    if config.DEMO_MODE:
+        return _demo_dashboard(u)
+    acct = {"balance": None, "account_value": None, "unrealized_pnl": None,
+            "open_exposure": None, "open_positions": 0, "positions": []}
     stats = {"total_pnl": 0.0, "win_rate": 0, "closed_trades": 0,
              "active_trades": 0, "pnl_series": [], "recent": []}
     if u.hl_account_address:
         try:
             snap = _snapshot(u.hl_account_address)
-            acct = {"balance": snap["balance"], "positions": snap["positions"]}
+            # 2026-06-12: ALLE Snapshot-Metriken durchreichen — vorher nur balance
+            # +positions, dadurch blieben die neuen Karten (account_value,
+            # unrealized_pnl, open_exposure, open_positions) leer.
+            acct = {
+                "balance": snap.get("balance"),
+                "account_value": snap.get("account_value"),
+                "unrealized_pnl": snap.get("unrealized_pnl"),
+                "open_exposure": snap.get("open_exposure"),
+                "open_positions": snap.get("open_positions"),
+                "positions": snap.get("positions", []),
+            }
             stats = snap["stats"]
         except Exception as e:
             log.warning("snapshot failed: %s", e)

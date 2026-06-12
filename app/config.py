@@ -56,6 +56,12 @@ DISCORD_BOT_TOKEN = _g("DISCORD_BOT_TOKEN")
 SIGNALS_CHANNEL_ID = _i("SIGNALS_CHANNEL_ID", 0)
 ENABLE_LISTENER = _b("ENABLE_LISTENER", "false")   # für localhost-Test ohne Discord = false
 
+# 2026-06-12 DEMO_MODE: NUR fürs lokale Frontend-/iPhone-Testen. Wenn an, liefert
+# /api/dashboard realistische MOCK-Daten statt echte HL-/DB-Abfragen — man kann
+# das UI gefahrlos ansehen, komplett getrennt vom Live-Bot. Sicherheits-Riegel:
+# greift NUR wenn ENABLE_LISTENER=false (Demo + Live-Trading schließen sich aus).
+DEMO_MODE = _b("DEMO_MODE", "false") and not ENABLE_LISTENER
+
 # Defaults für neue Nutzer
 # 2026-06-08 Mainnet-Hardening B1: konservative Defaults für neue User.
 # Können per env-var höher gesetzt werden (Power-User), neue User starten
