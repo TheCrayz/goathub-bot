@@ -32,6 +32,16 @@ _STALE_STRIKES_NEEDED = int(os.getenv("POSITION_SYNC_STRIKES", "2"))
 _stale_counter: dict[tuple[int, str, int], int] = {}
 
 
+def clear_strikes(user_id, coin):
+    """H-6 (2026-06-12): alle Stale-Strikes für (user, coin) löschen. Wird von der
+    Engine aufgerufen, wenn sie eine NEUE Position öffnet — die managed_trade-Row
+    wird evtl. wiederverwendet (gleiche mt_id), und ein getragener Strike der ALTEN
+    Positions-Generation würde sonst (mit einem einzigen transient-leeren HL-Read)
+    die neue, echt-live Position fälschlich auf 'closed' flippen."""
+    for k in [k for k in _stale_counter if k[0] == user_id and k[1] == coin]:
+        _stale_counter.pop(k, None)
+
+
 async def position_sync_loop():
     """Endlosschleife — startet im lifespan() neben dem Discord-Listener."""
     log.info("position_sync_loop started (interval=%ds)", SYNC_INTERVAL_S)

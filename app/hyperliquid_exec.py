@@ -8,10 +8,12 @@ import logging
 import threading
 from math import floor, log10
 
+import os
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+from hyperliquid.utils.types import Cloid
 
 log = logging.getLogger("goathub.hl")
 
@@ -241,6 +243,33 @@ class HyperliquidTrader:
     def _round_sz(self, coin, sz):
         return round(sz, self._sz.get(coin_of(coin), 3))
 
+    def _round_px(self, coin, px):
+        """HL-konforme PREIS-Rundung (Audit H-3, 2026-06-12). HL verlangt max 5
+        signifikante Stellen UND max (6 − szDecimals) Dezimalstellen (Perps).
+        `round_sig` allein (nur 5 sig-figs) erzeugte bei low-price-Coins (szDec=3,
+        Preis < ~31 → z.B. ALGO/DOGE/HBAR/SUI/ADA) ungültige Dezimalstellen → HL-
+        Reject ('tick size'/'divisible') → SL abgelehnt → Force-Close der frisch
+        gefüllten Position. Diese Funktion erzwingt BEIDE Regeln."""
+        px = _f(px)
+        if px <= 0:
+            return px
+        max_dec = max(0, 6 - self._sz.get(coin_of(coin), 3))
+        return round(float(f"{px:.5g}"), max_dec)
+
+    def cancel_order(self, coin, oid):
+        """Eine einzelne Order per oid canceln (Audit H-1: Watcher cancelt den
+        ruhenden Entry-Rest beim Beenden, OHNE die Schutz-Orders mit-zu-canceln).
+        Schluckt Fehler (z.B. Order schon gefüllt/weg) — best effort."""
+        if oid is None:
+            return False
+        coin = coin_of(coin)
+        try:
+            hl_retry(lambda: self.exchange.cancel(coin, int(oid)), max_attempts=2, label=f"cancel_oid {coin}")
+            return True
+        except Exception as e:
+            log.debug("cancel_order(%s, %s): %s", coin, oid, e)
+            return False
+
     @staticmethod
     def _status_ok(raw):
         """True, wenn eine Order-Antwort akzeptiert wurde (kein error-Status)."""
@@ -264,10 +293,13 @@ class HyperliquidTrader:
             log.warning("update_leverage(%s) final fail: %s", coin, e)
             return {"status": "err", "response": str(e)}
 
-    def _order(self, coin, is_buy, sz, px, otype, reduce_only=False):
+    def _order(self, coin, is_buy, sz, px, otype, reduce_only=False, cloid=None):
         kwargs = {"reduce_only": reduce_only}
         if self.builder:
             kwargs["builder"] = self.builder
+        # H-4 (2026-06-12): cloid macht den Retry idempotent (HL dedupt per cloid).
+        if cloid is not None:
+            kwargs["cloid"] = cloid
         # 2026-06-08 A5: reduce_only orders (SL/TP/close) sind must-succeed → 5 retries.
         # Normale entries: 3 retries reichen (User-Signal kann auch nochmal kommen).
         max_attempts = 5 if reduce_only else 3
@@ -276,14 +308,18 @@ class HyperliquidTrader:
             try:
                 return self.exchange.order(coin, is_buy, sz, px, otype, **kwargs)
             except TypeError:
-                return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only)
+                return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only, cloid=cloid)
         return hl_retry(_do, max_attempts=max_attempts, label=label)
 
     def place_entry(self, coin, is_buy, sz, px):
         coin = coin_of(coin)
         sz = self._round_sz(coin, sz)
+        # H-4 (2026-06-12): cloid PRO Aufruf, über alle Retries konstant → ein Retry
+        # nach verlorener Response (Order war serverseitig akzeptiert) ist IDEMPOTENT
+        # statt eine zweite Position zu öffnen.
+        cloid = Cloid.from_str("0x" + os.urandom(16).hex())
         try:
-            raw = self._order(coin, is_buy, sz, round_sig(px), {"limit": {"tif": "Gtc"}})
+            raw = self._order(coin, is_buy, sz, self._round_px(coin, px), {"limit": {"tif": "Gtc"}}, cloid=cloid)
         except Exception as e:
             return {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0, "error": str(e)}
         out = {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0, "error": None, "raw": raw}
@@ -357,10 +393,10 @@ class HyperliquidTrader:
         #   - Sell-side (closing LONG): worst = unter dem Trigger → cap * (1 - x)
         #   - Buy-side (closing SHORT): worst = über dem Trigger → cap * (1 + x)
         sign = 1 if is_buy_protection else -1
-        sl_worst = round_sig(sl_px * (1 + sign * slippage_cap))
+        sl_worst = self._round_px(coin, sl_px * (1 + sign * slippage_cap))
 
         res["sl"] = self._order(coin, is_buy_protection, sz, sl_worst,
-                                {"trigger": {"triggerPx": round_sig(sl_px), "isMarket": True, "tpsl": "sl"}},
+                                {"trigger": {"triggerPx": self._round_px(coin, sl_px), "isMarket": True, "tpsl": "sl"}},
                                 reduce_only=True)
         res["sl_ok"] = self._status_ok(res["sl"])
         for px, frac in (tps or []):
@@ -374,9 +410,9 @@ class HyperliquidTrader:
                     continue
             tp_sz = self._round_sz(coin, sz * frac)
             if tp_sz > 0:
-                tp_worst = round_sig(px * (1 + sign * slippage_cap))
+                tp_worst = self._round_px(coin, px * (1 + sign * slippage_cap))
                 res["tp"].append(self._order(coin, is_buy_protection, tp_sz, tp_worst,
-                                 {"trigger": {"triggerPx": round_sig(px), "isMarket": True, "tpsl": "tp"}},
+                                 {"trigger": {"triggerPx": self._round_px(coin, px), "isMarket": True, "tpsl": "tp"}},
                                  reduce_only=True))
         return res
 

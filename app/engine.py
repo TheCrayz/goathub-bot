@@ -548,6 +548,19 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
                 return
             pos = await asyncio.to_thread(trader.position_size, coin)
             if abs(pos) > 0:
+                # H-2 (2026-06-12): Gegenrichtungs-Signal auf offener Position NICHT
+                # blind in _adjust laufen lassen — _adjust leitet is_buy aus der HL-
+                # Position ab und würde SL/TP für die FALSCHE Seite setzen, alle TPs
+                # verwerfen und die DB-Richtung korrumpieren. Bei Richtungs-Mismatch:
+                # ablehnen + alerten, Position + Schutz bleiben unberührt.
+                sig_dir = (sig.direction or "").upper()
+                if sig_dir in ("LONG", "SHORT") and (sig_dir == "LONG") != (pos > 0):
+                    _log_activity(
+                        user_id, "skip",
+                        f"{coin}: {sig_dir}-Signal widerspricht offener "
+                        f"{'LONG' if pos > 0 else 'SHORT'}-Position — Update abgelehnt "
+                        f"(kein Flip, keine falsche Schutz-Seite). Bestehender Schutz bleibt.")
+                    return
                 await _adjust(trader, u, sig, pos)        # Position offen -> SL/TP nachziehen
             else:
                 if action_type == "UPDATE_TRADE":
@@ -734,6 +747,11 @@ async def _open_new(trader, u, sig):
     # ausgeführt markieren, damit ein Replay (z.B. nach Restart) nicht doppelt
     # öffnet. Geskippte Signale (Margin/Filter, oben) bleiben retry-bar.
     _mark_signal_done(u.id, sig.signal_id)
+    # H-6 (2026-06-12): Stale-Sync-Strikes für diesen Coin löschen — die neue
+    # Position kann die managed_trade-Row wiederverwenden; ein getragener Strike
+    # der alten Generation darf die neue Live-Position nicht auf 'closed' flippen.
+    from app.sync import clear_strikes
+    clear_strikes(u.id, coin)
 
     if entry["filled"]:
         sz = entry["filled_sz"] or plan.qty
@@ -760,7 +778,7 @@ async def _open_new(trader, u, sig):
     else:
         _log_activity(u.id, "order", f"{sig.direction} {coin}: Limit ruht @ {sig.entry}, warte auf Fill")
         _save_managed(u.id, coin, sig, status="resting", resting_oid=entry.get("resting_oid"))
-        _spawn(_protect_when_filled(trader, u.id, sig, is_buy, tps))
+        _spawn(_protect_when_filled(trader, u.id, sig, is_buy, tps, entry.get("resting_oid")))
 
 
 async def _adjust(trader, u, sig, pos):
@@ -845,6 +863,24 @@ async def _adjust(trader, u, sig, pos):
         if _is_unauthorized_agent_response(err_detail):
             _pause_user_bad_key(u.id, err_detail, reason="not_authorized")
             return
+        # H-5 (2026-06-12): wenn der NEUE SL NUR wegen would-trigger-Race abgelehnt
+        # wurde (Mark hat sich zwischen Engine-Preflight und dem 2. Mark-Read in
+        # place_protection bewegt, nachdem der alte SL schon gecancelt war), die
+        # Position NICHT market-closen — den vorherigen (per Ratchet sichereren)
+        # Schutz aus dem managed_trade wiederherstellen.
+        if skip_reason and "would_trigger" in skip_reason:
+            sl_old, tps_old = _load_protection_params(u.id, coin)
+            if sl_old is not None:
+                reprot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sl_old, tps_old)
+                if reprot.get("sl_ok"):
+                    _log_activity(u.id, "update",
+                                  f"{coin}: SL-Update {sig.stop_loss} würde sofort triggern (Mark-Race) → "
+                                  f"vorheriger Schutz (SL {sl_old}) wiederhergestellt, Position NICHT geschlossen.")
+                    return
+            _log_activity(u.id, "error",
+                          f"{coin}: SL-Update would-trigger + Wiederherstellung fehlgeschlagen — Position evtl. "
+                          f"UNGESCHÜTZT, bitte manuell prüfen (NICHT auto-geschlossen).")
+            return
         await asyncio.to_thread(trader.close_position, coin)
         await asyncio.to_thread(trader.cancel_orders, coin)
         _log_activity(u.id, "error",
@@ -901,7 +937,7 @@ async def _cancel(user_id, sig):
 
 
 # ── Fill-Watch für ruhende Limit-Orders ──────────────────────────────────────
-async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
+async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=None):
     """H2-Fix (2026-06-09): Schutz NACH JEDEM neuen Fill nachlegen (Delta-Add),
     statt nur den ersten Teil-Fill zu schützen und sofort zu returnen.
 
@@ -955,6 +991,11 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
         elif protected > 0:
             stable += 1
             if stable >= 2:   # 2 Polls keine neuen Fills → Order fertig gefüllt
+                # H-1 (2026-06-12): evtl. noch ruhenden Entry-Rest (Teil-Fill, Rest
+                # unbefüllt) canceln, damit er nicht SPÄTER nackt füllt. Nur die
+                # Entry-oid — Schutz-Orders bleiben.
+                if resting_oid:
+                    await asyncio.to_thread(trader.cancel_order, coin, resting_oid)
                 return
     # Timeout: letzter Delta-Check (last-second fill in der allerletzten Iteration).
     try:
@@ -970,6 +1011,10 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps):
             _save_managed(user_id, coin, sig, status="open")
             _log_activity(user_id, "order", f"{coin}: last-second fill (qty {psz_final:.6g}) — SL+TP nachgesetzt")
     if protected > 0:
+        # H-1 (2026-06-12): Watcher endet (Teil-/Voll-Fill) → ruhenden Entry-Rest
+        # canceln, sonst füllt der Rest später NACKT (sync.py prüft keine Coverage).
+        if resting_oid:
+            await asyncio.to_thread(trader.cancel_order, coin, resting_oid)
         return
     # Nie gefüllt → ruhende Order canceln.
     await asyncio.to_thread(trader.cancel_orders, coin)
