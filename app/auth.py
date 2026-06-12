@@ -94,7 +94,8 @@ def verify_pw(p: str, h: str) -> bool:
         return False
 
 
-def make_token(uid: int, token_version: int = 0, identity: str = "") -> str:
+def make_token(uid: int, token_version: int = 0, identity: str = "",
+               orig_iat: "int | None" = None) -> str:
     """JWT minten. `token_version` mit-einbacken, damit Logout/Pw-Change alle
     alten Tokens unbrauchbar machen kann (Phase 1, 2026-06-02).
     Phase 6 (2026-06-02): datetime.now(timezone.utc) statt deprecated utcnow().
@@ -105,6 +106,11 @@ def make_token(uid: int, token_version: int = 0, identity: str = "") -> str:
     gegen den NEUEN User → Account-Mixup. Lösung: JWT bindet zusätzlich an
     `identity` (discord_id für OAuth-User, email für E-Mail-User). Beim
     Decode prüfen wir dass die identity zum User passt.
+
+    2026-06-12 LOW-8: `orig_iat` = Epoch-Sekunden des URSPRÜNGLICHEN Logins.
+    /api/refresh reicht den Claim weiter statt ihn neu zu setzen — damit hat
+    jede Session eine ABSOLUTE Maximal-Lebensdauer, egal wie oft refreshed
+    wird (vorher: unbegrenzte Verlängerung alle 12h). None = frischer Login.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     exp = now + datetime.timedelta(hours=config.JWT_EXPIRE_HOURS)
@@ -116,10 +122,30 @@ def make_token(uid: int, token_version: int = 0, identity: str = "") -> str:
             "jti": __import__("secrets").token_hex(8),    # Phase 6: unique token id
             "tv": int(token_version),
             "id": str(identity or ""),                    # 2026-06-07: identity binding
+            "orig_iat": int(orig_iat) if orig_iat else int(now.timestamp()),  # LOW-8
         },
         config.JWT_SECRET,
         algorithm="HS256",
     )
+
+
+def request_token_payload(request: Request) -> dict:
+    """Decodierte Claims des Tokens am aktuellen Request (Cookie bevorzugt,
+    Bearer-Fallback — gleiche Reihenfolge wie current_user). {} wenn kein
+    oder ungültiger Token da ist. Für Endpoints, die ZUSÄTZLICH zur
+    current_user-Dependency einzelne Claims brauchen (2026-06-12 LOW-8:
+    /api/refresh liest orig_iat)."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        authz = request.headers.get("authorization") or ""
+        if authz.lower().startswith("bearer "):
+            token = authz[7:].strip()
+    if not token:
+        return {}
+    try:
+        return jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
+    except JWTError:
+        return {}
 
 
 def _user_identity(u: User) -> str:

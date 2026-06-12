@@ -2,185 +2,278 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#07100d">
+<meta name="theme-color" content="#050607">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="GoatHub">
 <title>GoatHub Trading Bot</title>
 <link rel="manifest" href="/static/manifest.json">
-<!-- Phase 6 (2026-06-02): favicon via emoji (no extra file needed). -->
-<link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22&gt;&lt;text y=%22.9em%22 font-size=%2290%22&gt;🐐&lt;/text&gt;&lt;/svg&gt;">
+<!-- 2026-06-12 Frontend-Overhaul: echtes Goat-Mark als Favicon statt Emoji
+     (Emoji rendert auf jedem OS anders; das SVG ist das Brand-Asset, das auch
+     manifest.json nutzt). Kein apple-touch-icon: dafür bräuchten wir PNG,
+     Pillow ist im venv nicht installiert — SVG-only bis PNGs generiert sind. -->
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
 <style>
+  /* 2026-06-12 Brand-Pass: Base von grün-getöntem #07100d auf neutrales
+     Near-Black (#050607-#0a0c0b) — Emerald ist für DATEN und ACTIONS
+     reserviert, nicht für Flächen. ALLE Blau-Akzente (Body-Gradient, Blob,
+     Eyebrow-Dot, h2-Bullet, Hero-Border, History-Card-Border) entfernt:
+     Brand = black + emerald + chrome. Chrome kommt als Gradient-Text auf h1
+     + metallische 1px-Border auf Hero/Stat-Cards (mask-composite-Technik). */
   :root{
-    --bg:#07100d; --panel:#0b1511; --panel-2:#101c17; --line:#1f342b; --text:#edf7f1; --mut:#9bb9ad;
-    --green:#4af2b2; --green-deep:#0e7c5a; --red:#ff8a8a; --amber:#ffd36b; --glow: rgba(74,242,178,.18);
+    --bg:#050607; --panel:#0a0c0b; --panel-2:#0e1110; --line:#1c2320; --text:#eef5f1; --mut:#94a8a0;
+    --green:#4af2b2; --green-mid:#10b981; --green-deep:#0e7c5a; --red:#ff8a8a; --amber:#ffd36b;
+    --chrome-hi:#cfd8d4; --chrome-lo:#3a4541;
+    --num: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
-  *{box-sizing:border-box} html{scroll-behavior:smooth}
+  *{box-sizing:border-box}
   body{
-    margin:0; background:
-      radial-gradient(circle at top, rgba(74,242,178,0.08), transparent 18%),
-      radial-gradient(circle at right top, rgba(47,129,255,0.07), transparent 20%),
-      linear-gradient(160deg,#060b09 0%,#07110d 45%,#040806 100%);
+    margin:0; background:var(--bg);
+    background-image:radial-gradient(1100px 500px at 50% -12%, rgba(74,242,178,.05), transparent 60%);
     color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow-x:hidden;
   }
-  body::before, body::after{content:"";position:fixed;inset:-20vmax;pointer-events:none;z-index:-1;filter:blur(70px);opacity:.35;animation:drift 18s ease-in-out infinite alternate}
-  body::before{background:radial-gradient(circle,rgba(74,242,178,.07) 0%,transparent 35%);}
-  body::after{background:radial-gradient(circle,rgba(96,165,250,.08) 0%,transparent 30%);animation-duration:22s}
+  /* 2026-06-12 Motion-Pass: drifting Background-Blobs, pulsierender Netz-Badge,
+     Card-Hover-Lift/Scale und Chart-Marching-Ants ENTFERNT — professionelle
+     Terminals (Hyperliquid, Binance) stehen still. Die einzige permanente
+     Animation ist der kleine Live-Dot wenn der Bot aktiv ist. Alle übrigen
+     Animationen respektieren prefers-reduced-motion. */
   .wrap{max-width:1200px;margin:0 auto;padding:24px 18px 40px}
   .hero{
-    background:linear-gradient(145deg, rgba(10,18,15,.96), rgba(8,14,11,.88));
-    border:1px solid rgba(74,242,178,.16); border-radius:24px; padding:18px 18px 14px; box-shadow:0 20px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
-    position:relative; overflow:hidden;
+    background:linear-gradient(150deg, rgba(12,14,13,.97), rgba(7,9,8,.94));
+    border:1px solid var(--line); border-radius:22px; padding:18px 18px 16px;
+    box-shadow:0 18px 44px rgba(0,0,0,.4); position:relative; overflow:hidden;
   }
-  .hero::after{content:"";position:absolute;inset:-1px;border-radius:24px;padding:1px;background:linear-gradient(120deg, rgba(74,242,178,.22), rgba(96,165,250,.08), rgba(74,242,178,.18)); -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none}
+  /* Metallische 1px-Border (Chrome-Pillar) via mask-composite */
+  .hero::after, .stat::after{
+    content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;
+    background:linear-gradient(120deg, var(--chrome-lo), var(--chrome-hi) 30%, var(--chrome-lo) 60%, rgba(74,242,178,.25));
+    -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none; opacity:.55;
+  }
+  .chrome{
+    background:linear-gradient(180deg,#f4f7f6,#9aa6a1);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
   .eyebrow{display:flex;align-items:center;gap:8px;color:#9fe8c8;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:800}
-  .eyebrow .dot{width:8px;height:8px;border-radius:999px;background:linear-gradient(135deg,var(--green),#3ec9ff);box-shadow:0 0 0 4px rgba(74,242,178,.08), 0 0 14px rgba(74,242,178,.35)}
-  h1{font-size:26px;margin:8px 0 4px;line-height:1.1}
+  .eyebrow .dot{width:8px;height:8px;border-radius:999px;background:var(--green);box-shadow:0 0 0 4px rgba(74,242,178,.08)}
+  h1{font-size:26px;margin:8px 0 4px;line-height:1.15;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
   .sub{color:var(--mut);font-size:13px;margin-bottom:8px}
   .hero-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;align-items:stretch}
-  .mini-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.15);color:#c9ffe8;font-size:12px;font-weight:700}
-  .mini-pill strong{color:var(--text)}
+  .mini-pill{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:#c9e8da;font-size:11px;font-weight:700;letter-spacing:.02em}
   .hero-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
-  .site-nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .site-nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
   .site-nav a{display:inline-flex;align-items:center;gap:6px;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:#e7fff4;text-decoration:none;font-size:12px;font-weight:700}
   .site-nav a:hover{background:rgba(74,242,178,.08);border-color:rgba(74,242,178,.18)}
   .section-kicker{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#9fe8c8;font-weight:800}
-  .hero-metric{background:linear-gradient(145deg, rgba(14,24,20,.96), rgba(9,15,12,.95)); border:1px solid rgba(255,255,255,.06); border-radius:16px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
-  .desk-strip{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}
-  .desk-tag{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.16);color:#dffbf2;font-size:12px;font-weight:700}
+  .hero-metric{background:var(--panel-2); border:1px solid var(--line); border-radius:14px; padding:10px 12px}
   .hero-metric .label{color:var(--mut);font-size:11px;letter-spacing:.12em;text-transform:uppercase}
-  .hero-metric .value{font-size:18px;font-weight:800;margin-top:3px}
-  .card{background:linear-gradient(145deg, rgba(10,16,13,.96), rgba(7,11,9,.92)); border:1px solid rgba(255,255,255,.06); border-radius:18px; padding:16px; margin:14px 0; box-shadow:0 18px 40px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.03); position:relative; overflow:hidden; animation:fadeUp .35s ease both}
-  .card:hover{transform:translateY(-2px); border-color:rgba(74,242,178,.22); box-shadow:0 24px 56px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.03)}
-  .card::after{content:"";position:absolute;inset:auto -20% -60% auto;width:180px;height:180px;background:radial-gradient(circle,rgba(74,242,178,.06),transparent 60%);pointer-events:none}
+  .hero-metric .value{font-size:17px;font-weight:800;margin-top:3px}
+  /* 2026-06-12 Onboarding-Stepper: Connect wallet → Set risk → Enable bot.
+     Zustände kommen aus /api/dashboard (wallet_connected / bot_active). */
+  .stepper{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  button.step{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--mut);font-size:12px;font-weight:700;cursor:pointer;margin:0;box-shadow:none}
+  button.step .n{width:18px;height:18px;border-radius:50%;border:1px solid currentColor;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:800}
+  button.step.done{color:#9fffdc;border-color:rgba(74,242,178,.3)}
+  button.step.done .n{background:rgba(74,242,178,.15);border-color:transparent}
+  button.step.current{color:var(--text);border-color:var(--green)}
+  .live-dot{width:8px;height:8px;border-radius:50%;background:var(--chrome-lo);display:inline-block;flex:none}
+  .live-dot.active{background:var(--green)}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; margin:11px 0; box-shadow:0 14px 34px rgba(0,0,0,.3); position:relative}
+  .card:hover{border-color:#26312b}
   .card h2{font-size:15px;margin:0 0 10px;color:#a8ffd8;display:flex;align-items:center;gap:8px}
-  .card h2::before{content:"";width:8px;height:8px;border-radius:999px;background:linear-gradient(135deg,var(--green),#7bd8ff);box-shadow:0 0 0 6px rgba(74,242,178,.08)}
-  .warn{border-color:rgba(255,211,107,.18);background:linear-gradient(145deg, rgba(25,18,8,.96), rgba(15,10,5,.96)); color:#ffeec2; font-size:13px}
+  .warn{border-color:rgba(255,211,107,.18);background:linear-gradient(145deg, rgba(24,18,8,.96), rgba(13,10,5,.96)); color:#ffeec2; font-size:13px}
+  .banner-err{display:flex;align-items:center;gap:8px;background:rgba(255,138,138,.08);border:1px solid rgba(255,138,138,.3);color:#ffc7c7;border-radius:12px;padding:10px 14px;margin:11px 0;font-size:13px;font-weight:700}
   label{display:block;font-size:12px;color:#b9d9ca;margin:8px 0 3px}
-  input, select{width:100%;padding:10px 11px;background:linear-gradient(180deg, rgba(8,13,10,.98), rgba(5,8,7,.98)); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text); font-size:14px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+  input, select{width:100%;padding:10px 11px;background:var(--bg); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text); font-size:14px}
   input:focus, select:focus{outline:none;border-color:rgba(74,242,178,.35); box-shadow:0 0 0 4px rgba(74,242,178,.08)}
-  button{background:linear-gradient(135deg,#18e0a2,#10b981); color:#03110b; border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 12px 24px rgba(16,185,129,.18); transition:transform .12s ease, box-shadow .2s ease, opacity .2s ease}
-  button:hover{transform:translateY(-1px); box-shadow:0 14px 28px rgba(16,185,129,.25)}
+  button{background:linear-gradient(135deg,#18e0a2,#10b981); color:#03110b; border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 10px 22px rgba(16,185,129,.16); transition:filter .15s ease, opacity .2s ease}
+  button:hover{filter:brightness(1.08)}
   button.ghost{background:transparent;color:#75f2c1;border:1px solid rgba(74,242,178,.28); box-shadow:none}
   .row{display:flex;gap:12px;flex-wrap:wrap} .row>div{flex:1;min-width:120px}
   .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:800; border:1px solid transparent}
-  .on{background:rgba(74,242,178,.1);color:#9fffdc;border-color:rgba(74,242,178,.25)} .off{background:rgba(255,138,138,.08);color:#ffc4c4;border-color:rgba(255,138,138,.18)}
-  table{width:100%;border-collapse:collapse;font-size:13px} td,th{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.08)}
+  .on{background:rgba(74,242,178,.1);color:#9fffdc;border-color:rgba(74,242,178,.25)}
+  .off{background:rgba(255,138,138,.08);color:#ffc4c4;border-color:rgba(255,138,138,.18)}
+  .pill.mut{background:rgba(255,255,255,.05);color:var(--mut);border-color:rgba(255,255,255,.1)}
+  .pill.warn-pill{background:rgba(255,211,107,.12);color:var(--amber);border-color:rgba(255,211,107,.3)}
+  table{width:100%;border-collapse:collapse;font-size:13px} td,th{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.07)}
   code{background:rgba(255,255,255,.04);padding:2px 6px;border-radius:6px;font-size:12px;word-break:break-all}
   .msg{font-size:13px;margin-top:8px;min-height:18px} .err{color:#ffb7b7} .ok{color:#9fffdc}
   .mut{color:var(--mut);font-size:12px} a{color:#91ffd9} .hide{display:none}
-  .foot{color:#8ca79a;font-size:11px;text-align:center;margin-top:26px;line-height:1.6}
-  .avatar{width:32px;height:32px;border-radius:50%;border:2px solid rgba(74,242,178,.35);vertical-align:middle;margin-right:8px;box-shadow:0 0 0 4px rgba(74,242,178,.08)}
+  .foot{color:#7f968c;font-size:11px;text-align:center;margin-top:26px;line-height:1.6}
+  .avatar{width:32px;height:32px;border-radius:50%;border:2px solid rgba(74,242,178,.35);vertical-align:middle;margin-right:8px}
   .discord-user{display:flex;align-items:center;font-weight:800;font-size:15px}
-  .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
-  .stat{flex:1;min-width:150px;background:linear-gradient(145deg, rgba(10,16,13,.96), rgba(8,13,10,.92)); border:1px solid rgba(255,255,255,.06); border-radius:18px; padding:16px; box-shadow:0 18px 34px rgba(0,0,0,.26); transition:transform .15s ease, border-color .2s ease; position:relative; overflow:hidden}
-  .stat::after{content:"";position:absolute;inset:-30% auto auto -10%;width:120px;height:120px;background:radial-gradient(circle,rgba(74,242,178,.08),transparent 60%);pointer-events:none}
-  .stat:hover{transform:translateY(-3px) scale(1.02); border-color:rgba(74,242,178,.24); box-shadow:0 18px 42px rgba(74,242,178,.08)}
-  .mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-  .mini-card{background:linear-gradient(145deg, rgba(12,19,16,.96), rgba(7,11,9,.96)); border:1px solid rgba(74,242,178,.12); border-radius:14px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03); animation:fadeUp .35s ease both}
-  .mini-label{color:#a7c6b6;font-size:11px;text-transform:uppercase;letter-spacing:.12em}
-  .mini-value{font-size:18px;font-weight:800;margin-top:3px}
-  .market-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
-  .market-card{background:linear-gradient(145deg, rgba(12,19,16,.98), rgba(7,11,9,.98)); border:1px solid rgba(255,255,255,.06); border-radius:14px; padding:10px 12px; box-shadow:0 10px 24px rgba(0,0,0,.25)}
-  .market-label{font-size:11px;color:#abc8b8;text-transform:uppercase;letter-spacing:.12em}
-  .market-value{font-size:18px;font-weight:800;margin-top:3px}
-  .chip-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.16);color:#dffbf2;font-size:12px;font-weight:700}
-  .chip strong{color:#fff}
+  /* 2026-06-12 Zahlen-Pass: tabular-nums + Mono-Stack auf allen Werten, damit
+     live aktualisierte Ziffern das Layout nicht verschieben. */
+  .stat-v,.hero-metric .value,.metric-box .value,#ubal,.pos-upnl,.num,
+  #histtbl td,#pctbl td,#acttbl td:first-child{font-family:var(--num);font-variant-numeric:tabular-nums}
+  .stats{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
+  .stat{flex:1;min-width:148px;background:var(--panel-2); border:1px solid var(--line); border-radius:14px; padding:13px 14px; position:relative}
+  .stat-h{color:#b7d6ca;font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .stat-v{font-size:24px;font-weight:800;line-height:1.1;border-radius:6px}
+  .pos{color:#98ffd6} .neg{color:#ffc7c7}
+  .tf{display:inline-flex;gap:2px;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:2px;margin-bottom:8px}
+  .tfbtn{background:transparent;color:#a3c3b5;border:0;border-radius:7px;padding:3px 8px;font-size:11px;font-weight:800;cursor:pointer;margin:0;box-shadow:none}
+  .tfbtn.on{background:linear-gradient(135deg,#18e0a2,#10b981);color:#04120c}
+  /* touch-action:pan-y — Crosshair per Touch, vertikales Scrollen bleibt möglich */
+  #chart{width:100%;height:190px;display:block;border-radius:12px;background:var(--bg);touch-action:pan-y}
+  /* Positions 2.0 */
   .position-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:10px}
-  .position-card{background:linear-gradient(145deg, rgba(12,19,16,.98), rgba(8,13,10,.98)); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:12px; box-shadow:0 14px 28px rgba(0,0,0,.24); position:relative; overflow:hidden; transition:transform .15s ease, border-color .2s ease}
-  .position-card:hover{transform:translateY(-3px) scale(1.02); border-color:rgba(74,242,178,.24); box-shadow:0 18px 32px rgba(74,242,178,.12)}
-  .position-card.heat-positive{background:linear-gradient(145deg, rgba(9,22,17,.98), rgba(7,13,10,.98)); box-shadow:0 14px 30px rgba(74,242,178,.12)}
-  .position-card.heat-negative{background:linear-gradient(145deg, rgba(27,12,12,.98), rgba(14,9,9,.98)); box-shadow:0 14px 30px rgba(255,138,138,.10)}
-  .position-card::after{content:"";position:absolute;inset:auto -20% -40% auto;width:140px;height:140px;background:radial-gradient(circle,rgba(74,242,178,.08),transparent 55%);pointer-events:none}
-  .position-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
-  .position-coin{font-size:15px;font-weight:800}
-  .position-side{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:#b7d6ca}
-  .position-metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:8px}
+  .position-card{background:var(--panel-2); border:1px solid rgba(255,255,255,.07); border-radius:14px; padding:12px}
+  .position-card.heat-positive{border-color:rgba(74,242,178,.18)}
+  .position-card.heat-negative{border-color:rgba(255,138,138,.18)}
+  .position-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  .position-coin{font-size:15px;font-weight:800;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .pos-upnl{font-size:15px;font-weight:800;text-align:right;border-radius:6px}
+  .pos-upnl small{display:block;font-size:10px;color:var(--mut);font-weight:600}
+  .position-metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:9px}
   .metric-box{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:8px}
   .metric-box .label{font-size:10px;color:#a8c4b4;text-transform:uppercase;letter-spacing:.14em}
-  .metric-box .value{font-size:14px;font-weight:800;margin-top:2px}
-  .mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-  .mini-card{background:linear-gradient(145deg, rgba(12,19,16,.96), rgba(7,11,9,.96)); border:1px solid rgba(74,242,178,.12); border-radius:14px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
-  .mini-label{color:#a7c6b6;font-size:11px;text-transform:uppercase;letter-spacing:.12em}
-  .mini-value{font-size:18px;font-weight:800;margin-top:3px}
-  .stat:hover{transform:translateY(-2px); border-color:rgba(74,242,178,.18)}
-  .stat-h{color:#b7d6ca;font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}
-  .stat-v{font-size:26px;font-weight:800;line-height:1.1}
-  .pos{color:#98ffd6} .neg{color:#ffc7c7}
-  .tf{display:inline-flex;gap:2px;background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.04);border-radius:10px;padding:2px;margin-bottom:10px}
-  .tfbtn{background:transparent;color:#a3c3b5;border:0;border-radius:7px;padding:3px 8px;font-size:11px;font-weight:800;cursor:pointer;margin:0}
-  .tfbtn.on{background:linear-gradient(135deg,#18e0a2,#10b981);color:#04120c}
-  #chart{width:100%;height:170px;display:block;filter:drop-shadow(0 10px 24px rgba(74,242,178,.20)); border-radius:14px; background:linear-gradient(180deg, rgba(8,13,10,.98), rgba(6,10,8,.98)); animation:chartPulse 3.2s ease-in-out infinite alternate}
-  #chart .area{animation:chartFill 1.6s ease both}
-  #chart .line{stroke-dasharray:5 4; animation:chartDash 10s linear infinite}
-  .pulse{animation:pulse 1.8s infinite}
-  @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.02)}}
-  @keyframes drift{from{transform:translate3d(0,0,0)}to{transform:translate3d(-2%,2%,0)}}
-  @keyframes fadeUp{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:translateY(0)}}
-  @keyframes chartPulse{from{filter:drop-shadow(0 10px 18px rgba(74,242,178,.12))}to{filter:drop-shadow(0 14px 30px rgba(74,242,178,.26))}}
-  @keyframes chartFill{from{opacity:.45}to{opacity:1}}
-  @keyframes chartDash{to{stroke-dashoffset:-180}}
-
-  @media (max-width: 980px){ .hero-grid{grid-template-columns:1fr} .hero-metrics{grid-template-columns:1fr 1fr} }
+  .metric-box .value{font-size:13px;font-weight:800;margin-top:2px}
+  .metric-box.warn-sl{border-color:var(--amber);box-shadow:inset 0 0 0 1px rgba(255,211,107,.35)}
+  .badge-nosl{display:inline-flex;align-items:center;gap:4px;background:rgba(255,80,80,.16);color:#ff9d9d;border:1px solid rgba(255,138,138,.45);padding:2px 8px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+  .sl-bar{height:4px;border-radius:2px;background:rgba(255,255,255,.09);margin-top:10px;position:relative;overflow:hidden}
+  .sl-fill{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:linear-gradient(90deg,var(--red),var(--amber) 35%,var(--green))}
+  .sl-bar-l{display:flex;justify-content:space-between;font-size:10px;color:var(--mut);margin-top:3px;font-family:var(--num)}
+  /* Setup-Cards als details/summary: zugeklappt wenn der Schritt erledigt ist */
+  details.card>summary{display:flex;justify-content:space-between;align-items:center;gap:10px;cursor:pointer;list-style:none;font-weight:800;color:#a8ffd8;font-size:15px}
+  details.card>summary::-webkit-details-marker{display:none}
+  details.card>summary .setup-t{display:flex;align-items:center;gap:8px}
+  details.card>summary .state{font-size:12px;color:var(--mut);font-weight:600;text-align:right}
+  details.card[open]>summary{margin-bottom:10px}
+  /* Icons: ein Inline-SVG-Sprite (stroke, currentColor) statt Emoji */
+  .ico{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:inline-block;vertical-align:-2px;flex:none}
+  .ico-lg{width:24px;height:24px;color:var(--green)}
+  /* Skeleton-Shimmer für den First-Paint (ehrlicher Initial-State statt
+     hartkodiertem "MAINNET/Online/Ready") */
+  .skeleton{position:relative;color:transparent !important;border-radius:6px;background:rgba(255,255,255,.05);overflow:hidden;min-height:1em}
+  /* Toasts: bottom-right, mobile bottom-center (über der Sticky-Bar) */
+  #toasts{position:fixed;right:16px;bottom:16px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:340px}
+  .toast{background:var(--panel-2);border:1px solid var(--line);border-left:3px solid var(--green);border-radius:10px;padding:10px 14px;font-size:13px;color:var(--text);box-shadow:0 12px 30px rgba(0,0,0,.5);cursor:pointer}
+  .toast-err{border-left-color:var(--red)}
+  .toast.out{opacity:0;transition:opacity .3s}
+  /* Mobile Sticky-Bottom-Bar: Account-Value, uPnL, Bot-Pill */
+  .mbar{display:none}
+  /* Onboarded: Daten-Sektionen über die Setup-Sektionen heben */
+  #app{display:flex;flex-direction:column}
+  /* WICHTIG: #app{display:flex} hat höhere Spezifität als .hide — explizit
+     übersteuern, sonst wäre die App-Sektion pre-login sichtbar. */
+  #app.hide{display:none}
+  #setupZone,#dataZone{display:block}
+  #setupZone{order:1} #dataZone{order:2}
+  #app.onboarded #dataZone{order:1} #app.onboarded #setupZone{order:2}
+  #discordbtn{display:flex;align-items:center;justify-content:center;gap:10px;background:#0b1a13;border:1.5px solid #10b981;border-radius:10px;padding:13px 18px;color:#e6f2ec;font-weight:700;font-size:15px;text-decoration:none;margin-bottom:14px;transition:background .15s}
+  #discordbtn:hover{background:#0e2318}
+  @media (prefers-reduced-motion: no-preference){
+    html{scroll-behavior:smooth}
+    .card{animation:fadeUp .3s ease both}
+    .live-dot.active{animation:livePulse 1.8s infinite}
+    .skeleton::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.08),transparent);animation:shimmer 1.4s infinite}
+    .flash-up{animation:flashUp .6s ease}
+    .flash-down{animation:flashDown .6s ease}
+    .toast{animation:toastIn .25s ease}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes livePulse{0%,100%{box-shadow:0 0 0 0 rgba(74,242,178,.35)}50%{box-shadow:0 0 0 5px rgba(74,242,178,0)}}
+    @keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+    @keyframes flashUp{0%{background-color:rgba(74,242,178,.28)}100%{background-color:transparent}}
+    @keyframes flashDown{0%{background-color:rgba(255,138,138,.24)}100%{background-color:transparent}}
+    @keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  }
+  @media (max-width: 980px){ .hero-grid{grid-template-columns:1fr} .hero-metrics{grid-template-columns:1fr 1fr} .position-grid{grid-template-columns:1fr} }
   @media (max-width: 720px) {
-    .wrap { padding: 12px; }
+    .wrap { padding: 12px 12px 80px; }
     h1 { font-size: 18px; }
     .sub { font-size: 12px; }
-    .card { padding: 12px; margin: 10px 0; border-radius: 14px; }
+    .card { padding: 12px; margin: 9px 0; border-radius: 14px; }
     .card h2 { font-size: 14px; margin-bottom: 8px; }
     .row { flex-direction: column; gap: 8px; }
     .row > div { min-width: 0; width: 100%; }
     .stats { gap: 8px; }
     .stat { min-width: 0; padding: 10px 12px; flex: 1 1 calc(50% - 4px); }
-    .mini-grid{grid-template-columns:1fr 1fr;}
-    .stat-v { font-size: 20px; }
+    .stat-v { font-size: 19px; }
     .stat-h { font-size: 10px; }
     button { padding: 12px 16px; font-size: 14px; width: auto; min-height: 44px; }
+    button.step,.tfbtn{min-height:0;padding:7px 11px}
+    .tfbtn{padding:3px 8px}
     button:not(.ghost) + button { margin-top: 8px; }
     input { font-size: 16px; padding: 11px 12px; }
     .card table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
     code { font-size: 11px; word-break: break-all; }
     .pill { font-size: 11px; }
     .foot { font-size: 10px; margin-top: 16px; }
+    #toasts{left:50%;right:auto;transform:translateX(-50%);bottom:74px;width:calc(100% - 24px);max-width:420px}
+    .mbar{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:900;background:rgba(8,10,9,.97);border-top:1px solid var(--line);padding:9px 16px calc(9px + env(safe-area-inset-bottom));justify-content:space-between;align-items:center;gap:12px;backdrop-filter:blur(8px)}
+    .mbar .mbar-l{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.1em}
+    .mbar b{font-size:14px}
   }
-  @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .mini-grid{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
+  .mbar.hide{display:none}
+  @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 21px; } }
 </style></head>
-<body><div class="wrap">
+<body>
+<!-- 2026-06-12 Icon-Sprite: ~10 16px-Stroke-Icons (currentColor) ersetzen das
+     Emoji-Icon-System — Emojis rendern pro OS unterschiedlich. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="i-goat" viewBox="0 0 24 24">
+    <path d="M7.5 3.2C6 4.2 5.4 6 6 7.8"/><path d="M16.5 3.2c1.5 1 2.1 2.8 1.5 4.6"/>
+    <path d="M6 7.8h12l-1.9 5.3L12 20.6l-4.1-7.5z"/>
+    <path d="M9.8 10.9l.01 0M14.2 10.9l.01 0"/><path d="M12 20.6v1.2"/>
+  </symbol>
+  <symbol id="i-wallet" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="2.5"/><path d="M16.5 12.5h2.5"/><path d="M6 6V5.2A1.7 1.7 0 0 1 7.7 3.5H18"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9.5 12l2 2 3.5-4"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M7 14l3.5-4 3 2.5L18 7"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2.5 4.5 13.5H11L10 21.5 18.5 10.5H12z"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 2.5 20h19z"/><path d="M12 9.5v5M12 17.6l.01 0"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.6"/><path d="M5 20c1.2-3.4 3.7-5 7-5s5.8 1.6 7 5"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M3.5 3.5h7l10 10-7 7-10-10z"/><path d="M8 8l.01 0"/></symbol>
+</svg>
+<div class="wrap">
   <section class="hero">
-    <div class="eyebrow"><span class="dot"></span> Live trading dashboard</div>
+    <div class="eyebrow"><span class="dot"></span> Live trading dashboard
+      <!-- "Updated Xs ago"-Chip + Live-Dot: tickt sekündlich, Daten pollen alle 15s -->
+      <span class="mini-pill hide" id="updatedChip" style="margin-left:auto"><span class="live-dot" id="liveDot"></span><span id="updatedAgo" class="num">—</span></span>
+    </div>
     <div class="hero-grid">
       <div>
-        <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill off pulse">MAINNET</span></h1>
-        <div class="sub" id="netline">Community copy-trading on Hyperliquid — smoother, brighter, and built for fast decisions.</div>
-        <div class="desk-strip">
-          <div style="display:flex;flex-wrap:wrap;gap:8px">
-            <span class="desk-tag">⚡ Trading Desk</span>
-            <span class="desk-tag">🛡️ Risk controls</span>
-            <span class="desk-tag">📈 Live PnL stream</span>
-          </div>
-          <span class="mini-pill">Builder-ready • Hyperliquid snapshot</span>
+        <!-- 2026-06-12: Badges starten NEUTRAL ("—"), nie mehr hartkodiertes
+             MAINNET/Online/Ready vor dem ersten API-Response (Finding: falscher
+             MAINNET-Flash auf der Testnet-Beta). -->
+        <h1><svg class="ico ico-lg"><use href="#i-goat"/></svg><span class="chrome">GoatHub Trading Bot</span>
+          <span id="netbadge" class="pill mut">—</span>
+          <span id="demobadge" class="pill warn-pill hide">DEMO</span></h1>
+        <div class="sub" id="netline">Community copy-trading on Hyperliquid.</div>
+        <div class="stepper hide" id="stepper">
+          <button type="button" class="step" id="step1" data-target="wallet-connect"><span class="n" data-i="1">1</span>Connect wallet</button>
+          <button type="button" class="step" id="step2" data-target="risk-setup"><span class="n" data-i="2">2</span>Set risk</button>
+          <button type="button" class="step" id="step3" data-target="wallet"><span class="n" data-i="3">3</span>Enable bot</button>
         </div>
         <nav class="site-nav" aria-label="Primary">
           <a href="#overview">Overview</a>
-          <a href="#wallet">Wallet</a>
-          <a href="#risk">Risk</a>
           <a href="#positions">Positions</a>
           <a href="#history">History</a>
+          <a href="#wallet-connect">Wallet</a>
+          <a href="#risk-setup">Risk</a>
         </nav>
       </div>
       <div class="hero-metrics">
-        <div class="hero-metric"><div class="label">Status</div><div class="value" id="heroStatus">Online</div></div>
-        <div class="hero-metric"><div class="label">Network</div><div class="value" id="heroNet">Mainnet</div></div>
-        <div class="hero-metric"><div class="label">Wallet</div><div class="value" id="heroWallet">Ready</div></div>
+        <div class="hero-metric"><div class="label">Status</div><div class="value skeleton" id="heroStatus">—</div></div>
+        <div class="hero-metric"><div class="label">Network</div><div class="value skeleton" id="heroNet">—</div></div>
+        <div class="hero-metric"><div class="label">Wallet</div><div class="value skeleton" id="heroWallet">—</div></div>
       </div>
     </div>
   </section>
 
+  <!-- 2026-06-12: Load-Fehler werden sichtbar gemacht statt geschluckt — Banner
+       bleibt non-blocking, letzte Daten bleiben stehen, Polling retry't. -->
+  <div id="loaderr" class="banner-err hide" role="alert">
+    <svg class="ico"><use href="#i-alert"/></svg> Could not load dashboard — retrying…
+  </div>
+
   <!-- 2026-06-08: Risk-Disclosure — IMMER sichtbar (pre-login + logged-in).
        Network-Toggle (Testnet/MAINNET) wird per JS in load() updaten. -->
   <div class="card warn" id="netbanner">
-    ⚠️ <b id="netbanner-title">High-Risk Trading — read before using</b><br>
+    <svg class="ico"><use href="#i-alert"/></svg> <b id="netbanner-title">High-Risk Trading — read before using</b><br>
     <span style="display:block;margin-top:6px;font-size:13px;line-height:1.6">
       <b>You can lose all your deposited capital, including more than you put in due to leverage and liquidation.</b>
       Crypto perpetual futures trading is highly speculative and not suitable for everyone. Past performance does not
@@ -197,17 +290,18 @@
 
   <!-- AUTH -->
   <div class="card" id="auth">
-    <h2>Sign In</h2>
+    <h2><svg class="ico"><use href="#i-user"/></svg> Sign In</h2>
     <div class="msg err" style="margin-bottom:14px;min-height:0;background:#3b1e1e;color:#ffd2d2;padding:10px 12px;border-radius:8px;border:1px solid #ff8a8a;font-size:13px;line-height:1.5">
-      🚨 <b>Risk Acknowledgment</b><br>
+      <b>Risk Acknowledgment</b><br>
       By signing in you confirm you've read the warning above, understand that <b>automated leveraged trading can
       result in total loss of capital</b>, and accept full responsibility. This is not financial advice. Start small.
       Test before scaling up.
     </div>
     <div id="autherror" class="msg err" style="margin-bottom:10px;min-height:0"></div>
 
-    <!-- Primary: Discord login -->
-    <a href="/auth/discord" id="discordbtn" style="display:flex;align-items:center;justify-content:center;gap:10px;background:#0b1a13;border:1.5px solid #10b981;border-radius:10px;padding:13px 18px;color:#e6f2ec;font-weight:700;font-size:15px;text-decoration:none;margin-bottom:14px;transition:background .15s" onmouseover="this.style.background='#0e2318'" onmouseout="this.style.background='#0b1a13'">
+    <!-- Primary: Discord login. 2026-06-12: inline onmouseover/onmouseout entfernt
+         (CSP script-src 'self' blockt inline handlers) → CSS :hover. -->
+    <a href="/auth/discord" id="discordbtn">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057c.002.022.015.043.03.056a19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
       Login with Discord
     </a>
@@ -228,218 +322,223 @@
     </details>
   </div>
 
-  <!-- APP -->
+  <!-- APP. 2026-06-12 Redesign: EIN Overview-Stats-Row + Position-Cards + Chart
+       + History + Activity. Entfernt (waren reine Duplikate/Deko): "Trader
+       At-a-Glance"-Card, #postbl-Positions-Tabelle, Fake-Feature-Chips
+       ("Heatmap-ready", "Live stream", "Builder-ready"), Card-in-Card-Chart.
+       dataZone/setupZone: nach Onboarding (#app.onboarded) rutschen die Daten
+       über die Setup-Karten (Flex-Order, kein DOM-Move). -->
   <div id="app" class="hide">
-    <!-- Overview -->
-    <section id="overview" class="card">
-      <div class="section-kicker">Overview</div>
-      <h2 style="margin-top:6px">Trading Desk Overview</h2>
-      <div class="mut" style="margin-bottom:8px">A clearer multi-section workspace for live account data, risk controls, and activity history.</div>
-      <div class="stats">
-      <div class="stat">
-        <div class="stat-h">$ Total PnL</div>
-        <div class="tf">
-          <button class="tfbtn" data-d="1">24H</button>
-          <button class="tfbtn" data-d="7">7D</button>
-          <button class="tfbtn on" data-d="30">30D</button>
-          <button class="tfbtn" data-d="0">All</button>
-        </div>
-        <div id="statpnl" class="stat-v">—</div>
-      </div>
-      <div class="stat"><div class="stat-h">💰 Account Value</div><div id="statAccount" class="stat-v">—</div><div class="mut">Live Hyperliquid equity snapshot</div></div>
-      <div class="stat"><div class="stat-h">📈 Unrealized PnL</div><div id="statUnrealized" class="stat-v">—</div><div class="mut">Open positions only</div></div>
-      <div class="stat"><div class="stat-h">🧭 Open Exposure</div><div id="statExposure" class="stat-v">—</div><div class="mut">Estimated notional exposure</div></div>
-      <div class="stat"><div class="stat-h">📍 Open Positions</div><div id="statOpen" class="stat-v">—</div><div class="mut">Active trades on the book</div></div>
-      <div class="stat"><div class="stat-h">✓ Win Rate</div><div id="statwin" class="stat-v">—</div><div class="mut" id="stattrades">—</div></div>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Trader At-a-Glance</h2>
-      <div class="chip-row">
-        <span class="chip">⚡ Live PnL</span>
-        <span class="chip">📊 Hyperliquid snapshot</span>
-        <span class="chip">🧭 Open exposure overview</span>
-      </div>
-      <div class="mini-grid" style="margin-top:10px">
-        <div class="mini-card"><div class="mini-label">Account Value</div><div id="miniAccount" class="mini-value">—</div></div>
-        <div class="mini-card"><div class="mini-label">Unrealized PnL</div><div id="miniUnrealized" class="mini-value">—</div></div>
-        <div class="mini-card"><div class="mini-label">Open Positions</div><div id="miniOpen" class="mini-value">—</div></div>
-        <div class="mini-card"><div class="mini-label">Closed PnL</div><div id="miniClosed" class="mini-value">—</div></div>
-      </div>
-      <div class="market-grid">
-        <div class="market-card"><div class="market-label">Win Rate</div><div id="marketWin" class="market-value">—</div></div>
-        <div class="market-card"><div class="market-label">Closed trades</div><div id="marketClosed" class="market-value">—</div></div>
-        <div class="market-card"><div class="market-label">Risk layer</div><div id="marketRisk" class="market-value">—</div></div>
-      </div>
-    </section>
-
-    <section class="card">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
-        <h2 style="margin-bottom:0">Cumulative PnL Performance</h2>
-        <div class="chip-row" style="margin-top:0">
-          <span class="chip">📈 PnL curve</span>
-          <span class="chip">🧠 Heatmap-ready</span>
-          <span class="chip">⚡ Live stream</span>
-        </div>
-      </div>
-      <div class="card" style="margin:10px 0 0;padding:10px;background:linear-gradient(145deg, rgba(8,13,10,.98), rgba(5,9,7,.98)); border-color:rgba(74,242,178,.18); box-shadow:0 16px 36px rgba(0,0,0,.26), inset 0 1px 0 rgba(255,255,255,.03)">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-          <span class="chip">📉 Cumulative curve</span>
-          <span class="chip">🧭 Exposure-aware view</span>
-        </div>
-        <svg id="chart" viewBox="0 0 600 170" preserveAspectRatio="none"></svg>
-        <div class="mut" id="chartempty" style="display:none">No closed trades in this period yet.</div>
-      </div>
-    </section>
-
-    <section id="wallet" class="card">
-      <div class="section-kicker">Wallet</div>
-      <h2 style="margin-top:6px">Account & Wallet</h2>
-      <div class="row">
-        <div>
-          <div class="mut">Logged in as</div>
-          <div class="discord-user">
-            <img id="uavatar" class="avatar hide" src="" alt="">
-            <span id="uname">—</span>
+    <div id="setupZone">
+      <section id="wallet" class="card">
+        <div class="section-kicker">Account</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-user"/></svg> Account &amp; Wallet</h2>
+        <div class="row">
+          <div>
+            <div class="mut">Logged in as</div>
+            <div class="discord-user">
+              <img id="uavatar" class="avatar hide" src="" alt="">
+              <span id="uname">—</span>
+            </div>
           </div>
+          <div><div class="mut">Balance</div><div id="ubal" class="skeleton" style="font-size:20px;font-weight:700;border-radius:6px">—</div>
+            <!-- 2026-06-12 Finding "duplicate hint nodes": fixes Element statt
+                 ubal.after(createElement) bei jedem load() -->
+            <div id="ubalhint" class="mut" style="font-size:12px;display:none"></div></div>
+          <div><div class="mut">Bot</div><div><span id="botpill" class="pill off">off</span></div></div>
         </div>
-        <div><div class="mut">Balance</div><div id="ubal" style="font-size:20px;font-weight:700">—</div></div>
-        <div><div class="mut">Bot</div><div><span id="botpill" class="pill off">off</span></div></div>
-      </div>
-      <button id="toggle" style="margin-top:14px">Enable Bot</button>
-      <button id="logoutBtn" class="ghost">Logout</button>
-      <a id="adminlink" href="/admin" class="hide" style="margin-left:8px;color:#10b981;font-size:12px;text-decoration:none">⚙ Admin →</a>
-    </section>
+        <button id="toggle" style="margin-top:14px">Enable Bot</button>
+        <button id="logoutBtn" class="ghost">Logout</button>
+        <a id="adminlink" href="/admin" class="hide" style="margin-left:8px;color:#10b981;font-size:12px;text-decoration:none"><svg class="ico" style="width:12px;height:12px"><use href="#i-sliders"/></svg> Admin →</a>
+      </section>
 
-    <section id="wallet-connect" class="card">
-      <div class="section-kicker">Setup</div>
-      <h2 style="margin-top:6px">1. Connect Hyperliquid Wallet</h2>
-      <div class="mut">Status: <b id="wstat">not connected</b></div>
+      <details id="wallet-connect" class="card" open>
+        <summary>
+          <span class="setup-t"><svg class="ico"><use href="#i-wallet"/></svg> 1. Connect Hyperliquid Wallet</span>
+          <span class="state mut" id="wstat">not connected</span>
+        </summary>
 
-      <!-- 2026-06-04 Wallet-Wizard (Restposten #1): step-by-step damit Tester
-           ohne 1:1-Erklärung onboarden können. Vorher haben mind. 2 von 3
-           Testern die Adresse statt des Keys eingegeben. -->
-      <details id="walletWizard" style="margin-top:10px;background:#0e1a14;border:1px solid #1f2e23;border-radius:8px;padding:8px 12px">
-        <summary style="cursor:pointer;color:#7ce0a8;font-weight:600">📖 Wie hole ich Master-Adresse + Agent-Key? (Klick für Anleitung)</summary>
-        <ol style="font-size:13px;line-height:1.7;color:#cfe6d4;margin:8px 0 4px 18px;padding:0">
-          <li>Geh auf <a id="hl-url" href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> und logge dich mit MetaMask ein. <span class="mut">(URL passt sich automatisch an deinen Netzwerk-Modus an)</span></li>
-          <li>Oben rechts auf dein Wallet-Icon → <b>„API"</b>.</li>
-          <li>Klick <b>„Generate"</b> bei „API Wallet". Es erscheint eine rote Warnung-Box mit einem Private-Key — das ist dein <b>Agent-Key</b> (lang, 66 Zeichen mit „0x"). <b style="color:#ff8a8a">Kopier ihn jetzt — du siehst ihn nur einmal!</b></li>
-          <li>Im selben Dialog steht oben eine <b>Address</b> (42 Zeichen) — das ist die Agent-Adresse (NICHT was wir brauchen). Schließ den Dialog.</li>
-          <li>Auf der HL-Seite oben rechts steht jetzt deine richtige <b>Master-Adresse</b> (z.B. <code>0x12E3…9D95</code>). Die kopierst du ebenfalls.</li>
-          <li>Hier unten:
-            <ul style="margin:4px 0;padding-left:18px">
-              <li>Ins Feld <b>„MASTER Address"</b> → die <b>kurze</b> (42 Zeichen) → deine Haupt-Wallet</li>
-              <li>Ins Feld <b>„Agent Private Key"</b> → der <b>lange</b> (66 Zeichen) aus der roten Box</li>
-            </ul>
-          </li>
-          <li>Save klicken — der Bot validiert die Längen sofort.</li>
-        </ol>
-        <div class="mut" style="font-size:12px;margin-top:6px">
-          ⚠️ Der Agent-Key hat <b>keine Withdraw-Rechte</b> — auch wenn jemand ihn hätte, kommt er nicht an dein Geld. Trotzdem: behandle ihn wie ein Passwort.
+        <!-- 2026-06-04 Wallet-Wizard (Restposten #1): step-by-step damit Tester
+             ohne 1:1-Erklärung onboarden können. Vorher haben mind. 2 von 3
+             Testern die Adresse statt des Keys eingegeben. -->
+        <details id="walletWizard" style="margin-top:10px;background:#0c1410;border:1px solid #1f2e23;border-radius:8px;padding:8px 12px">
+          <summary style="cursor:pointer;color:#7ce0a8;font-weight:600">Wie hole ich Master-Adresse + Agent-Key? (Klick für Anleitung)</summary>
+          <ol style="font-size:13px;line-height:1.7;color:#cfe6d4;margin:8px 0 4px 18px;padding:0">
+            <li>Geh auf <a id="hl-url" href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> und logge dich mit MetaMask ein. <span class="mut">(URL passt sich automatisch an deinen Netzwerk-Modus an)</span></li>
+            <li>Oben rechts auf dein Wallet-Icon → <b>„API"</b>.</li>
+            <li>Klick <b>„Generate"</b> bei „API Wallet". Es erscheint eine rote Warnung-Box mit einem Private-Key — das ist dein <b>Agent-Key</b> (lang, 66 Zeichen mit „0x"). <b style="color:#ff8a8a">Kopier ihn jetzt — du siehst ihn nur einmal!</b></li>
+            <li>Im selben Dialog steht oben eine <b>Address</b> (42 Zeichen) — das ist die Agent-Adresse (NICHT was wir brauchen). Schließ den Dialog.</li>
+            <li>Auf der HL-Seite oben rechts steht jetzt deine richtige <b>Master-Adresse</b> (z.B. <code>0x12E3…9D95</code>). Die kopierst du ebenfalls.</li>
+            <li>Hier unten:
+              <ul style="margin:4px 0;padding-left:18px">
+                <li>Ins Feld <b>„MASTER Address"</b> → die <b>kurze</b> (42 Zeichen) → deine Haupt-Wallet</li>
+                <li>Ins Feld <b>„Agent Private Key"</b> → der <b>lange</b> (66 Zeichen) aus der roten Box</li>
+              </ul>
+            </li>
+            <li>Save klicken — der Bot validiert die Längen sofort.</li>
+          </ol>
+          <div class="mut" style="font-size:12px;margin-top:6px">
+            ⚠️ Der Agent-Key hat <b>keine Withdraw-Rechte</b> — auch wenn jemand ihn hätte, kommt er nicht an dein Geld. Trotzdem: behandle ihn wie ein Passwort.
+          </div>
+        </details>
+
+        <label style="margin-top:12px">
+          MASTER Address <span class="mut" style="font-size:11px">(deine Haupt-Wallet, 42 Zeichen)</span>
+          <span id="addrlen" class="mut" style="float:right;font-family:monospace">0 / 42</span>
+        </label>
+        <input id="addr" placeholder="0x…" autocomplete="off" spellcheck="false">
+        <div id="addrhint" class="mut" style="font-size:11px;min-height:14px"></div>
+
+        <label style="margin-top:10px">
+          Agent Private Key <span class="mut" style="font-size:11px">(aus der „API"-Box, 66 Zeichen)</span>
+          <span id="seclen" class="mut" style="float:right;font-family:monospace">0 / 66</span>
+        </label>
+        <input id="sec" type="password" placeholder="0x…" autocomplete="off" spellcheck="false">
+        <div id="sechint" class="mut" style="font-size:11px;min-height:14px"></div>
+
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button id="savewalletbtn">Save Wallet</button>
+          <button type="button" class="ghost" id="walletAnleitungBtn">Anleitung öffnen</button>
         </div>
       </details>
 
-      <label style="margin-top:12px">
-        MASTER Address <span class="mut" style="font-size:11px">(deine Haupt-Wallet, 42 Zeichen)</span>
-        <span id="addrlen" class="mut" style="float:right;font-family:monospace">0 / 42</span>
-      </label>
-      <input id="addr" placeholder="0x…" autocomplete="off" spellcheck="false">
-      <div id="addrhint" class="mut" style="font-size:11px;min-height:14px"></div>
+      <details id="risk-setup" class="card" open>
+        <summary>
+          <span class="setup-t"><svg class="ico"><use href="#i-sliders"/></svg> 2. Risk Management &amp; Capital Cap</span>
+          <span class="state mut" id="riskstate">—</span>
+        </summary>
+        <div class="row">
+          <!-- 2026-06-12 Risk-%-Fix (Finding 12/13): Feld zeigt PROZENT (0.5 =
+               0.5%), die DB speichert die Fraction (0.005). JS konvertiert in
+               beide Richtungen + validiert 0.05–5 client-side. Leere Felder
+               werden NIE als 0 gesendet (0 beim Capital Cap = ganzer Account!). -->
+          <div><label for="risk">Risk % per trade</label><input id="risk" type="number" step="0.05" min="0.05" max="5" inputmode="decimal" placeholder="0.5">
+            <div id="riskhint" class="mut" style="font-size:11px;min-height:14px"></div></div>
+          <div><label for="lev">Max Leverage Cap (Auto)</label><input id="lev" type="number" step="1" min="1" max="50"></div>
+          <div><label for="maxp">Max Open Positions</label><input id="maxp" type="number" step="1" min="1"></div>
+          <div><label for="cap">Capital Cap (USDC, 0 = full account)</label><input id="cap" type="number" step="50" min="0"></div>
+        </div>
+        <button id="saveSettingsBtn">Save Settings</button>
+        <div class="msg" id="smsg"></div>
+        <div class="mut" style="margin-top:8px">
+          <b>Risk % pro Trade:</b> Eingabe in Prozent — <code>0.5</code> heißt 0,5 % deines Account-Werts
+          pro Trade (gespeichert als Anteil 0.005). Erlaubt: 0.05–5 %.
+          <br><b>Auto-Leverage:</b> der Bot wählt pro Trade selbst den optimalen Hebel aus SL-Distanz × Signal-Confidence,
+          gedeckelt durch deinen <i>Max Leverage Cap</i> (1-50, default 50 = HL-Maximum).
+          Beispiel SL 2% von Entry → safe ~25x; SL 0.5% → cap 50x; SL 5% → ~9x.
+          <br>Risk-Amount (% × Account) bleibt bei jedem Trade gleich — Hebel ändert nur margin-usage, nicht Verlustpotenzial bei SL-Trigger.
+          <br>Cap 1000 = bei 100k Account werden nur 1000 USDC fürs Sizing genutzt.
+        </div>
+      </details>
 
-      <label style="margin-top:10px">
-        Agent Private Key <span class="mut" style="font-size:11px">(aus der „API"-Box, 66 Zeichen)</span>
-        <span id="seclen" class="mut" style="float:right;font-family:monospace">0 / 66</span>
-      </label>
-      <input id="sec" type="password" placeholder="0x…" autocomplete="off" spellcheck="false">
-      <div id="sechint" class="mut" style="font-size:11px;min-height:14px"></div>
+      <!-- 2026-06-12: Builder-Card ist komplett versteckt solange der Server
+           keine BUILDER_ADDRESS hat (README Known issue #4 — "disabled
+           (Testnet)" hat Tester verwirrt). load() blendet sie ein, sobald
+           d.builder.address gesetzt ist. -->
+      <section id="builder" class="card hide">
+        <div class="section-kicker">Builder</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-tag"/></svg> 3. Builder Fee / Referral</h2>
+        <div class="mut">Trades carry a builder code. Approve the fee once in the Hyperliquid UI
+          (<i>approve builder fee</i>) for this address, then confirm here. Phase 5 (2026-06-02):
+          the dashboard now verifies on-chain — clicking confirm will only succeed if the approval
+          is actually on Hyperliquid.</div>
+        <div style="margin:8px 0"><span class="mut">Builder address:</span> <code id="baddr">—</code>
+          <span class="mut">· Fee <span id="bfee">—</span></span></div>
+        <div>Status (DB): <span id="bstat" class="pill off">not confirmed</span></div>
+        <div style="margin-top:6px;font-size:13px">On-chain: <span id="bonchain" class="mut">— click "Verify" to check</span></div>
+        <button id="signbtn" style="background:#f6851b;color:#fff">Approve via MetaMask</button>
+        <button id="bbtn" class="ghost">Re-verify after manual approve</button>
+        <button id="verifyBuilderBtn" class="ghost">Check on-chain status</button>
+        <div class="msg" id="bmsg"></div>
+        <div class="mut" style="font-size:11px;margin-top:6px">
+          Der orange Button öffnet MetaMask und lässt dich on-chain freigeben — danach setzt der Bot automatisch das DB-Flag. Funktioniert nur wenn deine MetaMask die <b>MASTER-Adresse</b> dieser Wallet ist (nicht der Agent-Key).
+        </div>
+      </section>
+    </div>
 
-      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-        <button id="savewalletbtn">Save Wallet</button>
-        <button type="button" class="ghost" id="walletAnleitungBtn">Anleitung öffnen</button>
-      </div>
-      <div class="msg" id="wmsg"></div>
-    </section>
+    <div id="dataZone">
+      <!-- Overview -->
+      <section id="overview" class="card">
+        <div class="section-kicker">Overview</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-chart"/></svg> Trading Desk Overview</h2>
+        <div class="stats">
+        <div class="stat">
+          <div class="stat-h">Total PnL</div>
+          <div class="tf">
+            <button class="tfbtn" data-d="1">24H</button>
+            <button class="tfbtn" data-d="7">7D</button>
+            <button class="tfbtn on" data-d="30">30D</button>
+            <button class="tfbtn" data-d="0">All</button>
+          </div>
+          <div id="statpnl" class="stat-v skeleton">—</div>
+        </div>
+        <div class="stat"><div class="stat-h"><svg class="ico" style="width:12px;height:12px"><use href="#i-wallet"/></svg> Account Value</div><div id="statAccount" class="stat-v skeleton">—</div><div class="mut">Hyperliquid equity snapshot</div></div>
+        <div class="stat"><div class="stat-h"><svg class="ico" style="width:12px;height:12px"><use href="#i-zap"/></svg> Unrealized PnL</div><div id="statUnrealized" class="stat-v skeleton">—</div><div class="mut">Open positions only</div></div>
+        <div class="stat"><div class="stat-h"><svg class="ico" style="width:12px;height:12px"><use href="#i-layers"/></svg> Open Exposure</div><div id="statExposure" class="stat-v skeleton">—</div><div class="mut" id="statOpenSub">Notional · <span id="statOpen" class="num">—</span> open</div></div>
+        <div class="stat"><div class="stat-h"><svg class="ico" style="width:12px;height:12px"><use href="#i-shield"/></svg> Win Rate</div><div id="statwin" class="stat-v skeleton">—</div><div class="mut" id="stattrades">—</div></div>
+        <!-- 2026-06-12 Finding "Risk layer 0%": Risk kommt aus
+             d.user.settings.risk_pct (Fraction) ×100 — vorher las die Karte
+             nicht existierende Felder und zeigte immer 0%. -->
+        <div class="stat"><div class="stat-h"><svg class="ico" style="width:12px;height:12px"><use href="#i-sliders"/></svg> Risk / Trade</div><div id="statRisk" class="stat-v skeleton">—</div><div class="mut">of account value per trade</div></div>
+        </div>
+      </section>
 
-    <section id="risk" class="card">
-      <div class="section-kicker">Risk</div>
-      <h2 style="margin-top:6px">2. Risk Management &amp; Capital Cap</h2>
-      <div class="row">
-        <div><label>Risk % / Trade</label><input id="risk" type="number" step="0.005"></div>
-        <div><label>Max Leverage Cap (Auto)</label><input id="lev" type="number" step="1" min="1" max="50"></div>
-        <div><label>Max Open Positions</label><input id="maxp" type="number" step="1"></div>
-        <div><label>Capital Cap (USDC, 0 = full account)</label><input id="cap" type="number" step="50"></div>
-      </div>
-      <button id="saveSettingsBtn">Save Settings</button>
-      <div class="msg" id="smsg"></div>
-      <div class="mut" style="margin-top:8px">
-        <b>Auto-Leverage:</b> der Bot wählt pro Trade selbst den optimalen Hebel aus SL-Distanz × Signal-Confidence,
-        gedeckelt durch deinen <i>Max Leverage Cap</i> (1-50, default 50 = HL-Maximum).
-        Beispiel SL 2% von Entry → safe ~25x; SL 0.5% → cap 50x; SL 5% → ~9x.
-        <br>Risk-Amount (% × Account) bleibt bei jedem Trade gleich — Hebel ändert nur margin-usage, nicht Verlustpotenzial bei SL-Trigger.
-        <br>Cap 1000 = bei 100k Account werden nur 1000 USDC fürs Sizing genutzt.
-      </div>
-    </section>
+      <section id="positions" class="card">
+        <div class="section-kicker">Positions</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-layers"/></svg> Open Positions</h2>
+        <div class="mut" style="margin-bottom:8px">Die wichtigsten offenen Trades auf einen Blick — Entry/Mark, SL/TP, Hebel, Liquidationspreis und PnL aus dem Bot-Snapshot.</div>
+        <div id="positionCards" class="position-grid"><div class="skeleton" style="height:96px;border-radius:14px"></div><div class="skeleton" style="height:96px;border-radius:14px"></div></div>
+        <div class="mut" id="posempty" style="display:none">No open positions.</div>
+      </section>
 
-    <section id="builder" class="card">
-      <div class="section-kicker">Builder</div>
-      <h2 style="margin-top:6px">3. Builder Fee / Referral</h2>
-      <div class="mut">Trades carry a builder code. Approve the fee once in the Hyperliquid UI
-        (<i>approve builder fee</i>) for this address, then confirm here. Phase 5 (2026-06-02):
-        the dashboard now verifies on-chain — clicking confirm will only succeed if the approval
-        is actually on Hyperliquid.</div>
-      <div style="margin:8px 0"><span class="mut">Builder address:</span> <code id="baddr">—</code>
-        <span class="mut">· Fee <span id="bfee">—</span></span></div>
-      <div>Status (DB): <span id="bstat" class="pill off">not confirmed</span></div>
-      <div style="margin-top:6px;font-size:13px">On-chain: <span id="bonchain" class="mut">— click "Verify" to check</span></div>
-      <button id="signbtn" style="background:#f6851b;color:#fff">🦊 Approve via MetaMask</button>
-      <button id="bbtn" class="ghost">Re-verify after manual approve</button>
-      <button id="verifyBuilderBtn" class="ghost">Check on-chain status</button>
-      <div class="msg" id="bmsg"></div>
-      <div class="mut" style="font-size:11px;margin-top:6px">
-        Der orange Button öffnet MetaMask und lässt dich on-chain freigeben — danach setzt der Bot automatisch das DB-Flag. Funktioniert nur wenn deine MetaMask die <b>MASTER-Adresse</b> dieser Wallet ist (nicht der Agent-Key).
-      </div>
-    </section>
+      <section id="chart-card" class="card">
+        <h2><svg class="ico"><use href="#i-chart"/></svg> Cumulative PnL</h2>
+        <svg id="chart" viewBox="0 0 600 190"></svg>
+        <div class="mut" id="chartempty" style="display:none">No closed trades in this period yet.</div>
+      </section>
 
-    <section id="positions" class="card">
-      <div class="section-kicker">Positions</div>
-      <h2 style="margin-top:6px">Open Positions</h2>
-      <div class="mut" style="margin-bottom:8px">Die wichtigsten offenen Trades direkt auf einem Blick – mit PnL, Größe und Entry aus dem Bot-Snapshot.</div>
-      <div id="positionCards" class="position-grid"></div>
-      <table id="postbl" style="margin-top:10px"><thead><tr><th>Coin</th><th>Size</th><th>Entry</th><th>uPnL</th></tr></thead><tbody></tbody></table>
-      <div class="mut" id="posempty">No open positions.</div>
-    </section>
+      <section id="history" class="card">
+        <div class="section-kicker">History</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-clock"/></svg> Recent History</h2>
+        <table id="histtbl"><thead><tr><th>Date</th><th>Asset</th><th>Direction</th><th>Price</th><th>PnL</th></tr></thead>
+          <tbody><tr><td colspan="5"><span class="skeleton" style="display:block;height:14px"></span></td></tr></tbody></table>
+        <div class="mut" id="histempty" style="display:none">No trades yet.</div>
+      </section>
 
-    <section id="history" class="card">
-      <div class="section-kicker">History</div>
-      <h2 style="margin-top:6px">Per-Coin Filter Status</h2>
-      <div class="mut" style="margin-bottom:8px">
-        Der Bot blockt automatisch neue Positionen für Coins auf denen du eine schwache Performance hast.
-        Schwelle: ≥<span id="pcMinTrades">10</span> Trades und Win-Rate <span id="pcMinRate">&lt; 30%</span>.
-        Existing positions werden NICHT angefasst — nur neue Entries.
-      </div>
-      <table id="pctbl"><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Win-Rate</th><th>Status</th></tr></thead><tbody></tbody></table>
-      <div class="mut" id="pcempty">Noch keine Trade-History auf HL — nichts geblockt.</div>
-    </section>
+      <section id="percoin" class="card">
+        <div class="section-kicker">Filter</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-shield"/></svg> Per-Coin Filter Status</h2>
+        <div class="mut" style="margin-bottom:8px">
+          Der Bot blockt automatisch neue Positionen für Coins auf denen du eine schwache Performance hast.
+          Schwelle: ≥<span id="pcMinTrades">10</span> Trades und Win-Rate <span id="pcMinRate">&lt; 30%</span>.
+          Existing positions werden NICHT angefasst — nur neue Entries.
+        </div>
+        <table id="pctbl"><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Win-Rate</th><th>Status</th></tr></thead>
+          <tbody><tr><td colspan="5"><span class="skeleton" style="display:block;height:14px"></span></td></tr></tbody></table>
+        <div class="mut" id="pcempty" style="display:none">Noch keine Trade-History auf HL — nichts geblockt.</div>
+      </section>
 
-    <section class="card" style="border-color:rgba(96,165,250,.16)">
-      <div class="section-kicker">History</div>
-      <h2 style="margin-top:6px">Recent History</h2>
-      <table id="histtbl"><thead><tr><th>Date</th><th>Asset</th><th>Direction</th><th>Price</th><th>PnL</th></tr></thead><tbody></tbody></table>
-      <div class="mut" id="histempty">No trades yet.</div>
-    </section>
+      <section id="activity" class="card">
+        <div class="section-kicker">Activity</div>
+        <h2 style="margin-top:6px"><svg class="ico"><use href="#i-zap"/></svg> Bot Activity</h2>
+        <table id="acttbl"><thead><tr><th>Time</th><th>Type</th><th>Info</th></tr></thead>
+          <tbody><tr><td colspan="3"><span class="skeleton" style="display:block;height:14px"></span></td></tr></tbody></table>
+        <div class="mut" id="actempty" style="display:none">No activity yet.</div>
+      </section>
+    </div>
 
-    <section class="card" style="border-color:rgba(255,211,107,.16)">
-      <div class="section-kicker">Activity</div>
-      <h2 style="margin-top:6px">Bot Activity</h2>
-      <table id="acttbl"><thead><tr><th>Time</th><th>Type</th><th>Info</th></tr></thead><tbody></tbody></table>
-      <div class="mut" id="actempty">No activity yet.</div>
-    </section>
+    <!-- 2026-06-12 Mobile Sticky-Bar: die 3 Zahlen, die ein Trader am Handy
+         checkt, ohne die lange Seite zu scrollen. Nur <720px sichtbar. -->
+    <div class="mbar" id="mbar">
+      <div><div class="mbar-l">Account</div><b class="num" id="mbarVal">—</b></div>
+      <div><div class="mbar-l">uPnL</div><b class="num" id="mbarUpnl">—</b></div>
+      <span id="mbarBot" class="pill off">off</span>
+    </div>
   </div>
 
   <div class="foot"><span id="foot-net">GoatHub Trading Bot</span> · not financial advice · trade at your own risk<br>
     Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>
 </div>
-<script src="/static/dashboard.js?v=20260612b" defer></script>
+<div id="toasts" aria-live="polite"></div>
+<script src="/static/dashboard.js?v=20260612v" defer></script>
 </body></html>

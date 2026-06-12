@@ -101,7 +101,17 @@ class HyperliquidTrader:
         self.builder = builder            # {"b": addr, "f": int} oder None
         self.exchange = Exchange(Account.from_key(secret_key), base, account_address=account_address)
         self.info = Info(base, skip_ws=True)
-        self._sz = {a["name"]: a.get("szDecimals", 2) for a in self.info.meta().get("universe", [])}
+        meta = self.info.meta()
+        self._sz = {a["name"]: a.get("szDecimals", 2) for a in meta.get("universe", [])}
+        # 2026-06-12 (Review #17): per-Asset maxLeverage aus meta merken. Viele Alts
+        # cappen bei 3-10x — auto_leverage darf nie mehr anfragen, sonst rejected HL
+        # update_leverage non-transient und der Entry liefe mit altem/undefiniertem Hebel.
+        self._max_lev = {}
+        for a in meta.get("universe", []):
+            try:
+                self._max_lev[a["name"]] = int(a.get("maxLeverage") or 0)
+            except (TypeError, ValueError):
+                pass
 
     def account_value(self):
         """Handelbares Guthaben = Perps-Equity + Spot-USDC (Unified/Cross-Collateral).
@@ -228,14 +238,29 @@ class HyperliquidTrader:
         return total
 
     def position_size(self, coin):
+        """Signierte Positionsgröße für `coin` (0.0 = wirklich flat).
+
+        2026-06-12 (Review #0, KRITISCH): vorher hat ein except hier 0.0
+        zurückgegeben — ein einziger transienter Info-API-Fehler ließ die Engine
+        eine OFFENE Position für flat halten: cancel_orders riss die live SL/TP
+        weg, _open_new legte eine ZWEITE Position obendrauf, _cancel/_watcher
+        schlossen die DB-Row → nackte Position ohne Schutz. Jetzt: user_state
+        via hl_retry (3 Versuche), nach finalem Fail wird die Exception
+        durchgereicht. JEDER Engine-Caller muss "Positionsstatus unbekannt"
+        als sicheren Abbruch behandeln — NIEMALS als flat.
+        """
         coin = coin_of(coin)
-        try:
-            for p in self.info.user_state(self.address).get("assetPositions", []):
-                if p.get("position", {}).get("coin") == coin:
-                    return _f(p["position"].get("szi"))
-        except Exception:
-            pass
+        state = hl_retry(lambda: self.info.user_state(self.address),
+                         max_attempts=3, label=f"position_size {coin}")
+        for p in (state or {}).get("assetPositions", []):
+            if p.get("position", {}).get("coin") == coin:
+                return _f(p["position"].get("szi"))
         return 0.0
+
+    def max_leverage(self, coin):
+        """2026-06-12 (Review #17): Asset-Max-Hebel aus meta. 0 = unbekannt
+        (Caller clampt dann nicht)."""
+        return self._max_lev.get(coin_of(coin), 0)
 
     def is_tradable(self, coin):
         return coin_of(coin) in self._sz
@@ -395,9 +420,14 @@ class HyperliquidTrader:
         sign = 1 if is_buy_protection else -1
         sl_worst = self._round_px(coin, sl_px * (1 + sign * slippage_cap))
 
+        # M-2 (2026-06-12): cloid auch für Schutz-Orders — wie beim Entry (H-4).
+        # reduce-only läuft mit max_attempts=5; ein Retry nach verlorener Response
+        # (Order serverseitig akzeptiert) konnte SL/TP-Trigger DOPPELT platzieren.
+        # Eine pro Order konstante Cloid macht den Retry idempotent (HL dedupt).
         res["sl"] = self._order(coin, is_buy_protection, sz, sl_worst,
                                 {"trigger": {"triggerPx": self._round_px(coin, sl_px), "isMarket": True, "tpsl": "sl"}},
-                                reduce_only=True)
+                                reduce_only=True,
+                                cloid=Cloid.from_str("0x" + os.urandom(16).hex()))
         res["sl_ok"] = self._status_ok(res["sl"])
         for px, frac in (tps or []):
             # Gleicher Side-Check für TPs:
@@ -411,9 +441,11 @@ class HyperliquidTrader:
             tp_sz = self._round_sz(coin, sz * frac)
             if tp_sz > 0:
                 tp_worst = self._round_px(coin, px * (1 + sign * slippage_cap))
+                # M-2: eigene Cloid pro TP-Order (gleiche Idempotenz-Logik wie SL).
                 res["tp"].append(self._order(coin, is_buy_protection, tp_sz, tp_worst,
                                  {"trigger": {"triggerPx": self._round_px(coin, px), "isMarket": True, "tpsl": "tp"}},
-                                 reduce_only=True))
+                                 reduce_only=True,
+                                 cloid=Cloid.from_str("0x" + os.urandom(16).hex())))
         return res
 
     def cancel_orders(self, coin):
@@ -440,10 +472,23 @@ class HyperliquidTrader:
     def close_position(self, coin, slippage_cap=None):
         """Offene Position per Market schließen (reduce-only, ohne Builder-Code).
         Phase 6+ (2026-06-03, H-8): explizite Slippage-Cap statt HL-Default (8 %).
+
+        2026-06-12 (Review #4): market_close jetzt via hl_retry (5 Versuche,
+        must-succeed wie alle reduce-only Ops) — vorher war das der EINZIGE
+        Exchange-Call ohne Retry, ausgerechnet im SL-Fail-Sicherheitsnetz.
+        Caller MÜSSEN result['ok'] prüfen: ok=False heißt die Position ist
+        evtl. noch OFFEN und UNGESCHÜTZT (alter Schutz schon gecancelt).
         """
         coin = coin_of(coin)
-        psz = self.position_size(coin)
-        if abs(psz) == 0:
+        # Positions-Read kann jetzt raisen (Review #0). Close ist risk-reduzierend:
+        # bei unbekanntem Status trotzdem den market_close versuchen (das SDK liest
+        # die Größe selbst) statt blind abzubrechen.
+        psz = None
+        try:
+            psz = self.position_size(coin)
+        except Exception as e:
+            log.warning("close_position(%s): position read failed (%s) — versuche market_close trotzdem", coin, e)
+        if psz is not None and abs(psz) == 0:
             return {"ok": True, "closed": 0.0}
         if slippage_cap is None:
             try:
@@ -454,12 +499,14 @@ class HyperliquidTrader:
         try:
             # market_close akzeptiert slippage-Kwarg im HL-SDK (default 0.05).
             # Falls eine SDK-Version den Kwarg nicht hat, fallback.
-            try:
-                raw = self.exchange.market_close(coin, slippage=slippage_cap)
-            except TypeError:
-                raw = self.exchange.market_close(coin)
+            def _do():
+                try:
+                    return self.exchange.market_close(coin, slippage=slippage_cap)
+                except TypeError:
+                    return self.exchange.market_close(coin)
+            raw = hl_retry(_do, max_attempts=5, label=f"market_close {coin}")
             ok = isinstance(raw, dict) and raw.get("status") == "ok"
-            return {"ok": ok, "closed": abs(psz), "raw": raw}
+            return {"ok": ok, "closed": abs(psz) if psz is not None else 0.0, "raw": raw}
         except Exception as e:
-            log.warning("market_close(%s): %s", coin, e)
+            log.warning("market_close(%s) final fail: %s", coin, e)
             return {"ok": False, "closed": 0.0, "error": str(e)}

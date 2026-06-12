@@ -1,0 +1,18 @@
+# M-19 (2026-06-12): Täglicher Trigger für goathub-backup.service.
+# Install (macht der Deploy-Workflow automatisch, wenn der goathub-User existiert):
+#   cp goathub-backup.service goathub-backup.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now goathub-backup.timer
+# Prüfen: systemctl list-timers goathub-backup.timer
+[Unit]
+Description=Taeglicher GoatHub-DB-Backup-Timer
+
+[Timer]
+OnCalendar=daily
+# Randomisierte Verzögerung — nicht exakt um Mitternacht mit allen anderen
+# Cron-/Timer-Jobs (Log-Rotation etc.) kollidieren.
+RandomizedDelaySec=45min
+# Verpasste Läufe (Server war aus/rebootete) beim nächsten Boot nachholen.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

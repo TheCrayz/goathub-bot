@@ -43,6 +43,47 @@ if not JWT_SECRET or JWT_SECRET == "dev-insecure-change-me":
         "Ohne sicheres Secret sind alle Login-Tokens fälschbar (Account-Übernahme).")
 JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 24)   # 2026-06-08 B4: 24h statt 168h (war 7 Tage). Refresh-Endpoint extends.
 ENCRYPTION_KEY = _g("ENCRYPTION_KEY")        # Fernet-Key; nötig zum Speichern der HL-Agent-Keys
+# 2026-06-12 Key-Rotation (#43): optionaler ALTER Fernet-Key. Bei Rotation:
+# neuen Key nach ENCRYPTION_KEY, alten nach ENCRYPTION_KEY_OLD — decrypt
+# probiert beide (MultiFernet in crypto.py), encrypt nutzt nur den neuen.
+# Danach können Agent-Keys nach und nach re-encrypted und _OLD entfernt werden.
+ENCRYPTION_KEY_OLD = _g("ENCRYPTION_KEY_OLD", "")
+
+# 2026-06-12 M-15: generalisierte Rotation via ENCRYPTION_KEYS — kommasepariert,
+# NEUESTER Key ZUERST. encrypt() nutzt immer den ersten Key, decrypt() probiert
+# alle der Reihe nach (MultiFernet in crypto.py). Wenn ENCRYPTION_KEYS gesetzt
+# ist, gewinnt es; sonst rückwärtskompatibel ENCRYPTION_KEY (+ optional
+# ENCRYPTION_KEY_OLD aus #43).
+_keys_csv = _g("ENCRYPTION_KEYS", "")
+if _keys_csv:
+    ENCRYPTION_KEYS = [k.strip() for k in _keys_csv.split(",") if k.strip()]
+else:
+    ENCRYPTION_KEYS = [k for k in (ENCRYPTION_KEY, ENCRYPTION_KEY_OLD) if k]
+
+# 2026-06-12 #43: ENCRYPTION_KEY beim Import validieren — spiegelbildlich zum
+# JWT_SECRET-Check oben. Vorher flog ein fehlender/kaputter Key erst zur
+# Laufzeit in crypto._fernet() — schlimmstenfalls MITTEN im Signal, wenn die
+# Engine Agent-Keys decrypten will → Trading für ALLE User still kaputt.
+# Jetzt: Service startet gar nicht erst ohne gültigen Fernet-Key.
+def _validate_fernet(name, key):
+    from cryptography.fernet import Fernet
+    try:
+        Fernet(key.encode() if isinstance(key, str) else key)
+    except Exception as e:
+        raise RuntimeError(
+            f"{name} fehlt oder ist kein gültiger Fernet-Key ({e}). In der .env setzen, z.B.:\n"
+            f"  {name}=$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')\n"
+            "Ohne gültigen Key können HL-Agent-Keys nicht ver-/entschlüsselt werden.")
+
+
+if not ENCRYPTION_KEYS:
+    _validate_fernet("ENCRYPTION_KEY", "")   # → RuntimeError "fehlt …"
+for _idx, _key in enumerate(ENCRYPTION_KEYS):
+    _validate_fernet(f"ENCRYPTION_KEYS[{_idx}]" if _keys_csv else
+                     ("ENCRYPTION_KEY" if _idx == 0 else "ENCRYPTION_KEY_OLD"), _key)
+# Konsistenz: config.ENCRYPTION_KEY ist IMMER der neueste (= encrypt-)Key,
+# egal ob er aus ENCRYPTION_KEYS oder ENCRYPTION_KEY kam.
+ENCRYPTION_KEY = ENCRYPTION_KEYS[0]
 
 # Hyperliquid
 HL_TESTNET = _b("HL_TESTNET", "true")
@@ -55,6 +96,11 @@ BUILDER_FEE = _g("BUILDER_FEE", "0.05%")     # f bis 0.1% (perps max)
 DISCORD_BOT_TOKEN = _g("DISCORD_BOT_TOKEN")
 SIGNALS_CHANNEL_ID = _i("SIGNALS_CHANNEL_ID", 0)
 ENABLE_LISTENER = _b("ENABLE_LISTENER", "false")   # für localhost-Test ohne Discord = false
+
+# 2026-06-12 LOW-12: /docs, /redoc, /openapi.json leaken die komplette
+# API-Surface (inkl. Admin-Endpoints) — default AUS, nur lokal auf true.
+# main.py liest das via getattr(config, "ENABLE_DOCS", False).
+ENABLE_DOCS = _b("ENABLE_DOCS", "false")
 
 # 2026-06-12 DEMO_MODE: NUR fürs lokale Frontend-/iPhone-Testen. Wenn an, liefert
 # /api/dashboard realistische MOCK-Daten statt echte HL-/DB-Abfragen — man kann
@@ -123,7 +169,55 @@ ALERT_THROTTLE_S = _i("ALERT_THROTTLE_S", 60)           # max 1 Alert pro 60s pr
 # Wird gesetzt durch /api/admin/halt oder durch automatic-Trigger
 # (MAX_SIGNALS_PER_HOUR überschritten). Pfad zur Datei statt env-var damit
 # wir's zur Laufzeit toggeln können ohne Service-Restart.
-EMERGENCY_HALT_FLAG_PATH = _g("EMERGENCY_HALT_FLAG_PATH", "/tmp/goathub-emergency-halt")
+# 2026-06-12 LOW-11: /tmp ist world-writable — JEDER lokale User konnte den
+# Bot per `touch /tmp/goathub-emergency-halt` lahmlegen (DoS) bzw. den vom
+# Admin gesetzten Halt löschen. Default jetzt /var/lib/goathub/emergency-halt
+# (nur goathub-User schreibbar, übersteht PrivateTmp=true im systemd-Unit);
+# Fallback auf /tmp NUR wenn das Verzeichnis nicht existiert/anlegbar ist
+# (z.B. lokales Dev auf macOS) — dann mit lauter Warnung. Env-Override
+# (EMERGENCY_HALT_FLAG_PATH) gewinnt immer.
+_halt_env = _g("EMERGENCY_HALT_FLAG_PATH")
+if _halt_env:
+    EMERGENCY_HALT_FLAG_PATH = _halt_env
+else:
+    _halt_dir = "/var/lib/goathub"
+    try:
+        os.makedirs(_halt_dir, exist_ok=True)
+    except OSError:
+        pass
+    if os.path.isdir(_halt_dir) and os.access(_halt_dir, os.W_OK):
+        EMERGENCY_HALT_FLAG_PATH = os.path.join(_halt_dir, "emergency-halt")
+    else:
+        import logging as _logging
+        _logging.getLogger("goathub.config").warning(
+            "EMERGENCY_HALT_FLAG_PATH: /var/lib/goathub nicht beschreibbar — "
+            "Fallback auf world-writable /tmp/goathub-emergency-halt. Auf dem "
+            "Server: mkdir -p /var/lib/goathub && chown goathub:goathub /var/lib/goathub")
+        EMERGENCY_HALT_FLAG_PATH = "/tmp/goathub-emergency-halt"
+
+# 2026-06-12 #54: Token-Usage-Scraper nur noch per Opt-in. Vorher lief der
+# Loop in JEDEM Deployment und pollte einen hardcoded Docker-Pfad aus dem
+# SEPARATEN TradingHub-Projekt — auf jedem Host ohne dieses Volume ein
+# stiller No-Op (totes Cross-Projekt-Coupling). Jetzt: leer = Loop wird gar
+# nicht gestartet (eine INFO-Zeile beim Boot). Auf dem TradingHub-Host in
+# der .env setzen, z.B.:
+#   SIGNALBOT_LOG_PATH=/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/logs/bot.log
+SIGNALBOT_LOG_PATH = _g("SIGNALBOT_LOG_PATH", "")
+
+# 2026-06-12 M-20: kanonische Namen für den Token-Usage-Scraper — main.py und
+# admin.py lesen die via getattr(config, ...). TOKEN_USAGE_LOG_PATH überstimmt
+# das ältere SIGNALBOT_LOG_PATH (bleibt als Fallback für bestehende .envs);
+# Default ist der frühere hardcoded TradingHub-Docker-Pfad.
+# TOKEN_SCRAPER_ENABLED default: NUR an, wenn der Pfad beim Start existiert
+# UND lesbar ist — auf Hosts ohne das Volume (oder als unprivilegierter
+# goathub-User) bleibt der Scraper damit automatisch aus. Explizites
+# TOKEN_SCRAPER_ENABLED=true/false in der .env gewinnt immer.
+_TOKEN_LOG_DEFAULT = "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/logs/bot.log"
+TOKEN_USAGE_LOG_PATH = _g("TOKEN_USAGE_LOG_PATH") or SIGNALBOT_LOG_PATH or _TOKEN_LOG_DEFAULT
+TOKEN_SCRAPER_ENABLED = _b(
+    "TOKEN_SCRAPER_ENABLED",
+    "true" if (os.path.isfile(TOKEN_USAGE_LOG_PATH)
+               and os.access(TOKEN_USAGE_LOG_PATH, os.R_OK)) else "false")
 
 # Discord OAuth2
 DISCORD_CLIENT_ID = _g("DISCORD_CLIENT_ID", "1508987342482837524")

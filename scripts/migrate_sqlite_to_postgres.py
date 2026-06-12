@@ -46,6 +46,14 @@ def _connect(url):
     return create_engine(url, future=True)
 
 
+def _redact(url: str) -> str:
+    """LOW-13: Passwort aus einer DB-URL für JEDE Ausgabe maskieren.
+    postgresql+psycopg2://user:GEHEIM@host/db → postgresql+psycopg2://user:***@host/db
+    """
+    import re
+    return re.sub(r"(?<=://)([^:/@]+):([^@]+)@", r"\1:***@", url)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--sqlite-path", required=True, help="Pfad zur Source-SQLite-Datei")
@@ -62,21 +70,31 @@ def main():
 
     src_url = f"sqlite:///{args.sqlite_path}"
     print(f"[{datetime.utcnow():%H:%M:%S}] Source : {src_url}")
-    print(f"[{datetime.utcnow():%H:%M:%S}] Target : {args.postgres_url}")
+    print(f"[{datetime.utcnow():%H:%M:%S}] Target : {_redact(args.postgres_url)}")
     if args.dry_run:
         print(f"[{datetime.utcnow():%H:%M:%S}] DRY-RUN — nichts wird geschrieben.")
+
+    # M-14: KEIN hardcoded Fallback-Key mehr (der alte Default-Key stand im
+    # öffentlichen Repo). Der Key wird hier nicht zum Entschlüsseln gebraucht
+    # (Blobs werden 1:1 kopiert), aber config.py validiert ihn beim Import —
+    # also denselben Key wie in /var/www/goathub-bot/.env mitgeben:
+    #   ENCRYPTION_KEY=$(grep ^ENCRYPTION_KEY= /var/www/goathub-bot/.env | cut -d= -f2-) \
+    #     python3 scripts/migrate_sqlite_to_postgres.py …
+    if not (os.environ.get("ENCRYPTION_KEY") or os.environ.get("ENCRYPTION_KEYS")):
+        print("ERROR: ENCRYPTION_KEY (oder ENCRYPTION_KEYS) muss als Umgebungs-"
+              "variable gesetzt sein — Abbruch. Den Key aus der Server-.env nehmen.")
+        sys.exit(2)
 
     # WICHTIG: erst DATABASE_URL setzen, dann models importieren — damit
     # app.db die TARGET-URL nutzt zum schema-creation. Für reines Read
     # nutzen wir separaten Source-Engine.
     os.environ["DATABASE_URL"] = args.postgres_url
-    # Test-secrets damit der config-import nicht bei JWT_SECRET hard-failt
+    # Test-secret damit der config-import nicht bei JWT_SECRET hard-failt
     os.environ.setdefault("JWT_SECRET", "migration-script-only-ignored")
-    os.environ.setdefault("ENCRYPTION_KEY", "AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=")
 
     from app.db import init_db, engine as target_engine
     from sqlalchemy.orm import sessionmaker
-    from app.models import User, Activity, ManagedTrade, TokenUsage
+    from app.models import User, Activity, ManagedTrade, TokenUsage, ProcessedSignal
 
     print(f"[{datetime.utcnow():%H:%M:%S}] Target schema anlegen…")
     if not args.dry_run:
@@ -92,6 +110,11 @@ def main():
         ("activity", Activity, "id"),
         ("managed_trades", ManagedTrade, "id"),
         ("token_usage", TokenUsage, "id"),
+        # H-E (2026-06-12): processed_signal MUSS mit — das ist die Replay-
+        # Dedup-Tabelle (C3). Ohne sie wäre nach dem Cutover der Dedup-Speicher
+        # leer und ein Restart-Replay der letzten Signale würde echte
+        # Positionen DOPPELT eröffnen.
+        ("processed_signal", ProcessedSignal, "id"),
     ]
 
     for tbl_name, Model, pk_col in TABLES:
@@ -142,12 +165,15 @@ def main():
 
     print(f"[{datetime.utcnow():%H:%M:%S}] DONE.")
     print()
+    # LOW-13: URL in der Ausgabe IMMER redacted — das echte Passwort steht
+    # sonst in CI-Logs / Shell-History / Scrollback.
     print("Cutover-Schritte:")
     print("  1. Stoppe goathub: ssh gh-srv 'systemctl stop goathub'")
     print(f"  2. Nochmal final-sync laufen lassen (idempotent):")
     print(f"     python3 scripts/migrate_sqlite_to_postgres.py "
-          f"--sqlite-path {args.sqlite_path} --postgres-url '{args.postgres_url}'")
-    print(f"  3. In /var/www/goathub-bot/.env: DATABASE_URL={args.postgres_url}")
+          f"--sqlite-path {args.sqlite_path} --postgres-url '{_redact(args.postgres_url)}'")
+    print(f"  3. In /var/www/goathub-bot/.env: DATABASE_URL={_redact(args.postgres_url)}")
+    print( "     (*** durch das echte Passwort ersetzen)")
     print( "  4. Start: ssh gh-srv 'systemctl start goathub'")
     print( "  5. Verifizieren: dashboard öffnen, /api/admin/users sollte alle User listen.")
     print( "  6. SQLite-Datei zur Sicherheit aufheben für ~1 Woche bevor wegwerfen.")

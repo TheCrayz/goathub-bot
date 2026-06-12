@@ -16,16 +16,23 @@ import re
 
 from sqlalchemy import and_
 
+from app import config
 from app.db import SessionLocal
 from app.models import TokenUsage
 
 log = logging.getLogger("goathub.tokens")
 
 SCRAPE_INTERVAL_S = int(os.getenv("TOKEN_USAGE_SCRAPE_INTERVAL_S", "300"))   # 5 min
-SB_LOG_PATH = os.getenv(
-    "SIGNALBOT_LOG_PATH",
-    "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/logs/bot.log",
-)
+# 2026-06-12 #54/M-20: Pfad + Schalter kommen jetzt zentral aus config
+# (TOKEN_USAGE_LOG_PATH / TOKEN_SCRAPER_ENABLED). Vorher war hier der
+# TradingHub-Docker-Volume-Pfad hardcoded und der Loop lief in JEDEM
+# Deployment mit — siehe Kommentar in config.py.
+SB_LOG_PATH = getattr(config, "TOKEN_USAGE_LOG_PATH", "") or config.SIGNALBOT_LOG_PATH
+
+# M-20: Pfad unlesbar (z.B. Service läuft als goathub statt root, oder das
+# Docker-Volume existiert auf diesem Host gar nicht) → genau EINE Warnung,
+# danach still. Kein Error-Spam alle 5 Minuten.
+_warned_unreadable = False
 
 # Gleiche Pricing-Tabelle wie admin.py — duplicated bewusst um keine Cross-Imports.
 PRICING = {
@@ -53,20 +60,34 @@ def _calc_usd(model: str, prompt: int, output: int, thoughts: int, cached: int) 
     )
 
 
-def _parse_ts(line: str) -> datetime.datetime:
+def _parse_ts(line: str):
+    """Timestamp-Prefix der Log-Zeile parsen — None wenn keiner da/parsebar.
+
+    2026-06-12 #27: vorher fiel das auf datetime.utcnow() zurück. Fatal für
+    die Idempotenz: eine Zeile ohne (intakten) Timestamp bekam bei JEDEM
+    5-Minuten-Scan eine NEUE ts → der Existenz-Check griff nie → Duplikat-Rows
+    bei jedem Durchlauf. Jetzt: None zurückgeben, Caller skippt die Zeile.
+    """
     m = _TS_RX.match(line)
     if not m:
-        return datetime.datetime.utcnow()
+        return None
     try:
         return datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        return datetime.datetime.utcnow()
+        return None
 
 
 def _scrape_once() -> int:
     """Run a single scrape; returns count of newly-inserted rows."""
-    if not os.path.exists(SB_LOG_PATH):
+    global _warned_unreadable
+    if not SB_LOG_PATH or not os.path.exists(SB_LOG_PATH) \
+            or not os.access(SB_LOG_PATH, os.R_OK):
+        if not _warned_unreadable:
+            log.warning("token_usage: %s nicht vorhanden/lesbar — Scraper bleibt "
+                        "passiv (einmalige Warnung).", SB_LOG_PATH or "<kein Pfad>")
+            _warned_unreadable = True
         return 0
+    _warned_unreadable = False   # Pfad wieder da (z.B. nach Log-Rotation)
 
     # Last 2 MB only — scrape läuft alle 5 min, das reicht.
     sz = os.path.getsize(SB_LOG_PATH)
@@ -74,6 +95,12 @@ def _scrape_once() -> int:
         if sz > 2 * 1024 * 1024:
             f.seek(sz - 2 * 1024 * 1024)
         tail = f.read().decode("utf-8", errors="ignore")
+        if sz > 2 * 1024 * 1024:
+            # 2026-06-12 #27: der Seek landet mitten in einer Zeile — das
+            # erste Fragment kann einen abgeschnittenen Timestamp haben,
+            # aber trotzdem das TOKEN_USAGE-Pattern matchen (search, nicht
+            # match) → Phantom-Row. Erstes Partial-Stück immer verwerfen.
+            tail = tail.split("\n", 1)[-1]
 
     inserted = 0
     db = SessionLocal()
@@ -86,6 +113,10 @@ def _scrape_once() -> int:
             prompt = int(m.group(2)); output = int(m.group(3))
             thoughts = int(m.group(4)); cached = int(m.group(5))
             ts = _parse_ts(line)
+            if ts is None:
+                # 2026-06-12 #27: Zeile ohne parsebaren Timestamp → kein
+                # stabiler Dedup-Key möglich. Skippen statt utcnow()-raten.
+                continue
             # idempotenz-check: same ts+model+counts → schon drin?
             existing = (
                 db.query(TokenUsage.id)
@@ -118,6 +149,13 @@ def _scrape_once() -> int:
 
 
 async def token_usage_scrape_loop():
+    # 2026-06-12 #54/M-20: Defensive Doppel-Absicherung — lifespan() startet
+    # den Loop nur bei TOKEN_SCRAPER_ENABLED, aber falls jemand die Funktion
+    # direkt aufruft: ohne Schalter/Pfad sofort raus statt ewig No-Op-pollen.
+    if not getattr(config, "TOKEN_SCRAPER_ENABLED", False) or not SB_LOG_PATH:
+        log.info("token_usage_scrape_loop übersprungen — TOKEN_SCRAPER_ENABLED "
+                 "ist aus bzw. TOKEN_USAGE_LOG_PATH nicht gesetzt.")
+        return
     log.info("token_usage_scrape_loop started (interval=%ds, path=%s)", SCRAPE_INTERVAL_S, SB_LOG_PATH)
     await asyncio.sleep(30)   # boot-delay
     while True:

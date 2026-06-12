@@ -1,8 +1,13 @@
 """SQLAlchemy-Setup (SQLite default)."""
+import logging
+
 from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app import config
+
+log = logging.getLogger("goathub.db")
 
 _connect = {"check_same_thread": False} if config.DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(config.DATABASE_URL, connect_args=_connect, future=True)
@@ -37,7 +42,16 @@ def init_db():
     from app import models  # noqa: F401  (Tabellen registrieren)
     Base.metadata.create_all(engine)
     # Migrate: add Discord columns to existing tables if they don't exist yet
+    # 2026-06-12 #26/#35: vorher schluckte `except Exception: pass` JEDEN
+    # Fehler — gedacht nur für "duplicate column name". Ein "database is
+    # locked" (Deploy-Restart-Overlap, parallele sqlite3-Shell) oder Disk-
+    # Error wurde still verworfen → App bootet mit fehlender Spalte → jede
+    # User-Query crasht später mit "no such column" OHNE Hinweis auf die
+    # gescheiterte Migration. Jetzt: existierende Spalten vorab per Inspector
+    # überspringen; unerwartete Fehler werden laut geloggt und re-raised
+    # (Service-Start bricht ab statt mit kaputtem Schema weiterzulaufen).
     from sqlalchemy import text
+    existing_cols = {c["name"] for c in inspect(engine).get_columns("users")}
     with engine.connect() as conn:
         for col, typedef in [
             ("discord_id", "VARCHAR"),
@@ -52,11 +66,30 @@ def init_db():
             ("max_drawdown_pct", "FLOAT NOT NULL DEFAULT 0.30"),
             ("peak_account_value", "FLOAT NOT NULL DEFAULT 0.0"),
         ]:
+            if col in existing_cols:
+                continue
             try:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typedef}"))
                 conn.commit()
-            except Exception:
-                pass  # column already exists
+            except OperationalError as e:
+                # M-18: NUR OperationalError fangen, und davon NUR die erwartete
+                # Duplicate-Column-Race (zweiter Prozess war schneller) schlucken.
+                # Locked DB, Disk-Error etc. werden laut geloggt und re-raised —
+                # alles andere (Nicht-OperationalError) propagiert ungefangen.
+                if "duplicate column" in str(e).lower():
+                    continue
+                log.error("init_db: ALTER TABLE users ADD COLUMN %s fehlgeschlagen: %s", col, e)
+                raise
+        # 2026-06-12 #44: Composite-Index für den Idempotenz-Lookup des
+        # Token-Scrapers (6-Spalten-Filter, lief vorher als Full-Scan pro
+        # Log-Zeile alle 5 Minuten). ts+model+prompt+output selektiert genug.
+        try:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_tu_dedup ON token_usage (ts, model, prompt, output)"))
+            conn.commit()
+        except Exception as e:
+            log.error("init_db: CREATE INDEX ix_tu_dedup fehlgeschlagen: %s", e)
+            raise
 
     # Phase 4 (2026-06-02): FK-Migration für activity + managed_trades.
     # SQLite kann FK nicht via ALTER TABLE nachträglich anhängen — also
@@ -78,8 +111,12 @@ def init_db():
                 conn.commit()
                 if r.rowcount > 0:
                     print(f"[init_db] Bootstrap: {bootstrap_email} promoted to is_admin=True")
-            except Exception:
-                pass
+            except Exception as e:
+                # 2026-06-12 #26: nicht mehr still schlucken — Bootstrap-Fail
+                # (z.B. locked DB) soll sichtbar sein. Kein re-raise: ein
+                # fehlgeschlagenes Admin-Promote ist beim nächsten Start
+                # retry-bar und darf den Service-Start nicht verhindern.
+                log.error("init_db: INITIAL_ADMIN_EMAIL-Bootstrap fehlgeschlagen: %s", e)
 
 
 def _migrate_add_fk(table_name: str, column: str, ref: str, on_delete: str = "CASCADE"):
@@ -118,10 +155,16 @@ def _migrate_add_fk(table_name: str, column: str, ref: str, on_delete: str = "CA
         conn.execute(text(f"DROP TABLE {table_name}"))
         conn.execute(text(f"ALTER TABLE {tmp} RENAME TO {table_name}"))
         # Index auf user_id wiederherstellen (Lookups skalieren)
+        # M-18: kein bare except:pass mehr — nur "already exists" ist harmlos.
         try:
             conn.execute(text(f"CREATE INDEX ix_{table_name}_{column} ON {table_name}({column})"))
-        except Exception:
-            pass
+        except OperationalError as e:
+            if "already exists" in str(e).lower():
+                pass
+            else:
+                log.error("_migrate_add_fk: CREATE INDEX ix_%s_%s fehlgeschlagen: %s",
+                          table_name, column, e)
+                raise
 
 
 def get_db():

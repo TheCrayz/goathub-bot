@@ -18,14 +18,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      # 2026-06-12 M-14: ENCRYPTION_KEY war vorher als Literal im Workflow —
+      # ein VALIDER Fernet-Key im öffentlichen Repo. Jetzt: Wegwerf-Key pro
+      # CI-Lauf frisch generiert; prod-Key bleibt ausschließlich in der
+      # Server-.env.
+      - name: 🔐 Generate throwaway CI Fernet key
+        id: cikey
+        run: |
+          echo "key=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")" >> "$GITHUB_OUTPUT"
       - name: Run tests
         env:
           # Test-only secrets — tests don't touch the prod values.
           JWT_SECRET: ci-only-not-prod-secret-1234567890abcdef
-          ENCRYPTION_KEY: AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=
+          ENCRYPTION_KEY: ${{ steps.cikey.outputs.key }}
+        # 2026-06-12 (#37): pytest-Collection statt handregistrierter __main__-Listen.
+        # Vorher: "python tests/test_core.py" führte nur die im __main__-Block
+        # gelisteten Funktionen aus — ein neuer test_foo() ohne Listeneintrag
+        # lief NIE, Pipeline blieb grün, Auto-Deploy ging trotzdem raus.
         run: |
-          PYTHONPATH=. python tests/test_core.py
-          PYTHONPATH=. python tests/test_engine.py
+          PYTHONPATH=. python -m pytest tests/ -q
 
   deploy:
     name: 🚀 Deploy to GoatHub Server
@@ -34,14 +45,30 @@ jobs:
 
     steps:
       - name: 🔑 SSH Deploy
-        uses: appleboy/ssh-action@v1.0.3
+        # 2026-06-12 (#22): auf Commit-SHA gepinnt statt mutable Tag — der
+        # Tag v1.0.3 könnte vom Action-Owner (oder gekapertem Account) auf
+        # bösartigen Code umgebogen werden; die Action sieht den SSH-Key zum
+        # Trading-Server. SHA via `git ls-remote refs/tags/v1.0.3` verifiziert.
+        # TODO (2026-06-12): Deploy als Non-Root-User mit sudo nur für
+        # `systemctl restart goathub`; GH_TOKEN aus der Pull-URL nehmen
+        # (kurz im Server-Prozesslisting sichtbar) → Deploy-Key auf dem Server.
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: ${{ vars.GOATHUB_HOST }}
           username: root
           key: ${{ secrets.GOATHUB_DEPLOY_KEY }}
           script: |
-            set -e
+            # 2026-06-12 (#38): pipefail — vorher entschied der Exit-Code von
+            # `tail` über grün/rot; ein totes Unit endete trotzdem ✅.
+            set -eo pipefail
             cd /var/www/goathub-bot
+
+            # 2026-06-12 (#38): DB-Backup VOR dem Pull — init_db fährt teils
+            # destruktive Recreate-Migrationen (DROP TABLE in db.py); ohne
+            # Backup wäre ein kaputter Deploy = Datenverlust aller User.
+            if [ -f goathub.db ]; then
+              cp goathub.db "goathub.db.bak-$(date +%Y%m%d-%H%M%S)"
+            fi
 
             echo "📥 Pulling latest code..."
             git pull https://${{ secrets.GH_TOKEN }}@github.com/TheCrayz/goathub-bot.git main || \
@@ -50,8 +77,37 @@ jobs:
             echo "📦 Installing dependencies..."
             source venv/bin/activate && pip install -q -r requirements.txt
 
-            echo "🔄 Restarting service..."
-            systemctl restart goathub
+            # 2026-06-12 M-16/M-19: Unit-Files aus dem Repo installieren —
+            # aber NUR wenn der goathub-User schon existiert (das neue Unit
+            # hat User=goathub; ohne den User würde der Service nicht mehr
+            # starten). One-time-Setup: siehe Kommentarblock in goathub.service.
+            echo "🧷 Installing systemd units..."
+            if id goathub >/dev/null 2>&1; then
+              cp goathub.service /etc/systemd/system/goathub.service
+              cp goathub-backup.service /etc/systemd/system/goathub-backup.service
+              cp goathub-backup.timer /etc/systemd/system/goathub-backup.timer
+              systemctl daemon-reload
+              systemctl enable --now goathub-backup.timer
+            else
+              echo "goathub user missing — keeping old unit"
+            fi
+
+            # 2026-06-12 M-16: kein blinder Restart mehr — safe_restart.sh
+            # wartet (max ~5 Min), bis keine Entry-Fills mehr in-flight sind
+            # (Watcher pollt bis zu ENTRY_FILL_TIMEOUT_S=300s), und restartet
+            # erst dann. Vorher konnte ein Deploy mitten im Fill-Fenster den
+            # Watcher killen → resting Order ohne SL/TP.
+            echo "🔄 Restarting service (safe)..."
+            bash scripts/safe_restart.sh
+
+            # 2026-06-12 (#38): echtes Health-Gate. Type=simple meldet
+            # "restart ok" auch wenn die App sofort beim Import stirbt
+            # (z.B. config.py hard-fail bei fehlender Env-Var) — daher
+            # is-active + HTTP-Check; jeder Fehlschlag = Workflow rot.
+            echo "🩺 Health check..."
+            sleep 5
+            systemctl is-active goathub
+            curl -fsS localhost:8000/api/health
 
             echo "✅ Deploy done! Status:"
             systemctl status goathub --no-pager -l | tail -20

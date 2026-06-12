@@ -9,8 +9,15 @@ Pollt alle SYNC_INTERVAL_S Sekunden für jeden verbundenen User die HL-Positions
 und schließt managed_trades, die HL nicht mehr kennt (autonom via SL/TP exited).
 
 Symmetrisch zum signal-bot's eigenem sync.py, aber für HL statt MEXC.
+
+2026-06-12 Audit LOW-5: Flip auf 'closed' cancelt jetzt best-effort die
+verwaisten TP/SL-Trigger-Orders des Coins auf HL — vorher blieben die bis zum
+cancel_orders-Sweep des nächsten NEW_TRADE liegen (Orderbuch-/UI-Müll, und ein
+liegen gebliebener reduce-only-Stop hätte eine SPÄTERE Position desselben Coins
+am falschen Level anschneiden können).
 """
 import asyncio
+import datetime
 import logging
 import os
 
@@ -21,6 +28,11 @@ from app.models import Activity, ManagedTrade, User
 log = logging.getLogger("goathub.sync")
 
 SYNC_INTERVAL_S = int(os.getenv("POSITION_SYNC_INTERVAL_S", "60"))
+# 2026-06-12 (Review #3): jede N-te Sync-Iteration läuft zusätzlich der
+# Stop-Coverage-Reconciler (engine.reconcile_stop_coverage). Vorher lief der
+# NUR beim Prozess-Start — ein per Gap durch den Slippage-Cap konsumierter
+# Stop ließ die Position bis zum nächsten Deploy nackt. 5 × 60s = alle ~5 min.
+COVERAGE_RECONCILE_EVERY_N = max(1, int(os.getenv("STOP_COVERAGE_RECONCILE_EVERY_N", "5")))
 
 # 2026-06-04 audit-fix (B-#5): 2-strike-rule gegen API-Latency-false-positives.
 # Wenn HL einmalig wegen Timeout/Partial-Response leeren assetPositions returnt,
@@ -44,14 +56,26 @@ def clear_strikes(user_id, coin):
 
 async def position_sync_loop():
     """Endlosschleife — startet im lifespan() neben dem Discord-Listener."""
-    log.info("position_sync_loop started (interval=%ds)", SYNC_INTERVAL_S)
+    log.info("position_sync_loop started (interval=%ds, coverage every %d runs)",
+             SYNC_INTERVAL_S, COVERAGE_RECONCILE_EVERY_N)
     # Beim ersten Boot 10 s warten, damit andere Init-Tasks (DB, Discord) durch sind.
     await asyncio.sleep(10)
+    iteration = 0
     while True:
         try:
             await _reconcile_all_users()
         except Exception as e:
             log.exception("position-sync iteration failed: %s", e)
+        # 2026-06-12 (Review #3): periodischer Stop-Coverage-Check (Unter-Deckung
+        # nach SL-Gap-Through / nackt gefüllten Entry-Resten). Lazy-Import,
+        # damit sync.py ohne hyperliquid-SDK importierbar bleibt.
+        iteration += 1
+        if iteration % COVERAGE_RECONCILE_EVERY_N == 0:
+            try:
+                from app.engine import reconcile_stop_coverage
+                await reconcile_stop_coverage()
+            except Exception as e:
+                log.exception("stop-coverage reconcile failed: %s", e)
         await asyncio.sleep(SYNC_INTERVAL_S)
 
 
@@ -68,10 +92,14 @@ async def _reconcile_all_users():
     """
     db = SessionLocal()
     try:
-        # Nur status='open' reconcilen — 'resting' = noch nicht gefillt, gehört dem fill-watch
+        # Close-Logik bleibt nur für status='open'. 2026-06-12 (Review #1): User
+        # mit resting-Rows werden jetzt MIT geprüft — aber nur für die
+        # Fill-Detection (resting-Row + HL-Position = Limit hat gefüllt, während
+        # kein Watcher mehr lebte, z.B. nach Deploy-Restart), NIE für Strikes.
         user_ids_with_open = {
             row[0] for row in
-            db.query(ManagedTrade.user_id).filter(ManagedTrade.status == "open").distinct().all()
+            db.query(ManagedTrade.user_id)
+              .filter(ManagedTrade.status.in_(("open", "resting"))).distinct().all()
         }
         users = (
             db.query(User)
@@ -97,17 +125,21 @@ async def _reconcile_one_user(user_id: int, address: str):
     # Snapshot von DB
     db = SessionLocal()
     try:
-        open_mts = (
+        mts = (
             db.query(ManagedTrade)
-              .filter(ManagedTrade.user_id == user_id, ManagedTrade.status == "open")
+              .filter(ManagedTrade.user_id == user_id,
+                      ManagedTrade.status.in_(("open", "resting")))
               .all()
         )
         # Detach: wir lesen nur, schreiben mit fresh-query unten
-        open_coins = {(mt.id, mt.coin) for mt in open_mts}
+        open_coins = {(mt.id, mt.coin) for mt in mts if mt.status == "open"}
+        # 2026-06-12 (Review #1): resting-Rows für die Fill-Detection mitnehmen
+        # (updated_at für den Watcher-Grace-Timer).
+        resting_rows = [(mt.id, mt.coin, mt.updated_at) for mt in mts if mt.status == "resting"]
     finally:
         db.close()
 
-    if not open_coins:
+    if not open_coins and not resting_rows:
         return
 
     # HL Info API — read-only, kein Decrypt nötig
@@ -131,10 +163,70 @@ async def _reconcile_one_user(user_id: int, address: str):
         if coin and sz > 0:
             hl_positions[coin] = sz
 
+    # 2026-06-12 (Review #41): bevor eine open-Row einen Strike Richtung 'closed'
+    # bekommt, ein zweiter, ge-retry-ter Confirm-Read. Ein degraded-API-Fenster
+    # konnte vorher mit 2 transienten Leer-Antworten (2 Strikes × 60s) eine LIVE
+    # Position auf 'closed' flippen — das nächste UPDATE fand keine offene Row,
+    # der SL-Ratchet war aus und ein gelockerter SL ging durch. Schlägt der
+    # Confirm-Read fehl → diese Runde GAR keine Strikes (fail-safe).
+    strikes_allowed = True
+    if any(coin not in hl_positions for (_mt_id, coin) in open_coins):
+        try:
+            from app.hl_retry import hl_retry
+            state2 = await asyncio.to_thread(
+                lambda: hl_retry(lambda: info.user_state(address),
+                                 max_attempts=2, initial_delay=1.0,
+                                 label=f"sync-confirm u{user_id}"))
+            for p in (state2 or {}).get("assetPositions", []):
+                pos2 = p.get("position", {})
+                coin2 = pos2.get("coin")
+                try:
+                    sz2 = abs(float(pos2.get("szi", 0) or 0))
+                except (TypeError, ValueError):
+                    sz2 = 0.0
+                if coin2 and sz2 > 0:
+                    hl_positions[coin2] = sz2
+        except Exception as e:
+            strikes_allowed = False
+            log.warning("position-sync confirm-read failed user %d: %s — keine Strikes diese Runde",
+                        user_id, e)
+
+    # 2026-06-12 (Review #1): resting-Rows mit real existierender HL-Position =
+    # Limit-Order hat gefüllt, aber kein Fill-Watcher hat sie auf 'open' geflippt
+    # (Watcher starb z.B. beim Deploy-Restart). Grace-Periode: erst handeln, wenn
+    # sicher KEIN Watcher mehr leben kann (updated_at älter als Watcher-Lifetime),
+    # sonst Doppel-Schutz-Race gegen den lebenden Watcher.
+    grace = datetime.timedelta(
+        seconds=int(getattr(config, "ENTRY_FILL_TIMEOUT_S", 300)) + 2 * SYNC_INTERVAL_S)
+    now = datetime.datetime.utcnow()
+    filled_resting = [
+        (mt_id, coin) for (mt_id, coin, updated_at) in resting_rows
+        if coin in hl_positions and (updated_at is None or now - updated_at > grace)
+    ]
+
     # Jede open managed_trade prüfen
     db = SessionLocal()
+    flipped_coins = []   # LOW-5: Coins, deren Row hier auf 'closed' geflippt wurde
     try:
         closed_count = 0
+        reopened_count = 0
+        for mt_id, coin in filled_resting:
+            mt = db.get(ManagedTrade, mt_id)
+            if mt is None or mt.status != "resting":
+                continue
+            mt.status = "open"
+            db.add(Activity(
+                user_id=user_id,
+                kind="error",
+                text=(f"{coin}: ruhender Limit-Entry wurde OHNE aktiven Fill-Watcher gefüllt "
+                      f"(HL-Position da, managed_trade id={mt_id}) — Row auf 'open'; "
+                      f"Coverage-Reconciler legt fehlenden Schutz automatisch nach."),
+            ))
+            reopened_count += 1
+        if not strikes_allowed:
+            if reopened_count > 0:
+                db.commit()
+            return
         for mt_id, coin in open_coins:
             mt = db.get(ManagedTrade, mt_id)
             if mt is None or mt.status == "closed":
@@ -163,9 +255,53 @@ async def _reconcile_one_user(user_id: int, address: str):
             ))
             _stale_counter.pop(key, None)
             closed_count += 1
-        if closed_count > 0:
+            flipped_coins.append(coin)
+        if closed_count > 0 or reopened_count > 0:
             db.commit()
-            log.info("position-sync user=%d: %d stale managed_trade(s) auf 'closed' geflippt",
-                     user_id, closed_count)
+            log.info("position-sync user=%d: %d stale auf 'closed', %d resting auf 'open' geflippt",
+                     user_id, closed_count, reopened_count)
     finally:
         db.close()
+
+    # LOW-5 (2026-06-12): verwaiste TP/SL-Trigger-Orders der geflippten Coins
+    # auf HL canceln. Best-effort NACH dem Commit — ein Cancel-Fehler ändert
+    # nichts am (korrekten) Flip; der nächste NEW_TRADE sweept dann wie bisher.
+    for coin in flipped_coins:
+        await _cancel_leftover_orders(user_id, coin)
+
+
+async def _cancel_leftover_orders(user_id: int, coin: str):
+    """LOW-5 (2026-06-12): TP/SL-Trigger-Orders eines gerade auf 'closed'
+    geflippten Coins von HL räumen. Braucht (anders als der Read-Pfad oben)
+    den vollen Trader, weil cancel eine SIGNIERTE Exchange-Action ist →
+    engine._build_trader (lazy import, wie engine selbst clear_strikes lazy
+    importiert — kein Modul-Zyklus).
+
+    Race-Schutz: läuft unter engine._lock_for(user, coin) — dasselbe Lock wie
+    alle Trade-Pfade — und re-checkt NACH Lock-Erwerb, ob inzwischen ein neues
+    Signal eine nicht-geschlossene managed_trade-Row angelegt hat. Wenn ja:
+    Finger weg, sonst würden wir die frischen Entry-/Schutz-Orders des neuen
+    Trades wegräumen. Best-effort: jeder Fehler wird nur geloggt, der Flip
+    bleibt gültig (Fallback = NEW_TRADE-Sweep wie vor diesem Fix)."""
+    try:
+        from app.engine import _build_trader, _get_user, _lock_for
+        u = _get_user(user_id)
+        if u is None or not u.hl_api_secret_enc:
+            return
+        async with _lock_for(user_id, coin):
+            db = SessionLocal()
+            try:
+                live = (db.query(ManagedTrade)
+                        .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                                ManagedTrade.status != "closed").first())
+            finally:
+                db.close()
+            if live is not None:
+                return  # neues Signal hat den Coin schon übernommen — nicht anfassen
+            trader = await _build_trader(u)
+            n = await asyncio.to_thread(trader.cancel_orders, coin)
+            if n:
+                log.info("position-sync user=%d coin=%s: %d verwaiste Order(s) nach Flip gecancelt",
+                         user_id, coin, n)
+    except Exception as e:
+        log.warning("leftover-order-cancel user=%d coin=%s failed: %s", user_id, coin, e)

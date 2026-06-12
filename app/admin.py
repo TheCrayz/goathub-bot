@@ -12,8 +12,10 @@ Nur erreichbar für User.is_admin == True (sonst 403).
 import datetime
 import logging
 import os
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app import config
@@ -21,6 +23,14 @@ from app.auth import current_user
 from app.crypto import decrypt
 from app.db import SessionLocal, get_db
 from app.models import Activity, ManagedTrade, User
+
+# 2026-06-12 H-C: derselbe slowapi-Limiter wie in main.py (gleiches Pattern
+# wie alle anderen rate-limited Routes, gleiche _client_ip-Key-Func).
+# Zirkular-sicher: main.py definiert `limiter` VOR `from app.admin import
+# router` — beim normalen Import-Pfad (uvicorn/Tests laden app.main) ist er
+# hier also schon da. app.admin deshalb NIE direkt vor app.main importieren
+# (macht aktuell auch niemand — einziger Importer ist main.py selbst).
+from app.main import limiter
 
 log = logging.getLogger("goathub.admin")
 
@@ -34,7 +44,10 @@ def current_admin_user(u: User = Depends(current_user)) -> User:
     return u
 
 
-def _key_len(enc: str | None) -> int:
+# 2026-06-12 Py3.9-Kompat: PEP-604-Unions (str | None) werden auf 3.9 schon
+# beim Funktions-Def ausgewertet → TypeError beim Import (lokales venv ist
+# 3.9; Server-Python neuer). Optional[...] ist runtime-identisch.
+def _key_len(enc: Optional[str]) -> int:
     """Decrypted-Key-Länge (66 = ok, 42 = Adresse-statt-Key, 0 = leer)."""
     if not enc:
         return 0
@@ -194,8 +207,8 @@ def admin_halt_clear(admin: User = Depends(current_admin_user), db: Session = De
 @router.get("/activity")
 def admin_activity(
     limit: int = 100,
-    kind: str | None = None,
-    user_id: int | None = None,
+    kind: Optional[str] = None,
+    user_id: Optional[int] = None,
     db: Session = Depends(get_db),
     _: User = Depends(current_admin_user),
 ):
@@ -217,8 +230,8 @@ def admin_activity(
 
 @router.get("/trades")
 def admin_trades(
-    user_id: int | None = None,
-    status: str | None = None,
+    user_id: Optional[int] = None,
+    status: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db),
     _: User = Depends(current_admin_user),
@@ -266,11 +279,16 @@ def admin_cost(_: User = Depends(current_admin_user)):
     """
     import re
     import sqlite3
-    sb_db = os.getenv(
+    # 2026-06-12 CROSS-DEP: Scraper-Pfade ziehen zentral nach config.py um —
+    # defensiv via getattr lesen (funktioniert mit UND ohne den config-Change;
+    # config.SIGNALBOT_LOG_PATH existiert schon, ist aber per Default leer).
+    # Fallback bleibt env-Read + bisheriges Docker-Volume-Literal, damit das
+    # Cost-Dashboard auf dem TradingHub-Host weiter funktioniert.
+    sb_db = getattr(config, "SIGNALBOT_DB_PATH", None) or os.getenv(
         "SIGNALBOT_DB_PATH",
         "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/charthub.db",
     )
-    sb_log = os.getenv(
+    sb_log = getattr(config, "SIGNALBOT_LOG_PATH", None) or os.getenv(
         "SIGNALBOT_LOG_PATH",
         "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/logs/bot.log",
     )
@@ -473,10 +491,59 @@ def admin_per_coin(_: User = Depends(current_admin_user), db: Session = Depends(
     }
 
 
+# 2026-06-12 #33: Pydantic-Modell statt rohem dict. Vorher gingen entry=0,
+# negative Preise, SL auf der falschen Seite des Entries oder direction="YOLO"
+# ungeprüft durch str() in den synthetischen Embed → handle_signal → echte
+# Orders auf ALLEN bot_active-Accounts. Ein vertippter Admin-curl reichte.
+class TestSignalTP(BaseModel):
+    price: float = Field(gt=0)
+    percent: float = Field(default=100, gt=0, le=100)
+
+
+class TestSignalIn(BaseModel):
+    type: Literal["NEW_TRADE", "UPDATE_TRADE", "CANCEL_TRADE"] = "NEW_TRADE"
+    asset: str = Field(pattern=r"^[A-Z0-9]{1,12}/[A-Z0-9]{2,8}$")   # z.B. SOL/USDT
+    direction: Literal["LONG", "SHORT"] = "LONG"
+    entry: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, gt=0)
+    take_profits: List[TestSignalTP] = []
+    signal_id: Optional[str] = Field(None, max_length=64, pattern=r"^[A-Za-z0-9._\-]+$")
+    confidence: float = Field(0.90, ge=0, le=1)
+    # 2026-06-12 H-C: explizites Opt-in — ohne "confirm": true wird NICHTS
+    # dispatched (Schutz gegen vertippte/halbfertige curl-Calls; der Endpoint
+    # löst echte Trades auf JEDEM bot_active-Account aus). Check sitzt im
+    # Endpoint (400 mit klarer Message statt 422-Validation-Sammelfehler).
+    confirm: bool = False
+
+    @field_validator("type", "asset", "direction", mode="before")
+    @classmethod
+    def _upper(cls, v):
+        # Backward-Compat: bisher hat der Endpoint .upper() gemacht —
+        # lowercase-Eingaben ("long", "sol/usdt") weiter akzeptieren.
+        return v.strip().upper() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _cross_checks(self):
+        if self.type == "NEW_TRADE":
+            # Ein NEW_TRADE ohne Entry/SL würde ungeschützte Orders erzeugen.
+            if self.entry is None or self.stop_loss is None:
+                raise ValueError("NEW_TRADE requires entry and stop_loss (> 0)")
+            # SL auf der richtigen Seite — nur für NEW_TRADE prüfen:
+            # UPDATE_TRADE darf den SL über den Entry ziehen (Break-Even-Lock).
+            if self.direction == "LONG" and self.stop_loss >= self.entry:
+                raise ValueError("LONG: stop_loss must be BELOW entry")
+            if self.direction == "SHORT" and self.stop_loss <= self.entry:
+                raise ValueError("SHORT: stop_loss must be ABOVE entry")
+        return self
+
+
 @router.post("/test-signal")
+@limiter.limit("3/minute")
 async def admin_test_signal(
-    body: dict,
-    _: User = Depends(current_admin_user),
+    request: Request,
+    body: TestSignalIn,
+    admin: User = Depends(current_admin_user),
+    db: Session = Depends(get_db),
 ):
     """2026-06-05: Manuelles Test-Signal direkt durch die Engine schicken,
     ohne auf den signal-bot's 60min-Cycle oder Discord-Channel zu warten.
@@ -490,31 +557,57 @@ async def admin_test_signal(
         "stop_loss": 135,
         "take_profits": [{"price":150,"percent":50}, {"price":160,"percent":50}],
         "signal_id": "manual-test-001",       # optional, sonst auto-gen
-        "confidence": 0.85                    # optional, default = MIN_CONFIDENCE
+        "confidence": 0.85,                   # optional, default = MIN_CONFIDENCE
+        "confirm": true                       # PFLICHT — sonst 400 (H-C)
       }
 
     Baut einen synthetischen Discord-Embed im Format das parser.parse_signal
     erwartet (title, fields) und ruft handle_signal direkt — alle aktiven
     User mit bot_active=True bekommen das Signal, exakt wie wenn es von
     Bot 1 in #signals gekommen wäre.
+
+    2026-06-12 #33: Payload wird via TestSignalIn (oben) validiert — 422 bei
+    entry/stop_loss <= 0, falscher direction, SL auf der falschen Seite usw.
+    2026-06-12 H-C: zusätzlich (a) Pflicht-Feld confirm=true, (b) Rate-Limit
+    3/min (legitim braucht ein Admin genau 1 Dispatch), (c) Audit-Trail:
+    log.warning + Activity-Zeile mit Auslöser + komplettem Signal.
     """
+    # H-C (a): explizite Bestätigung erzwingen — ECHTE Trades auf allen Accounts.
+    if not body.confirm:
+        raise HTTPException(
+            400,
+            'This dispatches a REAL trade to every active user. '
+            'Add "confirm": true to the JSON body to proceed.')
     from app.engine import handle_signal
-    action = str(body.get("type") or "NEW_TRADE").upper()
-    asset = str(body.get("asset") or "")
-    if "/" not in asset:
-        raise HTTPException(400, "asset muss Format 'COIN/USDT' haben, z.B. 'SOL/USDT'")
-    direction = str(body.get("direction") or "LONG").upper()
-    entry = body.get("entry")
-    stop_loss = body.get("stop_loss")
-    tps = body.get("take_profits") or []
-    signal_id = str(body.get("signal_id") or f"manual-{int(datetime.datetime.utcnow().timestamp())}")
-    confidence = body.get("confidence", 0.90)
+    action = body.type
+    asset = body.asset
+    direction = body.direction
+    entry = body.entry
+    stop_loss = body.stop_loss
+    tps = [t.model_dump() for t in body.take_profits]
+    signal_id = body.signal_id or f"manual-{int(datetime.datetime.utcnow().timestamp())}"
+    confidence = body.confidence
 
     # Format take_profits zu "50% @ 150, 50% @ 160" string (parser-erwartet)
     tps_str = ", ".join(
-        f"{t.get('percent', 100)}% @ {t.get('price')}"
-        for t in tps if t.get("price")
+        f"{t.percent}% @ {t.price}"
+        for t in body.take_profits
     )
+    # H-C (c): Audit-Trail — JEDER Dispatch wird prominent geloggt (wer hat
+    # ausgelöst, was genau), BEVOR die Engine loslegt. Activity-Zeile hängt
+    # am Admin-Account und ist im Admin-Dashboard (Recent Activity) sichtbar.
+    log.warning(
+        "TEST-SIGNAL dispatch by admin %s (id=%s): %s %s %s entry=%s sl=%s tps=[%s] conf=%s signal_id=%s",
+        admin.email or admin.discord_username, admin.id, action, asset, direction,
+        entry, stop_loss, tps_str, confidence, signal_id,
+    )
+    db.add(Activity(
+        user_id=admin.id, kind="order",
+        text=(f"⚠️ TEST-SIGNAL dispatched by admin {admin.email or admin.discord_username}: "
+              f"{action} {asset} {direction} entry={entry} sl={stop_loss} "
+              f"tps=[{tps_str}] conf={confidence} id={signal_id}"),
+    ))
+    db.commit()
     # Baue synthetisches Embed im exakten Format das parser.parse_signal liest
     # 2026-06-05 fix: parser erwartet field-names MIT SPACE ('stop loss', 'take profits'),
     # nicht underscore. Vorher: parse_signal → None → silent skip in handle_signal.
@@ -562,8 +655,9 @@ def admin_health(_: User = Depends(current_admin_user)):
         },
         "signalbot": {"reachable": False, "last_cycle_summary": None, "error": None},
     }
-    # Signal-bot DB ist in einem Docker-Volume — Pfad aus env oder Default
-    sb_db_path = os.getenv(
+    # Signal-bot DB ist in einem Docker-Volume — Pfad aus config (CROSS-DEP,
+    # defensiv via getattr), sonst env, sonst bisheriges Literal.
+    sb_db_path = getattr(config, "SIGNALBOT_DB_PATH", None) or os.getenv(
         "SIGNALBOT_DB_PATH",
         "/var/lib/docker/volumes/tradinghub-signalbeta_signalbeta-data/_data/charthub.db",
     )

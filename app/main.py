@@ -6,46 +6,55 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import httpx
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import config
 from app.auth import (MAX_PW_BYTES, PasswordTooLongError, current_user, hash_pw,
-                      make_token, needs_rehash, verify_pw, _user_identity)
+                      make_token, needs_rehash, request_token_payload, verify_pw,
+                      _user_identity)
 from app.db import get_db, init_db
-from app.models import Activity, User
+from app.models import Activity, ManagedTrade, User
 from app.schemas import Login, Register, SettingsIn, WalletIn
 from app.discord_oauth import exchange_code, get_discord_user, get_guild_member, has_required_role
 
 
-# ── Rate limiting (Phase 1, 2026-06-02, gefixt 2026-06-04) ──────────────────
+# ── Rate limiting (Phase 1, 2026-06-02, gefixt 2026-06-04 + 2026-06-12) ─────
 # 2026-06-04 KRITISCH: Rate-Limit-Bypass via X-Forwarded-For Spoofing entdeckt!
-# Vorher: erster Wert aus X-Forwarded-For — vom Client KOMPLETT kontrollierbar,
-# weil nginx append-mode ($proxy_add_x_forwarded_for) jeden Attacker-Eintrag
-# durchlässt und nur DAHINTER den echten Client appendet. 15 verschiedene Fakes
-# → 15× kein Block. Jetzt: nginx setzt X-Real-IP zum echten Client-IP — das
-# nehmen wir. Fallback: letzter Wert in X-Forwarded-For (= was nginx appendiert
-# hat = echter Client). Letzter Fallback: TCP-Peer.
+# Vorher: erster Wert aus X-Forwarded-For — vom Client KOMPLETT kontrollierbar.
+# 2026-06-12 #7: zweite Lücke geschlossen — X-Real-IP wurde von JEDEM Peer
+# akzeptiert. Solange uvicorn auf 0.0.0.0:8000 lauschte, konnte jeder, der den
+# Port direkt erreicht (am Proxy vorbei), pro Request eine frische X-Real-IP
+# erfinden → eigener Rate-Limit-Bucket pro Request → Login-Brute-Force trotz
+# 10/5min-Limit. Jetzt: Proxy-Header werden NUR vertraut, wenn der direkte
+# TCP-Peer localhost ist (= Caddy auf derselben Maschine; uvicorn wird im
+# systemd-Unit auf 127.0.0.1 gebunden). Jeder andere Peer = seine eigene IP.
+_TRUSTED_PROXY_PEERS = ("127.0.0.1", "::1")
+
+
 def _client_ip(request: Request) -> str:
-    # Primary: X-Real-IP von nginx (proxy_set_header X-Real-IP $remote_addr).
-    # nginx-config selbst kontrolliert was hier landet, nicht der Client.
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    # Fallback: letzter Wert in der XFF-Chain (nginx appendet immer als letztes).
-    # Achtung: NICHT der erste — der ist attacker-controlled wenn nginx kein
-    # XFF-Clearing macht.
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[-1].strip()
-    # Letzter Ausweg: direkte TCP-Peer-Address (bei direkt-am-Server, ohne Proxy).
-    return get_remote_address(request)
+    peer = request.client.host if request.client else None
+    if peer in _TRUSTED_PROXY_PEERS:
+        # Direkter Peer ist der lokale Reverse-Proxy (Caddy) → dessen Header
+        # sind vertrauenswürdig. Primary: X-Real-IP (proxy-kontrolliert).
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
+        # Fallback: letzter Wert in der XFF-Chain (Proxy appendet als letztes).
+        # Achtung: NICHT der erste — der ist attacker-controlled wenn der
+        # Proxy kein XFF-Clearing macht.
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[-1].strip()
+    # Kein (vertrauenswürdiger) Proxy davor → TCP-Peer zählt. Header von
+    # Nicht-localhost-Peers werden bewusst IGNORIERT (Spoofing-Schutz).
+    return peer or get_remote_address(request)
 
 
 limiter = Limiter(key_func=_client_ip)
@@ -76,7 +85,10 @@ def _set_session_cookie(response, jwt_token: str):
         path="/",
     )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# 2026-06-12 #52: %(name)s im Format — vorher konnte man in journalctl nicht
+# unterscheiden, ob eine Zeile von goathub.engine, goathub.sync, goathub.hl
+# oder goathub.listener kam (der README-Incident-Workflow braucht genau das).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("goathub")
 
 
@@ -84,22 +96,50 @@ async def _activity_purge_loop():
     """Phase 4 (2026-06-02): Activity-Tabelle TTL-purge täglich.
     Behalte 90 Tage Historie, lösche älter. Verhindert unbeschränktes Wachstum
     (aktuell ~70 rows/Tag = ~25k/Jahr; nach 5 Jahren wird's spürbar).
+
+    2026-06-12 #44: erweitert auf die drei anderen unbounded Tabellen —
+    token_usage (1 Row pro Gemini-Call, hunderte/Tag), managed_trades
+    (closed-Rows wurden NIE gelöscht) und processed_signal (1 Row pro
+    (user, signal); Dedup muss nur Restarts/Replays überleben, nicht ewig).
+    Alles vor der SQLite→Postgres-Migration relevant.
     """
     import datetime
     PURGE_KEEP_DAYS = int(os.getenv("ACTIVITY_KEEP_DAYS", "90"))
+    TOKEN_USAGE_KEEP_DAYS = int(os.getenv("TOKEN_USAGE_KEEP_DAYS", "365"))
+    CLOSED_TRADES_KEEP_DAYS = int(os.getenv("CLOSED_TRADES_KEEP_DAYS", "90"))
+    PROCESSED_SIGNAL_KEEP_DAYS = int(os.getenv("PROCESSED_SIGNAL_KEEP_DAYS", "30"))
     # Beim ersten Mal nach 60 s starten — nicht direkt beim Service-Start
     # (damit Boot-Logs nicht zugespammt werden), dann täglich.
     await asyncio.sleep(60)
     while True:
         try:
             from app.db import SessionLocal
+            from app.models import ManagedTrade, ProcessedSignal, TokenUsage
             db = SessionLocal()
             try:
-                cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=PURGE_KEEP_DAYS)
+                now = datetime.datetime.utcnow()
+                cutoff = now - datetime.timedelta(days=PURGE_KEEP_DAYS)
                 deleted = db.query(Activity).filter(Activity.ts < cutoff).delete(synchronize_session=False)
+                # 2026-06-12 #44: TTL-Purge der drei restlichen Wachstums-Tabellen.
+                del_tu = db.query(TokenUsage).filter(
+                    TokenUsage.ts < now - datetime.timedelta(days=TOKEN_USAGE_KEEP_DAYS)
+                ).delete(synchronize_session=False)
+                # Nur CLOSED Trades purgen — offene/resting Rows sind Live-State!
+                del_mt = db.query(ManagedTrade).filter(
+                    ManagedTrade.status == "closed",
+                    ManagedTrade.updated_at < now - datetime.timedelta(days=CLOSED_TRADES_KEEP_DAYS),
+                ).delete(synchronize_session=False)
+                del_ps = db.query(ProcessedSignal).filter(
+                    ProcessedSignal.created_at < now - datetime.timedelta(days=PROCESSED_SIGNAL_KEEP_DAYS)
+                ).delete(synchronize_session=False)
                 db.commit()
-                if deleted:
-                    log.info("activity-purge: %d alte Zeilen gelöscht (älter als %d Tage)", deleted, PURGE_KEEP_DAYS)
+                if deleted or del_tu or del_mt or del_ps:
+                    log.info(
+                        "ttl-purge: activity=%d (>%dd), token_usage=%d (>%dd), "
+                        "closed managed_trades=%d (>%dd), processed_signal=%d (>%dd)",
+                        deleted, PURGE_KEEP_DAYS, del_tu, TOKEN_USAGE_KEEP_DAYS,
+                        del_mt, CLOSED_TRADES_KEEP_DAYS, del_ps, PROCESSED_SIGNAL_KEEP_DAYS,
+                    )
             finally:
                 db.close()
         except Exception as e:
@@ -126,6 +166,18 @@ async def lifespan(app: FastAPI):
                     log.error("lifespan task %r crashed: %r", name, exc, exc_info=exc)
         task.add_done_callback(_on_done)
 
+    # 2026-06-12 M-10: fehlendes Discord-Rollen-Gate LAUT machen. Ohne
+    # DISCORD_GUILD_ID + DISCORD_BOT_TOKEN lässt der OAuth-Callback JEDEN
+    # Discord-Account rein (bewusst offen während der Beta) — aber das darf
+    # nicht still passieren. Zusätzlich loggt der Callback jeden einzelnen
+    # Login, der das Gate so umgangen hat.
+    if not (config.DISCORD_GUILD_ID and config.DISCORD_BOT_TOKEN):
+        log.warning(
+            "⚠️ Discord-Rollen-Gate ist AUS (DISCORD_GUILD_ID gesetzt: %s, "
+            "DISCORD_BOT_TOKEN gesetzt: %s) — JEDER Discord-Account kann sich "
+            "per OAuth einloggen, KEIN Supporter-Rollen-Check!",
+            bool(config.DISCORD_GUILD_ID), bool(config.DISCORD_BOT_TOKEN),
+        )
     if config.ENABLE_LISTENER:
         from app.discord_listener import start_listener
         t = asyncio.create_task(start_listener())
@@ -157,10 +209,16 @@ async def lifespan(app: FastAPI):
     # TOKEN_USAGE-Zeilen in unsere DB, damit Historie auch nach Log-Rotation
     # erhalten bleibt. Liest bot.log alle 5 Minuten, idempotent (skip wenn
     # ts+counts schon in DB).
-    from app.token_usage_scraper import token_usage_scrape_loop
-    t = asyncio.create_task(token_usage_scrape_loop())
-    _attach_logger(t, "token_usage_scrape_loop")
-    tasks.append(t)
+    # 2026-06-12 #54: nur noch per Opt-in (SIGNALBOT_LOG_PATH in .env). Der
+    # Loop pollte sonst in JEDEM Deployment einen fremden TradingHub-Docker-
+    # Pfad — auf Hosts ohne dieses Volume ein stiller No-Op alle 5 Minuten.
+    if config.SIGNALBOT_LOG_PATH:
+        from app.token_usage_scraper import token_usage_scrape_loop
+        t = asyncio.create_task(token_usage_scrape_loop())
+        _attach_logger(t, "token_usage_scrape_loop")
+        tasks.append(t)
+    else:
+        log.info("Token-Usage-Scraper AUS (SIGNALBOT_LOG_PATH nicht gesetzt).")
     yield
     for t in tasks:
         t.cancel()
@@ -171,7 +229,14 @@ async def lifespan(app: FastAPI):
 # leakte raus (curl https://bot.goathub.network/openapi.json → 200, voller
 # Schema-Dump). Default jetzt: aus. Wer das Schema lokal in der UI explorieren
 # will, setzt ENABLE_DOCS=true in der .env — prod bleibt zu.
-_ENABLE_DOCS = os.getenv("ENABLE_DOCS", "false").strip().lower() in ("1", "true", "yes", "on")
+# 2026-06-12 CROSS-DEP: ENABLE_DOCS zieht zentral nach config.py um —
+# defensiv via getattr lesen (funktioniert mit UND ohne den config-Change),
+# Fallback bleibt der bisherige env-Read.
+_enable_docs_raw = getattr(config, "ENABLE_DOCS", None)
+if _enable_docs_raw is None:
+    _enable_docs_raw = os.getenv("ENABLE_DOCS", "false")
+_ENABLE_DOCS = (_enable_docs_raw if isinstance(_enable_docs_raw, bool)
+                else str(_enable_docs_raw).strip().lower() in ("1", "true", "yes", "on"))
 app = FastAPI(
     title="GoatHub Trading Bot",
     lifespan=lifespan,
@@ -180,7 +245,26 @@ app = FastAPI(
     openapi_url="/openapi.json" if _ENABLE_DOCS else None,
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# 2026-06-12 #51: eigener 429-Handler. slowapi's Default liefert
+# {"error": "Rate limit exceeded: ..."} — das Frontend (dashboard.js/admin.js
+# api()) liest aber überall .detail und zeigte dem User nur die nackte "429".
+# Jetzt gleiche Shape wie alle anderen Fehler: {"detail": "..."}.
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    response = JSONResponse(
+        {"detail": f"Too many requests ({exc.detail}) — please wait a few minutes and try again."},
+        status_code=429,
+    )
+    try:
+        # Retry-After/X-RateLimit-Header beibehalten (wie slowapi's Default).
+        response = request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
+    except Exception:
+        pass
+    return response
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # Phase 3 (2026-06-02): Admin-Router. is_admin-Gate ist im Modul selbst.
 from app.admin import router as admin_router
@@ -223,9 +307,6 @@ async def _security_headers(request: Request, call_next):
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-from fastapi.responses import JSONResponse  # für Cookie-setting Response
-
-
 @app.post("/api/register")
 @limiter.limit(REGISTER_RATE_LIMIT)
 def register(request: Request, body: Register, db: Session = Depends(get_db)):
@@ -240,6 +321,20 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
         raise HTTPException(400, "Email too long (max 254 chars per RFC 5321)")
     if not EMAIL_RE.match(email):
         raise HTTPException(400, "Valid email + password (min. 6 chars) required")
+    # 2026-06-12 #21: discord_<id>@goathub.internal ist das synthetische
+    # Email-Format, das der OAuth-Callback für Discord-User anlegt. Vorher
+    # konnte jeder, der eine öffentliche Discord-ID kennt, diese Email
+    # vorab registrieren → der erste Discord-Login des Opfers knallte in den
+    # UNIQUE-Constraint → permanentes /?error=oauth_failed (gezielter
+    # Signup-DoS). Die ganze Domain ist reserviert — niemand Legitimes hat
+    # eine echte @goathub.internal-Adresse.
+    if email.endswith("@goathub.internal"):
+        raise HTTPException(400, "This email domain is reserved — please use your real email address")
+    # 2026-06-12 M-9 (defensiv): auch der discord_-Local-Part-Namespace ist
+    # reserviert, egal welche Domain dahinter steht — schützt die synthetischen
+    # OAuth-Adressen auch dann noch, falls die interne Domain mal umbenannt wird.
+    if email.split("@", 1)[0].startswith("discord_"):
+        raise HTTPException(400, "Email addresses starting with 'discord_' are reserved — please use your real email address")
     if len(body.password) < 6:
         raise HTTPException(400, "Valid email + password (min. 6 chars) required")
     # Mit BCrypt-v2 (Restposten #3) ist 72-byte Limit weg, aber wir limitieren
@@ -264,12 +359,45 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
     return response
 
 
+# 2026-06-12 LOW-7: Per-ACCOUNT-Lockout zusätzlich zum per-IP-Rate-Limit.
+# Das IP-Limit allein reicht nicht: wer den Port direkt erreicht oder viele
+# IPs hat, verteilt den Brute-Force — der Account selbst blieb unbegrenzt
+# angreifbar. Jetzt: >= FAILED_LOGIN_MAX FEHLGESCHLAGENE Versuche in Folge
+# sperren den Account für FAILED_LOGIN_LOCK_S (auch mit richtigem Passwort),
+# erfolgreicher Login setzt den Zähler zurück. In-Memory-Dict reicht
+# (Single-Process-Deployment, gleiche Klasse wie _snapshot_cache).
+_failed_logins: dict = {}    # email → {"fails": int, "locked_until": epoch-s}
+FAILED_LOGIN_MAX = 5
+FAILED_LOGIN_LOCK_S = 15 * 60
+
+
 @app.post("/api/login")
 @limiter.limit(LOGIN_RATE_LIMIT)
 def login(request: Request, body: Login, db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.email == body.email.strip().lower()).first()
+    email = body.email.strip().lower()
+    now = _time.time()
+    rec = _failed_logins.get(email)
+    if rec and rec.get("locked_until", 0) > now:
+        wait_min = int((rec["locked_until"] - now) // 60) + 1
+        raise HTTPException(
+            429, f"Account temporarily locked after too many failed logins — "
+                 f"try again in {wait_min} min")
+    u = db.query(User).filter(User.email == email).first()
     if not u or not verify_pw(body.password, u.password_hash):
+        rec = _failed_logins.setdefault(email, {"fails": 0, "locked_until": 0})
+        rec["fails"] += 1
+        if rec["fails"] >= FAILED_LOGIN_MAX:
+            rec["locked_until"] = now + FAILED_LOGIN_LOCK_S
+            rec["fails"] = 0
+            log.warning("login lockout: account %r für %ds gesperrt nach %d Fehlversuchen in Folge",
+                        email, FAILED_LOGIN_LOCK_S, FAILED_LOGIN_MAX)
+        # Speicher-Guard gegen Email-Spray: abgelaufene Einträge rauswerfen.
+        if len(_failed_logins) > 5000:
+            for k in [k for k, v in _failed_logins.items()
+                      if v.get("locked_until", 0) < now and k != email]:
+                _failed_logins.pop(k, None)
         raise HTTPException(401, "Wrong email or password")
+    _failed_logins.pop(email, None)   # Erfolg → Zähler/Lock zurücksetzen
     # 2026-06-04 Restposten #3: transparente Migration legacy → v2 (SHA256+bcrypt).
     # Wir haben das Plain-PW gerade verifiziert und im Speicher, also können
     # wir den Hash sofort upgraden. User merkt nichts.
@@ -302,13 +430,28 @@ def logout(u: User = Depends(current_user), db: Session = Depends(get_db)):
 # JWT_EXPIRE_HOURS ist auf 24h gekürzt (statt 168h = 7d). Dashboard pollt
 # diesen Endpoint alle paar Stunden, bekommt einen neuen JWT mit frischem
 # exp. Solange der aktuelle noch valid + < 1h vor expiry, wird refreshed.
+# 2026-06-12 LOW-8: absolute Session-Lebensdauer. Vorher konnte eine Session
+# via /api/refresh UNBEGRENZT verlängert werden (alle 12h ein frischer JWT).
+SESSION_ABS_LIFETIME_S = 30 * 24 * 3600   # 30 Tage
+
+
 @app.post("/api/refresh")
 @limiter.limit("60/minute")
 def refresh_token(request: Request, u: User = Depends(current_user)):
     """Mintet einen neuen JWT für den aktuellen User. Voraussetzung: alter
     JWT noch valid (current_user dependency erfüllt) — bei expired wird's
-    durch current_user ohnehin 401."""
-    new_tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
+    durch current_user ohnehin 401.
+
+    2026-06-12 LOW-8: orig_iat (Zeitpunkt des ECHTEN Logins) wird beim
+    Refresh weitergereicht statt neu gesetzt; ist die Session älter als
+    SESSION_ABS_LIFETIME_S, gibt's keinen neuen Token mehr → neu einloggen.
+    Alt-Tokens ohne orig_iat-Claim nutzen ihr iat (backward-kompatibel)."""
+    payload = request_token_payload(request)
+    orig_iat = int(payload.get("orig_iat") or payload.get("iat") or 0)
+    if orig_iat and _time.time() - orig_iat > SESSION_ABS_LIFETIME_S:
+        raise HTTPException(401, "Session maximum age (30 days) reached — please log in again")
+    new_tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u),
+                         orig_iat=orig_iat or None)
     response = JSONResponse({"access_token": new_tok, "token_type": "bearer"})
     _set_session_cookie(response, new_tok)
     return response
@@ -381,6 +524,16 @@ async def discord_callback(request: Request, code: str = None, state: str = None
                 resp = RedirectResponse("/?error=no_role")
                 resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
                 return resp
+        else:
+            # 2026-06-12 M-10: Gate nicht konfiguriert → Login bewusst offen
+            # (Beta-Entscheidung), aber jeder Bypass wird EINZELN geloggt,
+            # damit das nie wieder still passiert (plus Startup-Warnung in
+            # lifespan).
+            log.warning(
+                "Discord-Login OHNE Rollen-Gate durchgelassen: discord_id=%s "
+                "username=%r (DISCORD_GUILD_ID/DISCORD_BOT_TOKEN nicht konfiguriert)",
+                discord_id, username,
+            )
 
         # Find or create user by discord_id
         u = db.query(User).filter(User.discord_id == discord_id).first()
@@ -405,12 +558,14 @@ async def discord_callback(request: Request, code: str = None, state: str = None
             db.commit()
 
         jwt_token = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
-        # Phase 2 #18 (2026-06-02): NEUE Strategie — Session-Cookie (httpOnly).
-        # Das URL-Fragment-Token bleibt zusätzlich für Backward-Compat erhalten,
-        # aber das Dashboard wird's nicht mehr in localStorage stecken — der
-        # XSS-Exfil-Vektor ist damit zu. Wenn beide Pfade aktiv sind, gewinnt
-        # das Cookie in `current_user` (cookie-first).
-        resp = RedirectResponse(f"/#token={jwt_token}")
+        # Phase 2 #18 (2026-06-02): Session-Cookie (httpOnly) ist DER Auth-Weg.
+        # 2026-06-12 #20/#31: das Legacy-URL-Fragment (/#token=…) ist raus.
+        # Das Dashboard-JS verwirft das Fragment seit Phase 2 ohnehin — übrig
+        # blieb nur, dass ein 24h-gültiger JWT in der Browser-History landete
+        # (inkl. Cross-Device-Sync) und via location.hash für jedes Script
+        # lesbar war. Das Cookie wird auf DIESER Response gesetzt, plain "/"
+        # reicht.
+        resp = RedirectResponse("/")
         _set_session_cookie(resp, jwt_token)
         resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
         return resp
@@ -446,8 +601,18 @@ def me(u: User = Depends(current_user)):
     return _user_public(u)
 
 
+# 2026-06-12 #25: Response-Cache pro Adresse. Ein cold-cache Request löste
+# 16 sequenzielle user_fills-Downloads (kompletter, identischer Fill-History
+# pro Coin) gegen die HL-Info-API aus — und der Endpoint hatte als einziger
+# KEIN Rate-Limit. Ein einzelner pollender User konnte damit die Server-IP
+# in HL's Rate-Limit treiben (trifft ALLE User). TTL = PERCOIN_CACHE_TTL_S
+# (gleicher Wert wie der (addr, coin)-Cache in engine._per_coin_stats).
+_percoin_status_cache: dict = {}    # address → (timestamp, response_dict)
+
+
 @app.get("/api/per-coin-status")
-def per_coin_status(u: User = Depends(current_user)):
+@limiter.limit("30/minute")
+def per_coin_status(request: Request, u: User = Depends(current_user)):
     """Per-coin filter status für DEN AKTUELLEN USER.
 
     2026-06-04: Tester sehen jetzt direkt im Dashboard warum ein Coin
@@ -458,6 +623,9 @@ def per_coin_status(u: User = Depends(current_user)):
     if not u.hl_account_address:
         return {"connected": False, "min_trades_required": config.PERCOIN_MIN_TRADES,
                 "min_winrate": config.PERCOIN_MIN_WINRATE, "coins": []}
+    cached = _percoin_status_cache.get(u.hl_account_address)
+    if cached and _time.time() - cached[0] < config.PERCOIN_CACHE_TTL_S:
+        return cached[1]
     from app.engine import _per_coin_stats
     common = ["BTC", "ETH", "SOL", "BNB", "AVAX", "DOGE", "ADA", "NEAR", "ATOM",
               "APT", "ARB", "OP", "TIA", "SUI", "INJ", "AAVE"]
@@ -481,12 +649,14 @@ def per_coin_status(u: User = Depends(current_user)):
             })
     # Sort: blocked first (warnt User), dann nach trades desc
     coins_out.sort(key=lambda c: (not c["blocked"], -c["trades"]))
-    return {
+    result = {
         "connected": True,
         "min_trades_required": config.PERCOIN_MIN_TRADES,
         "min_winrate": config.PERCOIN_MIN_WINRATE,
         "coins": coins_out,
     }
+    _percoin_status_cache[u.hl_account_address] = (_time.time(), result)
+    return result
 
 
 # ── Settings & Wallet ────────────────────────────────────────────────────────
@@ -496,25 +666,40 @@ def per_coin_status(u: User = Depends(current_user)):
 @app.put("/api/settings")
 @limiter.limit("60/minute")
 def update_settings(request: Request, body: SettingsIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
+    # 2026-06-12 #12/#13: REJECT statt Silent-Clamp/Coerce.
+    # (a) Bounds-Verletzungen (z.B. risk_pct=1.0 — User meinte "1 %", API
+    #     erwartet FRACTION 0.01) werden jetzt von pydantic (SettingsIn,
+    #     schemas.py) mit 422 abgelehnt — vorher clampte der Code still auf
+    #     0.05 = 5 %/Trade und das Frontend zeigte weiter "Saved ✓".
+    # (b) Explizit mitgeschicktes null → 422. Vorher coercte das Frontend
+    #     leere Felder zu 0 — ein geleertes Capital-Cap-Feld hob still den
+    #     kompletten Geld-Cap auf. Partial-Updates (Feld WEGLASSEN) bleiben
+    #     erlaubt — der bot_active-Toggle schickt weiter nur {bot_active}.
+    _MUTABLE = ("risk_pct", "leverage", "max_open_positions",
+                "capital_cap_usdc", "bot_active", "max_drawdown_pct")
+    for fname in _MUTABLE:
+        if fname in body.model_fields_set and getattr(body, fname) is None:
+            raise HTTPException(
+                422, f"{fname} must not be null — omit the field to keep the current value")
     if body.risk_pct is not None:
-        u.risk_pct = max(0.001, min(0.05, body.risk_pct))   # max 5% Risiko/Trade (war 50%)
+        u.risk_pct = body.risk_pct          # FRACTION, (0, 0.05] via Schema erzwungen
     if body.leverage is not None:
         # 2026-06-06: leverage = USER-MAX-CAP für Auto-Leverage.
         # Bot rechnet pro Trade aus SL+Confidence den optimalen Hebel, gecappt
         # an diesem Wert. 50 = HL Perps Max. Niedrigere Werte = User will
         # konservativer fahren (z.B. 10x als persönliches Maximum).
-        u.leverage = max(1, min(50, body.leverage))
+        u.leverage = body.leverage           # [1, 50] via Schema erzwungen
     if body.max_open_positions is not None:
-        u.max_open_positions = max(1, min(50, body.max_open_positions))
+        u.max_open_positions = body.max_open_positions   # [1, 20] via Schema erzwungen
     if body.capital_cap_usdc is not None:
-        u.capital_cap_usdc = max(0, body.capital_cap_usdc)     # 0 = ganzer Account
+        u.capital_cap_usdc = body.capital_cap_usdc       # [0, 10M] via Schema; 0 = ganzer Account
     if body.bot_active is not None:
         if body.bot_active and not u.hl_api_secret_enc:
             raise HTTPException(400, "Connect your wallet before activating the bot")
         u.bot_active = body.bot_active
     if body.max_drawdown_pct is not None:
         # 2026-06-08 C1: 0 = disabled, max 0.95 (95% drawdown cap)
-        u.max_drawdown_pct = max(0.0, min(0.95, body.max_drawdown_pct))
+        u.max_drawdown_pct = body.max_drawdown_pct       # [0, 0.95] via Schema erzwungen
     db.commit()
     return _user_public(u)
 
@@ -523,11 +708,17 @@ def update_settings(request: Request, body: SettingsIn, u: User = Depends(curren
 @limiter.limit("60/minute")
 def set_wallet(request: Request, body: WalletIn, u: User = Depends(current_user), db: Session = Depends(get_db)):
     from app.crypto import encrypt
+    import re
     addr = body.hl_account_address.strip()
     sec = body.hl_api_secret.strip()
-    # MASTER-Adresse: 0x + 40 Hex = 42 Zeichen
-    if not addr.startswith("0x") or len(addr) != 42:
-        raise HTTPException(400, "MASTER address must be 0x + 40 chars (42 total). That's the public address, not the key.")
+    # MASTER-Adresse: 0x + 40 HEX = 42 Zeichen.
+    # 2026-06-12 #34: volle Hex-Validierung statt nur Prefix+Länge. Vorher
+    # passierte "0xZZZZ…" (42 Zeichen, kein Hex) die Prüfung und wurde
+    # gespeichert → jeder info.user_state(addr)-Call scheiterte → Dashboard
+    # ohne Balance, Bot tradet nie, User sieht keinen Fehler (gleiche
+    # Silent-Broken-Account-Klasse wie das Adresse-im-Key-Feld-Problem).
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", addr):
+        raise HTTPException(400, "MASTER address must be 0x + 40 hex chars (42 total). That's the public address, not the key.")
     # Agent-Key SOFORT validieren (sonst scheitert es erst beim Trade — der häufigste Fehler!)
     try:
         from eth_account import Account
@@ -536,6 +727,14 @@ def set_wallet(request: Request, body: WalletIn, u: User = Depends(current_user)
         raise HTTPException(400, "Invalid Agent key. It must be the long private key (0x + 64 chars = 66 total) — NOT an address.")
     if agent_addr.lower() == addr.lower():
         raise HTTPException(400, "This key belongs to the MASTER address. You need the separate AGENT key (from the API-wallet 'Generate' box).")
+    # 2026-06-12 M-13: Wallet-Wechsel invalidiert das Builder-Approval — das
+    # Approval ist ON-CHAIN an die ALTE Master-Adresse gebunden. Vorher blieb
+    # das Flag stehen → Engine hängte den Builder-Code an, HL lehnte JEDE
+    # Order ab ("Builder fee has not been approved") → User verpasste still
+    # alle Entries. Gleiche Adresse erneut speichern (Key-Rotation) behält
+    # das Flag.
+    if (u.hl_account_address or "").lower() != addr.lower():
+        u.builder_approved = False
     u.hl_account_address = addr
     u.hl_api_secret_enc = encrypt(sec)
     db.commit()
@@ -599,7 +798,9 @@ class BuilderApprovalSubmit(BaseModel):
 
 
 @app.post("/api/builder-approval-submit")
+@limiter.limit("10/minute")
 def submit_builder_approval(
+    request: Request,
     body: BuilderApprovalSubmit,
     u: User = Depends(current_user),
     db: Session = Depends(get_db),
@@ -610,15 +811,44 @@ def submit_builder_approval(
     Frontend builds the EIP-712 payload, asks MetaMask to sign, gives us
     {action, signature, nonce}. We just relay to HL — HL itself validates
     that the signature comes from the user's master address.
+
+    2026-06-12 #32/#42 Hardening:
+    - action.type MUSS "approveBuilderFee" sein. Vorher war der Endpoint ein
+      generisches Relay für JEDE user-signierte Exchange-Action über unsere IP.
+    - maxFeeRate darf BUILDER_FEE nicht überschreiten — wir relayen keine
+      Approval für mehr Fee als wir konfiguriert verlangen.
+    - builder_approved wird AUSSCHLIESSLICH gesetzt, wenn die On-Chain-
+      Verifikation approved_bps >= required_bps bestätigt. Vorher wurde der
+      Flag auch bei Verify-Fail gesetzt → exakt der Trust-me-Flag-Bug
+      (README Known issue #3), den der Endpoint beheben sollte: Engine hängt
+      den Builder-Code an, HL lehnt jede Order ab, User verpasst still alle
+      Entries.
+    - Rate-Limit 10/min: relayed an HL /exchange + macht einen blocking
+      Verify-Roundtrip — braucht ein User legitim genau 1x.
     """
     if not config.BUILDER_ADDRESS:
         raise HTTPException(400, "Server has no BUILDER_ADDRESS configured")
     if not u.hl_account_address:
         raise HTTPException(400, "Connect your wallet first")
+    from app.hyperliquid_exec import fee_to_int
+    # Sanity: nur approveBuilderFee-Actions werden relayed
+    action_type = str(body.action.get("type", ""))
+    if action_type != "approveBuilderFee":
+        raise HTTPException(400, f"action.type must be 'approveBuilderFee' (got {action_type[:32]!r})")
     # Sanity: action.builder must match our configured BUILDER_ADDRESS
     action_builder = str(body.action.get("builder", "")).lower()
     if action_builder != config.BUILDER_ADDRESS.lower():
         raise HTTPException(400, f"action.builder mismatch (got {action_builder[:10]}…, expected our builder)")
+    # Sanity: maxFeeRate <= konfigurierte BUILDER_FEE (fee_to_int raised bei >0.1%)
+    try:
+        required_bps = fee_to_int(config.BUILDER_FEE)
+        submitted_bps = fee_to_int(body.action.get("maxFeeRate"))
+    except ValueError as e:
+        raise HTTPException(400, f"Invalid maxFeeRate: {e}")
+    if submitted_bps > required_bps:
+        raise HTTPException(
+            400, f"maxFeeRate too high (got {submitted_bps} bps, our configured fee is "
+                 f"{required_bps} bps = {config.BUILDER_FEE}) — refusing to relay")
     # POST to HL /exchange
     import httpx
     hl_url = (
@@ -641,21 +871,25 @@ def submit_builder_approval(
     import time
     time.sleep(1)
     try:
-        from app.hyperliquid_exec import fee_to_int
         approved_bps = _query_on_chain_builder_fee(u.hl_account_address, config.BUILDER_ADDRESS)
-        required_bps = fee_to_int(config.BUILDER_FEE)
     except Exception as e:
-        # HL said ok but on-chain query failed → trust HL, mark approved anyway
+        # 2026-06-12 #32: HL hat die Submission akzeptiert, aber wir KONNTEN
+        # nicht verifizieren → Flag NICHT setzen. User klickt "confirm"
+        # (/api/builder-approved) erneut, sobald die Info-API antwortet.
         log.warning("post-submit verify failed (HL said ok): %s", e)
-        u.builder_approved = True
-        db.commit()
-        return {"ok": True, "hl_response": hl_resp, "verify_warning": str(e)[:120]}
+        return {"ok": False, "pending": True, "hl_response": hl_resp,
+                "detail": "HL accepted the approval, but on-chain verification is unavailable — "
+                          "please retry the confirm step in a moment.",
+                "verify_warning": str(e)[:120]}
     if approved_bps < required_bps:
-        log.warning("HL said ok but maxBuilderFee=%d < required %d — race condition?", approved_bps, required_bps)
-        # Still set the flag — HL clearly accepted; verify might just be slow
-        u.builder_approved = True
-        db.commit()
-        return {"ok": True, "hl_response": hl_resp, "approved_bps": approved_bps, "note": "Verify lagging — HL accepted submission"}
+        # 2026-06-12 #32: Verifikation sagt NICHT genug bps → Flag NICHT
+        # setzen (vorher: gesetzt trotz Fail = Orders würden auf Mainnet
+        # abgelehnt). Kann eine lahme HL-Cache-Propagation sein → retry.
+        log.warning("HL said ok but maxBuilderFee=%d < required %d — not setting builder_approved", approved_bps, required_bps)
+        return {"ok": False, "pending": True, "hl_response": hl_resp,
+                "approved_bps": approved_bps, "required_bps": required_bps,
+                "detail": "Verification pending — on-chain approval not visible yet. "
+                          "Please retry the confirm step in a moment."}
     u.builder_approved = True
     db.commit()
     return {"ok": True, "hl_response": hl_resp, "approved_bps": approved_bps, "required_bps": required_bps}
@@ -729,6 +963,13 @@ def _snapshot(address: str):
                 bal += float(b.get("total", 0) or 0) - float(b.get("hold", 0) or 0)
     except Exception:
         pass
+    def _opt_float(v):
+        """None/"" → None, sonst float — HL liefert Zahlen als Strings."""
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
     positions = []
     unrealized_total = 0.0
     exposure_total = 0.0
@@ -738,8 +979,22 @@ def _snapshot(address: str):
             size = float(pos.get("szi", 0) or 0)
             entry = float(pos.get("entryPx", 0) or 0)
             upnl = float(pos.get("unrealizedPnl", 0) or 0)
+            # 2026-06-12 Dashboard-Extension: leverage/liq/mark/margin pro
+            # Position durchreichen (Frontend-Kontrakt; alle float|null).
+            lev_raw = pos.get("leverage")
+            leverage = _opt_float(lev_raw.get("value")) if isinstance(lev_raw, dict) else _opt_float(lev_raw)
+            mark_px = _opt_float(pos.get("markPx"))
+            if mark_px is None:
+                # markPx fehlt in manchen user_state-Antworten → aus
+                # positionValue/|szi| ableiten (gleiche Definition).
+                pos_val = _opt_float(pos.get("positionValue"))
+                mark_px = (pos_val / abs(size)) if (pos_val is not None and size) else None
             positions.append({"coin": pos.get("coin"), "size": pos.get("szi"),
-                              "entry": pos.get("entryPx"), "uPnl": pos.get("unrealizedPnl")})
+                              "entry": pos.get("entryPx"), "uPnl": pos.get("unrealizedPnl"),
+                              "leverage": leverage,
+                              "liquidation_px": _opt_float(pos.get("liquidationPx")),
+                              "mark_px": mark_px,
+                              "margin_used": _opt_float(pos.get("marginUsed"))})
             unrealized_total += upnl
             exposure_total += abs(size * entry)
     # PnL-Statistik aus realisierten Fills (Total PnL, Win-Rate, Verlauf, History)
@@ -826,12 +1081,28 @@ def _demo_dashboard(u):
     for i in range(30):
         cum += _r.uniform(-18, 28)
         series.append({"t": now_ms - (29 - i) * 86400000, "cum": round(cum, 2)})
+    # 2026-06-12 Dashboard-Extension: Demo-Positionen tragen jetzt dieselben
+    # Felder wie der Live-Pfad (leverage/liquidation_px/mark_px/margin_used/
+    # stop_loss/take_profits) — damit das Frontend ohne HL-Anbindung demobar ist.
     positions = [
-        {"coin": "BTC", "size": "0.085", "entry": "61767.0", "uPnl": "42.10"},
-        {"coin": "ETH", "size": "-0.73", "entry": "1691.1", "uPnl": "24.30"},
-        {"coin": "SOL", "size": "-14.4", "entry": "64.53", "uPnl": "15.80"},
-        {"coin": "SUI", "size": "-2624", "entry": "0.7653", "uPnl": "65.20"},
-        {"coin": "DOGE", "size": "-4072", "entry": "0.0867", "uPnl": "-8.40"},
+        {"coin": "BTC", "size": "0.085", "entry": "61767.0", "uPnl": "42.10",
+         "leverage": 10.0, "liquidation_px": 56210.0, "mark_px": 62262.4, "margin_used": 529.2,
+         "stop_loss": 60100.0, "take_profits": [{"price": 63500.0, "percent": 50.0},
+                                                {"price": 65800.0, "percent": 50.0}]},
+        {"coin": "ETH", "size": "-0.73", "entry": "1691.1", "uPnl": "24.30",
+         "leverage": 15.0, "liquidation_px": 1804.6, "mark_px": 1657.8, "margin_used": 80.7,
+         "stop_loss": 1645.0, "take_profits": [{"price": 1602.0, "percent": 50.0},
+                                               {"price": 1551.0, "percent": 50.0}]},
+        {"coin": "SOL", "size": "-14.4", "entry": "64.53", "uPnl": "15.80",
+         "leverage": 12.0, "liquidation_px": 69.86, "mark_px": 63.43, "margin_used": 76.1,
+         "stop_loss": 66.4, "take_profits": [{"price": 60.1, "percent": 100.0}]},
+        {"coin": "SUI", "size": "-2624", "entry": "0.7653", "uPnl": "65.20",
+         "leverage": 8.0, "liquidation_px": 0.8612, "mark_px": 0.7404, "margin_used": 251.0,
+         "stop_loss": 0.792, "take_profits": [{"price": 0.701, "percent": 60.0},
+                                              {"price": 0.658, "percent": 40.0}]},
+        {"coin": "DOGE", "size": "-4072", "entry": "0.0867", "uPnl": "-8.40",
+         "leverage": 5.0, "liquidation_px": 0.1031, "mark_px": 0.0888, "margin_used": 70.6,
+         "stop_loss": None, "take_profits": []},   # bewusst: Frontend muss null/[] abkönnen
     ]
     upnl = round(sum(float(p["uPnl"]) for p in positions), 2)
     exposure = round(sum(abs(float(p["size"]) * float(p["entry"])) for p in positions), 2)
@@ -854,6 +1125,7 @@ def _demo_dashboard(u):
         ],
         "net": "mainnet",   # Demo zeigt den echten Mainnet-Look
         "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE},
+        "server_time": now_ms,   # 2026-06-12 Dashboard-Extension (wie Live-Pfad)
         "demo": True,
     }
 
@@ -873,13 +1145,39 @@ def dashboard(request: Request, u: User = Depends(current_user), db: Session = D
             # 2026-06-12: ALLE Snapshot-Metriken durchreichen — vorher nur balance
             # +positions, dadurch blieben die neuen Karten (account_value,
             # unrealized_pnl, open_exposure, open_positions) leer.
+            # 2026-06-12 Dashboard-Extension: Positionen KOPIEREN bevor wir
+            # user-spezifische SL/TP-Daten anhängen — der Snapshot ist per
+            # Adresse gecacht und kann von mehreren Usern geteilt werden;
+            # In-Place-Mutation würde fremde managed_trades in den Cache
+            # schreiben.
+            positions = [dict(p) for p in snap.get("positions", [])]
+            # Offene ManagedTrades je Coin joinen → SL + TPs pro Position.
+            import json as _json
+            mt_by_coin = {}
+            for t in (db.query(ManagedTrade)
+                        .filter(ManagedTrade.user_id == u.id, ManagedTrade.status != "closed")
+                        .order_by(ManagedTrade.id).all()):
+                mt_by_coin[t.coin] = t
+            for p in positions:
+                t = mt_by_coin.get(p.get("coin"))
+                stop_loss = None
+                take_profits = []
+                if t is not None:
+                    stop_loss = float(t.stop_loss) if t.stop_loss is not None else None
+                    try:
+                        take_profits = [{"price": float(px), "percent": float(pct)}
+                                        for px, pct in _json.loads(t.take_profits or "[]")]
+                    except Exception:
+                        take_profits = []
+                p["stop_loss"] = stop_loss
+                p["take_profits"] = take_profits
             acct = {
                 "balance": snap.get("balance"),
                 "account_value": snap.get("account_value"),
                 "unrealized_pnl": snap.get("unrealized_pnl"),
                 "open_exposure": snap.get("open_exposure"),
                 "open_positions": snap.get("open_positions"),
-                "positions": snap.get("positions", []),
+                "positions": positions,
             }
             stats = snap["stats"]
         except Exception as e:
@@ -890,7 +1188,11 @@ def dashboard(request: Request, u: User = Depends(current_user), db: Session = D
                 for a in rows]
     return {"user": _user_public(u), "account": acct, "stats": stats, "activity": activity,
             "net": "testnet" if config.HL_TESTNET else "mainnet",
-            "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE}}
+            "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE},
+            # 2026-06-12 Dashboard-Extension: Server-Uhrzeit (epoch ms) — das
+            # Frontend kann damit Zeitstempel konsistent relativieren
+            # (Known issue #6: UTC-vs-Lokalzeit-Mix).
+            "server_time": int(_time.time() * 1000)}
 
 
 # ── Dashboard-Seite ──────────────────────────────────────────────────────────
@@ -912,4 +1214,9 @@ def admin_page():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "listener": config.ENABLE_LISTENER, "net": "testnet" if config.HL_TESTNET else "mainnet"}
+    """2026-06-12 LOW-10: nur noch minimale Liveness-Probe. listener-Status
+    und testnet/mainnet leakten vorher an JEDEN unauthentifizierten Caller —
+    beide Felder stehen (auth-gated) in /api/admin/health. Bekannte
+    Konsumenten: Deploy-Workflow (curlt nur den 200er) und dashboard.js
+    publicStatus (liest jetzt `status`)."""
+    return {"status": "ok"}

@@ -2,7 +2,7 @@
 
 A standalone multi-user product (**not** TradingHub). Users sign up, connect their **own Hyperliquid wallet**, set risk settings + a **capital cap**, and watch live **PnL / positions / bot activity**. A signal posted to Discord `#signals` (by "Bot 1", a private signal bot) is executed on **every active user account**. Each order can carry a **builder code** so the platform operator earns a share of fees.
 
-> **Live status (2026-05-29):** Running on **testnet**, listener **on**, builder **off**. Deployed commit `a459d6f`. One known blocker: two beta testers saved a wallet **address** into the agent-key field — see [Known issues](#known-issues). New devs: read [Critical gotchas](#critical-gotchas-read-before-touching-wallets) first.
+> **Live status (2026-06-12):** Running on **testnet**, listener **on**, builder **off**. One known blocker: two beta testers saved a wallet **address** into the agent-key field — their bots are auto-paused until they re-enter the key (see [Known issues](#known-issues)). New devs: read [Critical gotchas](#critical-gotchas-read-before-touching-wallets) first.
 
 ---
 
@@ -42,7 +42,7 @@ It executes on the user's own account via an **agent key** (no withdrawal rights
 ```bash
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 cp .env.example .env          # fill JWT_SECRET + ENCRYPTION_KEY (commands are in the file)
-PYTHONPATH=. venv/bin/python tests/test_core.py        # logic tests
+PYTHONPATH=. venv/bin/python -m pytest tests/ -q       # full test suite (same as CI)
 venv/bin/uvicorn app.main:app --reload --port 8000     # http://localhost:8000
 ```
 
@@ -76,7 +76,7 @@ Keep `ENABLE_LISTENER=false` and `HL_TESTNET=true` locally.
    - Putting the address into the key field → `ValueError: private key must be exactly 32 bytes ... got 20 bytes`. The order never places.
    - `set_wallet()` now **validates this on save** (length + `Account.from_key`), but **accounts saved before this validation are still broken** in the DB (see Known issues).
 2. **Self-builder is forbidden:** `BUILDER_ADDRESS` must never equal a trading account, or orders are rejected ("Builder fee has not been approved").
-3. **Builder approval is two-sided:** the dashboard "confirm" button only sets a DB flag; the user must also run `approveBuilderFee` **on-chain** in the Hyperliquid UI. Flag set + no on-chain approval = orders rejected.
+3. **Builder approval is verified on-chain (since Phase 5/6):** the dashboard "confirm" button (`/api/builder-approved`, `main.py`) queries Hyperliquid's `maxBuilderFee` and only sets `builder_approved` if the **on-chain** approval actually covers `BUILDER_FEE` — it is **not** a trust-me DB flag anymore. Users can approve either via the dashboard's MetaMask flow (`/api/builder-approval-submit` relays the EIP-712-signed `approveBuilderFee` to HL) or manually in the Hyperliquid UI and then click confirm. Gotcha: the approval must be signed by the **master address**, not the agent key.
 4. `account_value` = perps `marginSummary.accountValue` **+** spot USDC.
 
 ---
@@ -84,11 +84,23 @@ Keep `ENABLE_LISTENER=false` and `HL_TESTNET=true` locally.
 ## Current status (2026-06-12)
 
 - Latest verified UI pass: polished dashboard sections, mobile-friendly metadata, and live trading overview cards.
-- Verified locally with `python3 -m pytest -q` → `17 passed in 1.80s`.
-- Deployment path is `systemd`, not Docker: [goathub.service](goathub.service) runs `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+- Verified locally with `python3 -m pytest -q` → `61 passed` (incl. fake-trader harness for the money paths, web/API security tests, listener/sync tests; shared test DB wiring lives in `tests/conftest.py`).
+- Deployment path is `systemd`, not Docker: [goathub.service](goathub.service) runs `uvicorn app.main:app --host 127.0.0.1 --port 8000` (loopback only — Caddy terminates TLS and proxies locally; the unit runs as the dedicated `goathub` user with systemd sandboxing, see comments in the unit file).
 - CI/CD auto-deploys on push to `main` (`.github/workflows/deploy.yml` → SSH `git pull` + service restart).
 - **Builder off** (`BUILDER_ADDRESS` empty) → 0 builder errors in the last 24h.
 - **Active users:** id 2 (`tretaghunberg`, key OK, **trading fine** — ETH long + DOGE short open with SL/TP). ids 3 & 4 active but **broken** (below). All other accounts inactive.
+
+---
+
+## Ultra-Upgrade 2026-06-12
+
+A large multi-agent review + hardening pass landed on the `claude/ultra-upgrade` branch: a structured code review produced a list of confirmed findings (security, correctness, ops, docs), which were then fixed across the codebase. Ops/deploy highlights:
+
+- **systemd hardening:** `goathub.service` now runs as a dedicated `goathub` user (not root) with `NoNewPrivileges`, `ProtectSystem=strict` + scoped `ReadWritePaths`, and binds uvicorn to `127.0.0.1` (Caddy proxies locally). One-time `useradd`/`chown` steps are documented in the unit file.
+- **CI/CD:** tests now run via real pytest collection (no more hand-registered `__main__` lists), the deploy makes a timestamped `goathub.db` backup before `git pull`, and the workflow only goes green after `systemctl is-active` + an HTTP `/api/health` check pass. The third-party SSH action is pinned to a commit SHA.
+- **Config/deps:** `.env.example` aligned with the hardened risk defaults (`0.005` / `20` / `5`), `pytest` and `eth-account` pinned exactly.
+- **Docs:** this README updated to match the implemented on-chain builder approval flow and the bad-key auto-pause (see Known issues #2/#3 below, now fixed).
+- **Audit-fix batch (same day, full-codebase audit):** emergency-close results are now verified (naked-position alert instead of a false "closed" log), the fill-watcher takes the per-(user,coin) lock + a signal-generation check, SL/TP orders carry cloids (retry idempotency), undecryptable keys auto-pause like bad keys, the Discord listener resets its backoff and **backfills missed signals after reconnect**, stop-coverage is reconciled periodically (not just at startup), admin `test-signal` needs `confirm:true` + rate limit, per-account login lockout + 30-day absolute session lifetime, `builder_approved` resets on wallet change, `processed_signal` included in the Postgres migration, `ENCRYPTION_KEYS` rotation via MultiFernet, deploys gate on a quiet trading window (`scripts/safe_restart.sh`), and a daily DB backup timer ships with the unit files.
 
 ---
 
@@ -97,21 +109,21 @@ Keep `ENABLE_LISTENER=false` and `HL_TESTNET=true` locally.
 | # | Severity | Issue | Fix |
 |---|---|---|---|
 | 1 | 🔴 High | **Users 3 (`nasenloch63`) & 4 (`og_b1312`) have an address in the agent-key field** (stored key length 42, expected 66). Every signal → `Account.from_key` `ValueError` → traceback. They generate ~all of the ~295 daily exceptions **and never trade.** | Disable their bots (`bot_active=False`) and have them re-enter the correct **66-char Agent key** (not the address). Pre-existing bad data — the save-time validation doesn't fix it retroactively. |
-| 2 | 🟡 Med | `engine._run_user` catches the bad key per user but raises a **full traceback every cycle** → log spam. | Detect an unparseable/short key once, **skip the user gracefully**, auto-pause `bot_active`, and surface a dashboard warning ("re-enter your agent key"). |
-| 3 | 🟡 Med | **No on-chain `approveBuilderFee` flow.** Dashboard "confirm" sets `builder_approved` only. When builder is re-enabled for mainnet, users with the flag but no on-chain approval will have orders rejected. | Build the on-chain approval step into the dashboard before enabling builder. |
-| 4 | 🟢 Low | Dashboard shows "Builder: confirmed" while `BUILDER_ADDRESS` is empty → confusing. | Hide/derive builder status from the actual config. |
-| 5 | 🟢 Low | Some Discord logins return `/?error=no_role`. | Confirm the role gate (`DISCORD_GUILD_ID` / `DISCORD_REQUIRED_ROLE_ID`) is configured as intended (it's intentionally open if `DISCORD_GUILD_ID` is empty). |
+| 2 | ✅ Fixed | ~~Bad agent key raises a full traceback every cycle → log spam.~~ Implemented: `_pause_user_bad_key` (`app/engine.py`) detects a broken **or unauthorized** key, auto-pauses `bot_active`, and writes exactly **one** activity row telling the user to re-enter the 66-char agent key (idempotent, race-safe). | Done — remaining user action is issue #1 (testers must re-enter the correct key). |
+| 3 | ✅ Fixed | ~~No on-chain `approveBuilderFee` flow.~~ Implemented: `/api/builder-approval-submit` relays the MetaMask-signed EIP-712 `approveBuilderFee` to HL, and `/api/builder-approved` verifies the approval **on-chain** (`maxBuilderFee`) before setting the flag. See gotcha #3. | Done — just configure `BUILDER_ADDRESS`/`BUILDER_FEE` when enabling builder. |
+| 4 | ✅ Fixed | ~~Dashboard shows "Builder: confirmed" while `BUILDER_ADDRESS` is empty.~~ The builder card derives its state from the actual config (disabled mode when `BUILDER_ADDRESS` is empty) and `signBuilderApproval()` only shows "confirmed" after the server verifies on-chain. | Done. |
+| 5 | 🟢 Low | Some Discord logins return `/?error=no_role`. The gate is intentionally open if `DISCORD_GUILD_ID` is empty — since 2026-06-12 this is **logged loudly** at startup and per bypassed login instead of silently allowed. | Configure `DISCORD_GUILD_ID` / `DISCORD_REQUIRED_ROLE_ID` before mainnet. |
 | 6 | 🟢 Low | Dashboard timezone mismatch (Bot Activity in UTC, fill history in local time). | Normalize to one timezone. |
 
 ---
 
 ## Next steps to production (mainnet + builder fee)
 
-- [ ] Resolve Known issues #1 and #2 (the tester key problem + graceful skip).
-- [ ] **Rotate the compromised Discord client secret and purge it from git history** before inviting external collaborators — it still exists in earlier commits and any collaborator can read history.
+- [ ] Resolve Known issue #1 (testers 3 & 4 must re-enter their 66-char agent key — the graceful auto-pause from #2 is already live).
+- [x] ~~Rotate the compromised Discord client secret and purge it from git history.~~ Done: secret rotated 2026-05 and the history rewritten (only a redacted placeholder remains in `c6d7a82`; full-history sweep 2026-06-12 found no live secrets). Residual: GitHub may still serve pre-rewrite commits as dangling objects by hash — ask GitHub support to run GC if external collaborators join.
 - [ ] Create a **separate referral wallet** (≠ any trading account), set as `BUILDER_ADDRESS`, fund with ≥100 USDC perps.
-- [ ] Set `BUILDER_FEE` ≤ `0.1%` (e.g. `0.05%`) and ship the on-chain approval flow (#3).
-- [ ] HTTPS reverse proxy (Caddy) + Discord OAuth redirect URI for `bot.goathub.network`.
+- [ ] Set `BUILDER_FEE` ≤ `0.1%` (e.g. `0.05%`) — the on-chain approval flow (#3) is already shipped; have each user approve via the dashboard.
+- [x] ~~HTTPS reverse proxy (Caddy) + Discord OAuth redirect URI for `bot.goathub.network`.~~ Live — Caddy terminates TLS and proxies to `127.0.0.1:8000`.
 - [ ] Move from SQLite → Postgres before scaling past a handful of users.
 - [ ] Only then flip `HL_TESTNET=false`.
 

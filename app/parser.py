@@ -85,7 +85,13 @@ def parse_signal(embed: dict):
     if action in CANCEL_ACTIONS:
         return Signal(signal_id=signal_id, ticker=ticker, action=action, direction=direction,
                       entry=entry, stop_loss=stop_loss, take_profits=[], confidence=_num(fm.get("confidence")))
-    if entry is None or stop_loss is None:
+    # 2026-06-12 (Review #18): Entry+SL nur für NEW_TRADE Pflicht. Ein
+    # UPDATE_TRADE betrifft eine BEREITS offene Position — Entry ist dafür
+    # irrelevant, und ein reines SL-Nachzieh-/TP-Update darf nicht verworfen
+    # werden (vorher gingen Trail-Stop-Updates ohne Entry-Feld lautlos
+    # verloren; engine._adjust hat für stop_loss=None längst einen sicheren
+    # Pfad "Update ohne neuen SL").
+    if action != "UPDATE_TRADE" and (entry is None or stop_loss is None):
         return None
     return Signal(signal_id=signal_id, ticker=ticker, action=action, direction=direction,
                   entry=entry, stop_loss=stop_loss, take_profits=_tps(fm.get("take profits")),

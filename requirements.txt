@@ -16,6 +16,13 @@ slowapi==0.1.9
 discord.py==2.7.1
 audioop-lts==0.2.2; python_version >= "3.13"
 hyperliquid-python-sdk==0.23.0
+# 2026-06-12 (#53): eth-account explizit gepinnt (Version aus dem Server-venv).
+# Wird direkt importiert in money-kritischen Pfaden (main.py set_wallet-
+# Key-Validierung, hyperliquid_exec.py) — vorher nur transitive Dependency
+# des HL-SDK; ein SDK-Update hätte sie still droppen/umpinnen können.
+eth-account==0.13.7
 
 # Tests (CI + lokal):
-pytest>=8.0
+# 2026-06-12 (#53): exakt gepinnt (war ">=8.0" — ein pytest-9-Release hätte
+# das CI-Gate vor dem Auto-Deploy ungereviewt verändert).
+pytest==8.4.2

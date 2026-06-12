@@ -4,8 +4,13 @@ Run:
 """
 import os
 # Phase 4: bcrypt-Max-Test importiert app.auth → app.config → braucht Env.
+# M-14 (2026-06-12): ENCRYPTION_KEY wird zur Laufzeit generiert statt als
+# Literal — der alte hardcoded Key war ein VALIDER Fernet-Key im öffentlichen
+# Repo (jeder hätte damit verschlüsselte Agent-Keys lesen können, falls er je
+# in prod landete).
+from cryptography.fernet import Fernet
 os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef")
-os.environ.setdefault("ENCRYPTION_KEY", "AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=")
+os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 from app.sizing import size_trade, auto_leverage
 from app.parser import parse_signal
@@ -126,10 +131,91 @@ def test_auto_leverage():
     print("auto_leverage: OK -> SL-distance×confidence scaling, max_cap honored, floor & errors handled")
 
 
+# ── API-Tests (2026-06-12 #12/#13/#21): Settings-Validierung + reserved email ─
+# TestClient OHNE Context-Manager → lifespan (Listener/Sync-Loops) läuft NICHT,
+# wir testen rein die Request-Validierung. current_user wird mit einem
+# In-Memory-User überschrieben; die 422-Pfade erreichen die DB nie.
+
+def _api_client_with_fake_user():
+    from fastapi.testclient import TestClient
+    from app import auth
+    from app.main import app
+    from app.models import User
+
+    fake = User(
+        id=1, email="tester@example.com", password_hash="x",
+        hl_account_address="", hl_api_secret_enc="",
+        risk_pct=0.005, leverage=20, max_open_positions=5, capital_cap_usdc=0,
+        bot_active=True, builder_approved=False, token_version=0, is_admin=False,
+        max_drawdown_pct=0.30, peak_account_value=0.0,
+    )
+
+    class _StubDB:
+        """update_settings ruft nur db.commit() — Rejects erreichen die DB nie."""
+        def commit(self):
+            pass
+
+    from app.db import get_db
+    app.dependency_overrides[auth.current_user] = lambda: fake
+    app.dependency_overrides[get_db] = lambda: _StubDB()
+    return TestClient(app), app
+
+
+def test_settings_validation_rejects():
+    """#12/#13: out-of-range + explizite null-Werte → 422 statt Silent-Clamp."""
+    client, app = _api_client_with_fake_user()
+    try:
+        bad_payloads = [
+            {"risk_pct": 1.0},              # User meinte "1 %" — FRACTION wäre 0.01
+            {"risk_pct": 0},                # (0, 0.05] — 0 ist raus
+            {"risk_pct": 0.051},            # über 5 %/Trade
+            {"leverage": 0},                # [1, 50]
+            {"leverage": 51},
+            {"max_open_positions": 0},      # [1, 20]
+            {"max_open_positions": 21},
+            {"capital_cap_usdc": -1},       # [0, 10M]
+            {"capital_cap_usdc": 10_000_001},
+            {"max_drawdown_pct": 0.96},     # [0, 0.95]
+            {"risk_pct": None},             # explizites null (#13: war vorher 0-coerce)
+            {"capital_cap_usdc": None},     # geleertes Cap-Feld darf NICHT uncappen
+        ]
+        for payload in bad_payloads:
+            r = client.put("/api/settings", json=payload)
+            assert r.status_code == 422, f"{payload} → {r.status_code} (expected 422): {r.text[:200]}"
+
+        # Gültige Werte (inkl. Grenzen) + bot_active-only-Toggle gehen weiter durch.
+        r = client.put("/api/settings", json={"risk_pct": 0.05, "leverage": 1,
+                                              "max_open_positions": 20, "capital_cap_usdc": 0})
+        assert r.status_code == 200, r.text[:200]
+        assert r.json()["settings"]["risk_pct"] == 0.05   # FRACTION bleibt FRACTION
+        r = client.put("/api/settings", json={"bot_active": False})
+        assert r.status_code == 200, r.text[:200]
+        assert r.json()["bot_active"] is False
+        print("settings-validation: OK -> 12 Rejects (422), Grenzen + bot_active-Toggle gehen durch")
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_register_reserved_email_blocked():
+    """#21: discord_<id>@goathub.internal ist der synthetische OAuth-Namespace —
+    Registrierung damit wäre ein gezielter Signup-DoS gegen Discord-Logins."""
+    client, app = _api_client_with_fake_user()
+    try:
+        r = client.post("/api/register", json={
+            "email": "discord_123456789@goathub.internal", "password": "secret123"})
+        assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text[:200]}"
+        assert "reserved" in r.json()["detail"].lower()
+        print("register-reserved-email: OK -> @goathub.internal wird mit 400 abgelehnt")
+    finally:
+        app.dependency_overrides.clear()
+
+
 if __name__ == "__main__":
     test_cap_limits_capital()
     test_no_cap_uses_full()
     test_parser()
     test_bcrypt_max_length()
     test_auto_leverage()
+    test_settings_validation_rejects()
+    test_register_reserved_email_blocked()
     print("\nALLE CORE-TESTS BESTANDEN ✅")

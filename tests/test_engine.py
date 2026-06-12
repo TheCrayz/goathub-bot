@@ -19,32 +19,38 @@ Run:
 """
 import os
 # Test-only env so wir die echten config-Checks (JWT/ENCRYPTION) passieren.
+# 2026-06-12 Audit: ENCRYPTION_KEY wird zur LAUFZEIT generiert — der vorher
+# hier hartcodierte Fernet-Key lag im öffentlichen Repo (Secret-Leak-Klasse).
+from cryptography.fernet import Fernet
 os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef")
-os.environ.setdefault("ENCRYPTION_KEY", "AlwIc3vOpO5xZ8sxqr1Z5kvr1WnQqJg5MZ-ITZkqTeo=")
+os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 # Wir nutzen :memory:-SQLite — keine Spuren auf der Platte, kein Test-DB-Leak.
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from sqlalchemy.pool import StaticPool
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Force shared in-memory connection for tests (sonst sieht jede Session
-# eine andere :memory:-Instanz)
+# Unter pytest verdrahtet tests/conftest.py die EINE geteilte StaticPool-
+# :memory:-Engine, bevor irgendein Testmodul importiert — dann hier NICHTS
+# anfassen (eine zweite Engine würde App-Module und Tests auf verschiedene
+# DBs zeigen lassen). Nur standalone (python tests/test_engine.py) selbst bauen.
 import app.db as _dbmod
-_test_engine = create_engine(
-    "sqlite:///:memory:",
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-    future=True,
-)
-_dbmod.engine = _test_engine
-_dbmod.SessionLocal = sessionmaker(bind=_test_engine, autoflush=False, autocommit=False, future=True)
+if _dbmod.engine.pool.__class__.__name__ != "StaticPool":
+    _test_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        future=True,
+    )
+    _dbmod.engine = _test_engine
+    _dbmod.SessionLocal = sessionmaker(bind=_test_engine, autoflush=False, autocommit=False, future=True)
 
 # Jetzt die Models laden + Tabellen anlegen
 from app.models import Activity, ManagedTrade, User
 from app.db import Base, SessionLocal
-Base.metadata.create_all(_test_engine)
+Base.metadata.create_all(_dbmod.engine)
 
 # Engine importieren NACH dem DB-Setup
 import app.engine as engine
@@ -258,12 +264,19 @@ def test_signal_rate_cap_and_autohalt():
 
 
 def test_trade_interval_throttle():
-    """2026-06-08 Mainnet-Hardening A1: min interval pro (user, coin) gegen storms."""
+    """2026-06-08 Mainnet-Hardening A1: min interval pro (user, coin) gegen storms.
+
+    Audit M-5 (2026-06-12): der Check ist jetzt READ-ONLY — das Fenster startet
+    erst mit _record_trade_ts (nach erfolgreich PLATZIERTEM Entry). Geskippte/
+    fehlgeschlagene Versuche verbrauchen das Fenster nicht mehr."""
     engine.config.MIN_TRADE_INTERVAL_S = 60
     engine._trade_intervals.clear()
 
     assert engine._trade_interval_ok(1, "BTC") is True
-    assert engine._trade_interval_ok(1, "BTC") is False, "<60s elapsed"
+    assert engine._trade_interval_ok(1, "BTC") is True, \
+        "Check allein darf das Fenster nicht verbrauchen (Audit M-5)"
+    engine._record_trade_ts(1, "BTC")
+    assert engine._trade_interval_ok(1, "BTC") is False, "<60s seit platziertem Trade"
     assert engine._trade_interval_ok(2, "BTC") is True, "different user OK"
     assert engine._trade_interval_ok(1, "ETH") is True, "different coin OK"
     print("trade_interval_throttle: OK")
@@ -393,6 +406,385 @@ def test_sl_slippage_cap_math():
     print("sl_slippage_cap_math: OK")
 
 
+# ── 2026-06-12 (Review #15): echte Engine-Pfad-Tests mit Recorder-Stub ──────
+# Diese Tests rufen die ECHTEN engine-Funktionen (_open_or_update, _open_new,
+# _adjust, reconcile_protection_on_startup) mit einem Stub-Trader auf, statt
+# die Logik lokal zu re-implementieren.
+import asyncio
+import datetime
+import types
+
+from app.parser import Signal, TakeProfit
+
+
+class StubTrader:
+    """Recorder-Stub: zeichnet alle mutierenden HL-Calls auf, kein Netzwerk."""
+
+    def __init__(self, pos=0.0, pos_exc=None):
+        self.pos = pos                # von position_size geliefert
+        self.pos_exc = pos_exc        # wenn gesetzt: position_size raised (Review #0)
+        self.calls = []               # [(name, args...), ...] mutierende Calls
+        self.protection_calls = []    # place_protection-Argumente
+
+    def is_tradable(self, coin):
+        return True
+
+    def position_size(self, coin):
+        if self.pos_exc is not None:
+            raise self.pos_exc
+        return self.pos
+
+    def max_leverage(self, coin):
+        return 50
+
+    def set_leverage(self, coin, lev):
+        self.calls.append(("set_leverage", coin, lev))
+        return {"status": "ok"}
+
+    def cancel_orders(self, coin):
+        self.calls.append(("cancel_orders", coin))
+        return 1
+
+    def cancel_order(self, coin, oid):
+        self.calls.append(("cancel_order", coin, oid))
+        return True
+
+    def place_entry(self, coin, is_buy, sz, px):
+        self.calls.append(("place_entry", coin, is_buy, sz, px))
+        return {"ok": True, "filled": True, "filled_sz": sz, "resting_oid": None, "error": None}
+
+    def place_protection(self, coin, is_buy, sz, sl, tps):
+        self.protection_calls.append(
+            {"coin": coin, "is_buy": is_buy, "sz": sz, "sl": sl, "tps": list(tps or [])})
+        return {"sl_ok": True, "sl": {"status": "ok"}, "tp": [], "skip_reason": None}
+
+    def close_position(self, coin):
+        self.calls.append(("close_position", coin))
+        return {"ok": True, "closed": abs(self.pos)}
+
+    def account_value(self):
+        return 10_000.0
+
+    def available_margin(self):
+        return 10_000.0
+
+    def open_positions_count(self):
+        return 0
+
+    def open_positions(self):
+        return []
+
+    def covered_stop_size(self, coin):
+        return float("inf")
+
+
+def _async_return(value):
+    async def _f(*a, **k):
+        return value
+    return _f
+
+
+def _reset_engine_state():
+    """asyncio.Lock bindet sich an den Loop des ersten Acquire — jede
+    asyncio.run()-Testinsel braucht frische Locks/Watcher-Registries."""
+    engine._locks.clear()
+    engine._user_locks.clear()
+    engine._fill_watchers.clear()
+    engine._trade_intervals.clear()
+    engine._recent_pause_keys.clear()
+
+
+def _activities(user_id, kind=None):
+    db = SessionLocal()
+    try:
+        q = db.query(Activity).filter(Activity.user_id == user_id)
+        if kind:
+            q = q.filter(Activity.kind == kind)
+        return [a.text for a in q.order_by(Activity.id).all()]
+    finally:
+        db.close()
+
+
+def _make_managed_full(db, *, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="open",
+                       resting_oid=None, signal_id=None):
+    mt = ManagedTrade(user_id=user_id, coin=coin, direction=direction, entry=entry,
+                      stop_loss=stop_loss, take_profits=take_profits, status=status,
+                      resting_oid=resting_oid, signal_id=signal_id)
+    db.add(mt)
+    db.commit()
+    return mt
+
+
+def test_position_unknown_aborts_safely():
+    """Review #0: position_size-Fehler darf NIE als 'flat' gelten — weder
+    NEW_TRADE (würde live SL/TP canceln + Doppel-Entry) noch CANCEL (würde
+    Schutz der offenen Position wegcanceln + Row verstecken)."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="BTC", direction="LONG",
+                       entry=70000.0, stop_loss=68000.0, status="open")
+    db.close()
+
+    sig = Signal(signal_id="s0", ticker="BTC/USDT", action="NEW_TRADE", direction="LONG",
+                 entry=70000.0, stop_loss=68000.0, take_profits=[])
+    stub = StubTrader(pos_exc=RuntimeError("503 service unavailable"))
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine._open_or_update(1, sig, "NEW_TRADE"))
+        assert stub.calls == [], f"unbekannter Positionsstatus: NICHTS anfassen, hab {stub.calls}"
+
+        # CANCEL-Pfad genauso
+        _reset_engine_state()
+        stub2 = StubTrader(pos_exc=RuntimeError("connection timeout"))
+        engine._build_trader = _async_return(stub2)
+        asyncio.run(engine._cancel(1, sig))
+        assert stub2.calls == [], f"CANCEL bei unbekanntem Status: NICHTS canceln, hab {stub2.calls}"
+    finally:
+        engine._build_trader = orig_build
+
+    errs = _activities(1, "error")
+    assert sum("Positionsstatus" in t for t in errs) == 2, errs
+    db = SessionLocal()
+    st = db.query(ManagedTrade).filter_by(user_id=1, coin="BTC").first().status
+    db.close()
+    assert st == "open", "Row darf bei unbekanntem Status nicht geclosed werden"
+    print("position_unknown_aborts_safely: OK")
+
+
+def test_startup_rearm_resting_watcher():
+    """Review #1/#2: resting-Row nach Neustart → Fill-Watcher wird mit den
+    GESPEICHERTEN Parametern (resting_oid, SL, TPs) re-armiert."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[[2000.0, 50.0], [2200.0, 50.0]]",
+                       status="resting", resting_oid="987", signal_id="sigA")
+    db.close()
+
+    stub = StubTrader(pos=0.0)   # Order hat während der Downtime NICHT gefüllt
+    spawned = []
+
+    def fake_watcher(trader, user_id, sig, is_buy, tps, resting_oid=None):
+        spawned.append({"user_id": user_id, "sl": sig.stop_loss, "is_buy": is_buy,
+                        "tps": tps, "resting_oid": resting_oid})
+        async def _noop():
+            return None
+        return _noop()
+
+    orig_build, orig_watch = engine._build_trader, engine._protect_when_filled
+    orig_flag = engine.config.STARTUP_PROTECTION_RECONCILE
+    engine._build_trader = _async_return(stub)
+    engine._protect_when_filled = fake_watcher
+    engine.config.STARTUP_PROTECTION_RECONCILE = True
+    try:
+        asyncio.run(engine.reconcile_protection_on_startup())
+    finally:
+        engine._build_trader, engine._protect_when_filled = orig_build, orig_watch
+        engine.config.STARTUP_PROTECTION_RECONCILE = orig_flag
+        engine._fill_watchers.clear()
+
+    assert len(spawned) == 1, f"genau 1 Watcher erwartet, hab {len(spawned)}"
+    w = spawned[0]
+    assert w["resting_oid"] == "987" and w["sl"] == 1800.0 and w["is_buy"] is True
+    assert w["tps"] == [(2000.0, 0.5), (2200.0, 0.5)], w["tps"]
+    db = SessionLocal()
+    st = db.query(ManagedTrade).filter_by(user_id=1, coin="ETH").first().status
+    db.close()
+    assert st == "resting", "Row bleibt resting (re-armiert, nicht geschlossen)"
+    print("startup_rearm_resting_watcher: OK")
+
+
+def test_startup_rearm_impossible_cancels_entry():
+    """Review #1/#2: resting-Row OHNE SL kann nicht re-armiert werden →
+    ruhende Entry-Order wird gecancelt + Row geschlossen (kein nackter Fill)."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="BTC", direction="LONG", entry=70000.0,
+                       stop_loss=None, status="resting", resting_oid="555")
+    db.close()
+
+    stub = StubTrader(pos=0.0)
+    spawned = []
+
+    def fake_watcher(*a, **k):
+        spawned.append(a)
+        async def _noop():
+            return None
+        return _noop()
+
+    orig_build, orig_watch = engine._build_trader, engine._protect_when_filled
+    orig_flag = engine.config.STARTUP_PROTECTION_RECONCILE
+    engine._build_trader = _async_return(stub)
+    engine._protect_when_filled = fake_watcher
+    engine.config.STARTUP_PROTECTION_RECONCILE = True
+    try:
+        asyncio.run(engine.reconcile_protection_on_startup())
+    finally:
+        engine._build_trader, engine._protect_when_filled = orig_build, orig_watch
+        engine.config.STARTUP_PROTECTION_RECONCILE = orig_flag
+        engine._fill_watchers.clear()
+
+    assert spawned == [], "ohne SL darf KEIN Watcher gespawnt werden"
+    assert ("cancel_order", "BTC", "555") in stub.calls, stub.calls
+    db = SessionLocal()
+    st = db.query(ManagedTrade).filter_by(user_id=1, coin="BTC").first().status
+    db.close()
+    assert st == "closed", "Row muss geschlossen werden, wenn Re-Arm unmöglich"
+    print("startup_rearm_impossible_cancels_entry: OK")
+
+
+def test_sl_only_update_preserves_tps():
+    """Review #5: UPDATE_TRADE ohne TPs → gespeicherte TPs aus dem managed_trade
+    werden mit dem neuen SL re-placed (cancel_orders räumt sonst alle TPs weg)."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[[2000.0, 50.0], [2200.0, 50.0]]",
+                       status="open")
+    db.close()
+
+    stub = StubTrader(pos=1.0)
+    orig_mark = engine._get_mark
+    engine._get_mark = lambda coin: 0.0   # Preflight neutralisieren (kein HL-Call)
+    try:
+        sig = Signal(signal_id="s2", ticker="ETH/USDT", action="UPDATE_TRADE", direction="LONG",
+                     entry=None, stop_loss=1850.0, take_profits=[])
+        u = types.SimpleNamespace(id=1)
+        asyncio.run(engine._adjust(stub, u, sig, 1.0))
+    finally:
+        engine._get_mark = orig_mark
+
+    assert len(stub.protection_calls) == 1, stub.protection_calls
+    pc = stub.protection_calls[0]
+    assert pc["sl"] == 1850.0, "neuer (tighter) SL muss gesetzt werden"
+    assert pc["tps"] == [(2000.0, 0.5), (2200.0, 0.5)], \
+        f"gespeicherte TPs müssen ein SL-only-Update überleben, hab {pc['tps']}"
+    print("sl_only_update_preserves_tps: OK")
+
+
+def test_missing_direction_skips_new_trade():
+    """Review #16: Direction fehlt/leer → NEW_TRADE wird mit error-Activity
+    geskippt statt still als SHORT zu laufen."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    db.close()
+
+    stub = StubTrader()
+    sig = Signal(signal_id="s3", ticker="BTC/USDT", action="NEW_TRADE", direction="",
+                 entry=70000.0, stop_loss=68000.0, take_profits=[])
+    u = types.SimpleNamespace(id=1, hl_account_address="0xA", risk_pct=0.02, leverage=3,
+                              max_open_positions=10, capital_cap_usdc=0,
+                              max_drawdown_pct=0, peak_account_value=0, builder_approved=False)
+    asyncio.run(engine._open_new(stub, u, sig))
+
+    assert all(c[0] != "place_entry" for c in stub.calls), \
+        f"Signal ohne Direction darf NICHT ausgeführt werden, hab {stub.calls}"
+    errs = _activities(1, "error")
+    assert any("Direction" in t for t in errs), errs
+    print("missing_direction_skips_new_trade: OK")
+
+
+def test_throttle_exempts_updates_blocks_new():
+    """Review #19: MIN_TRADE_INTERVAL_S drosselt NUR echte Neueröffnungen.
+    Risiko-reduzierende UPDATE_TRADEs (SL-Tighten) laufen immer durch; ein
+    gedrosseltes NEW_TRADE fasst NICHTS an (auch kein cancel_orders)."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="open")
+    db.close()
+
+    engine.config.MIN_TRADE_INTERVAL_S = 60
+    # Audit M-5: Fenster explizit stempeln (der Check selbst ist jetzt read-only).
+    engine._record_trade_ts(1, "ETH")
+
+    orig_build, orig_mark = engine._build_trader, engine._get_mark
+    engine._get_mark = lambda coin: 0.0
+    try:
+        # a) UPDATE_TRADE im Intervall → MUSS durchgehen
+        stub_u = StubTrader(pos=2.0)
+        engine._build_trader = _async_return(stub_u)
+        sig_u = Signal(signal_id="s4", ticker="ETH/USDT", action="UPDATE_TRADE", direction="LONG",
+                       entry=None, stop_loss=1850.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig_u, "UPDATE_TRADE"))
+        assert len(stub_u.protection_calls) == 1, \
+            f"SL-Update darf nicht gedrosselt werden: {_activities(1)}"
+
+        # b) NEW_TRADE im Intervall → Skip VOR cancel_orders (ruht-Order/Watcher bleiben)
+        _reset_engine_state()
+        engine.config.MIN_TRADE_INTERVAL_S = 60
+        engine._record_trade_ts(1, "ETH")   # Audit M-5: Fenster aktiv
+        stub_n = StubTrader(pos=0.0)
+        engine._build_trader = _async_return(stub_n)
+        sig_n = Signal(signal_id="s5", ticker="ETH/USDT", action="NEW_TRADE", direction="LONG",
+                       entry=1900.0, stop_loss=1800.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig_n, "NEW_TRADE"))
+        assert stub_n.calls == [], f"throttled NEW_TRADE darf nichts anfassen, hab {stub_n.calls}"
+        skips = _activities(1, "skip")
+        assert any("throttle" in t for t in skips), skips
+    finally:
+        engine._build_trader, engine._get_mark = orig_build, orig_mark
+    print("throttle_exempts_updates_blocks_new: OK")
+
+
+def test_ratchet_baseline_survives_premature_sync_close():
+    """Review #41: hat der Sync eine Row verfrüht geclosed (HL-Position lebt),
+    fällt _get_current_sl auf die jüngste closed-Row (<24h) zurück, damit der
+    SL-Ratchet nicht ausgehebelt wird. Ältere closed-Rows zählen NICHT."""
+    _reset_db()
+    _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="closed")
+    db.close()
+
+    assert engine._get_current_sl(1, "ETH") == (1800.0, "LONG"), \
+        "frisch geclosede Row muss als Ratchet-Fallback dienen"
+
+    # >24h alt → kein Fallback (echter Close / legitimer manueller Re-Open)
+    db = SessionLocal()
+    mt = db.query(ManagedTrade).filter_by(user_id=1, coin="ETH").first()
+    mt.updated_at = datetime.datetime.utcnow() - datetime.timedelta(hours=25)
+    db.commit()
+    db.close()
+    assert engine._get_current_sl(1, "ETH") == (None, None)
+    print("ratchet_baseline_survives_premature_sync_close: OK")
+
+
+def test_parser_update_without_entry():
+    """Review #18: UPDATE_TRADE ohne Entry (Trail-Stop-Update) darf nicht
+    verworfen werden; NEW_TRADE ohne Entry/SL weiterhin schon."""
+    from app.parser import parse_signal
+    upd = {"title": "ETH/USDT — UPDATE_TRADE", "description": "Signal `u1`",
+           "fields": [{"name": "Action", "value": "UPDATE_TRADE"},
+                      {"name": "Ticker", "value": "ETH/USDT"},
+                      {"name": "Stop Loss", "value": "1850"}]}
+    s = parse_signal(upd)
+    assert s is not None and s.action == "UPDATE_TRADE" and s.stop_loss == 1850.0 and s.entry is None
+
+    new_no_entry = {"title": "ETH/USDT — NEW_TRADE", "description": "Signal `u2`",
+                    "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                               {"name": "Ticker", "value": "ETH/USDT"},
+                               {"name": "Stop Loss", "value": "1850"}]}
+    assert parse_signal(new_no_entry) is None, "NEW_TRADE ohne Entry bleibt invalid"
+    print("parser_update_without_entry: OK")
+
+
 if __name__ == "__main__":
     test_is_bad_key_error()
     test_pause_user_bad_key_idempotent()
@@ -406,4 +798,12 @@ if __name__ == "__main__":
     test_hl_retry()
     test_pause_user_idempotency_race()
     test_sl_slippage_cap_math()
+    test_position_unknown_aborts_safely()
+    test_startup_rearm_resting_watcher()
+    test_startup_rearm_impossible_cancels_entry()
+    test_sl_only_update_preserves_tps()
+    test_missing_direction_skips_new_trade()
+    test_throttle_exempts_updates_blocks_new()
+    test_ratchet_baseline_survives_premature_sync_close()
+    test_parser_update_without_entry()
     print("\nALLE ENGINE-TESTS BESTANDEN ✅")

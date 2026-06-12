@@ -1,3 +1,22 @@
+# GoatHub Trading Bot — systemd Unit.
+#
+# 2026-06-12 Hardening (#8 + Audit M-16/M-19/LOW-11): läuft als goathub statt
+# root, bindet nur noch 127.0.0.1 (Caddy proxied + terminiert TLS), systemd-
+# Sandbox. Bei RCE/kompromittierter Dependency hängt sonst .env (JWT_SECRET,
+# ENCRYPTION_KEY, DISCORD_BOT_TOKEN) + goathub.db (alle Agent-Keys) an root.
+#
+# ── EINMALIGE Server-Voraussetzungen (als root, BEVOR dieses Unit live geht) ──
+#   useradd --system --no-create-home --shell /usr/sbin/nologin goathub
+#   mkdir -p /var/lib/goathub && chown goathub:goathub /var/lib/goathub && chmod 700 /var/lib/goathub
+#   mkdir -p /var/backups/goathub && chown goathub:goathub /var/backups/goathub && chmod 700 /var/backups/goathub
+#   chown -R goathub:goathub /var/www/goathub-bot
+#   cp goathub.service goathub-backup.service goathub-backup.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl restart goathub && systemctl enable --now goathub-backup.timer
+# Danach installiert der Deploy-Workflow Unit-Updates automatisch (gated auf
+# `id goathub` — solange der User fehlt, bleibt das alte Unit aktiv).
+#
+# Env-Handling: KEIN EnvironmentFile= — app/config.py lädt die .env selbst via
+# python-dotenv aus dem WorkingDirectory (/var/www/goathub-bot/.env).
 [Unit]
 Description=GoatHub Trading Bot (Multi-User Plattform)
 After=network-online.target
@@ -5,12 +24,39 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=goathub
+Group=goathub
 WorkingDirectory=/var/www/goathub-bot
-ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
-Restart=always
+# Bind auf 127.0.0.1 statt 0.0.0.0 — Caddy proxied lokal auf :8000
+# (TLS-Terminierung). Direkter Internet-Zugriff auf uvicorn umging vorher
+# Caddys X-Forwarded-For → Rate-Limit-Key in main.py wäre spoofbar gewesen
+# (Pair-Fix mit _client_ip in app/main.py).
+ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+# 2026-06-12 (#8): on-failure statt always — bei sauberem `systemctl stop` /
+# exit 0 (z.B. bewusstem Operator-Halt) soll systemd den Bot nicht sofort
+# wieder hochziehen; Crashes werden weiterhin neu gestartet.
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
+# systemd-Sandbox.
+NoNewPrivileges=true
+# ProtectSystem=strict mountet das gesamte FS read-only (strenger als das im
+# Audit geforderte "full"); beschreibbar bleiben nur App-Dir (Code, venv,
+# goathub.db inkl. SQLite-WAL/-Journal) + /var/lib/goathub (Emergency-Halt-
+# Flag, LOW-11) + das private /tmp.
+ProtectSystem=strict
+ReadWritePaths=/var/www/goathub-bot /var/lib/goathub
+ProtectHome=true
+# 2026-06-12 LOW-11: PrivateTmp jetzt true — das EMERGENCY_HALT_FLAG liegt
+# nicht mehr unter world-writable /tmp sondern unter /var/lib/goathub/
+# emergency-halt (config.py). Manueller Not-Halt per Shell entsprechend:
+#   touch /var/lib/goathub/emergency-halt
+# VORAUSSETZUNG: /var/lib/goathub existiert + gehört goathub (siehe oben),
+# sonst fällt config.py auf /tmp zurück und der manuelle Halt-Pfad wäre durch
+# PrivateTmp unsichtbar.
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

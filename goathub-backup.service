@@ -1,0 +1,20 @@
+# M-19 (2026-06-12): Oneshot-Service für das tägliche SQLite-Backup.
+# Getriggert von goathub-backup.timer — siehe BACKUP.md für Plan + Restore.
+# Einmalige Server-Voraussetzung (als root):
+#   mkdir -p /var/backups/goathub && chown goathub:goathub /var/backups/goathub && chmod 700 /var/backups/goathub
+[Unit]
+Description=GoatHub SQLite-Backup (taeglich, siehe BACKUP.md)
+
+[Service]
+Type=oneshot
+User=goathub
+Group=goathub
+ExecStart=/bin/bash /var/www/goathub-bot/scripts/backup_db.sh
+# Backup soll den laufenden Bot nicht ausbremsen.
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/backups/goathub

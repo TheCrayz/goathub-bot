@@ -4,29 +4,47 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GoatHub Admin</title>
 <style>
-  *{box-sizing:border-box} body{margin:0;background:#0b0f0d;color:#e6f2ec;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  /* 2026-06-12 Brand-Alignment: Dashboard-Token-Palette übernommen (dashboard.html :root),
+     Hintergrund auf near-black neutral (#050607) statt grünstichigem #0b0f0d —
+     bewusst utilitaristisch, keine Deko-Animationen im Admin. */
+  :root{
+    --bg:#050607; --panel:#0b1511; --panel-2:#101c17; --line:#1f342b; --text:#edf7f1; --mut:#9bb9ad;
+    --green:#4af2b2; --green-deep:#0e7c5a; --red:#ff8a8a; --amber:#ffd36b;
+  }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   .wrap{max-width:1180px;margin:0 auto;padding:24px}
-  h1{font-size:22px;margin:0 0 4px} h2{font-size:14px;color:#10b981;margin:0 0 10px;text-transform:uppercase;letter-spacing:.07em}
-  .sub{color:#7f9a90;font-size:13px;margin-bottom:18px}
-  .card{background:#0f1714;border:1px solid #1e2a24;border-radius:12px;padding:16px;margin:14px 0;overflow:auto}
+  h1{font-size:22px;margin:0 0 4px} h2{font-size:14px;color:var(--green);margin:0 0 10px;text-transform:uppercase;letter-spacing:.07em}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:14px 0;overflow:auto}
   .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
-  .stat{flex:1;min-width:160px;background:#0f1714;border:1px solid #1e2a24;border-radius:10px;padding:14px}
-  .stat-h{color:#7f9a90;font-size:11px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px}
+  .stat{flex:1;min-width:160px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .stat-h{color:var(--mut);font-size:11px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px}
   .stat-v{font-size:22px;font-weight:800;line-height:1.1}
   table{width:100%;border-collapse:collapse;font-size:13px;font-family:ui-monospace,Menlo,monospace}
-  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #1e2a24;white-space:nowrap}
-  th{color:#9fb8af;font-size:11px;text-transform:uppercase;font-family:system-ui,sans-serif;letter-spacing:.05em}
-  td.mut{color:#7f9a90}
-  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;font-family:system-ui,sans-serif}
-  .on{background:#0e3b2b;color:#3fe0a0} .off{background:#3b1e1e;color:#ff8a8a}
-  .neutral{background:#2a2f2d;color:#9fb8af}
-  button{background:#10b981;color:#04120c;border:0;border-radius:6px;padding:5px 10px;font-weight:700;cursor:pointer;font-size:12px}
-  button.danger{background:#3b1e1e;color:#ff8a8a}
-  button.ghost{background:transparent;color:#10b981;border:1px solid #0e7c5a}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--mut);font-size:11px;text-transform:uppercase;font-family:system-ui,sans-serif;letter-spacing:.05em}
+  td.mut, .mut{color:var(--mut)}
+  /* Pill-Styles analog dashboard.html .mini-pill (transparenter Fill + Border) */
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;font-family:system-ui,sans-serif;border:1px solid transparent}
+  .on{background:rgba(74,242,178,.1);color:var(--green);border-color:rgba(74,242,178,.25)}
+  .off{background:rgba(255,138,138,.1);color:var(--red);border-color:rgba(255,138,138,.25)}
+  .neutral{background:rgba(155,185,173,.08);color:var(--mut);border-color:rgba(155,185,173,.2)}
+  button{background:var(--green);color:#04120c;border:0;border-radius:6px;padding:5px 10px;font-weight:700;cursor:pointer;font-size:12px}
+  button.danger{background:rgba(255,138,138,.12);color:var(--red);border:1px solid rgba(255,138,138,.3)}
+  button.ghost{background:transparent;color:var(--green);border:1px solid var(--green-deep)}
+  /* 2026-06-12 Review #47: aktiver Filter-Button sichtbar markiert */
+  button.ghost.active{background:rgba(74,242,178,.14);border-color:var(--green)}
   .row{display:flex;gap:8px;align-items:center}
-  pre{background:#0a100d;padding:10px;border-radius:6px;overflow-x:auto;font-size:11px;margin:6px 0}
-  a{color:#10b981}
-  .err-banner{background:#3b1e1e;color:#ffb0b0;padding:12px;border-radius:8px;margin:10px 0;display:none}
+  pre{background:var(--panel-2);padding:10px;border-radius:6px;overflow-x:auto;font-size:11px;margin:6px 0}
+  a{color:var(--green)}
+  .err-banner{background:rgba(255,138,138,.1);border:1px solid rgba(255,138,138,.3);color:#ffb0b0;padding:12px;border-radius:8px;margin:10px 0;display:none}
+
+  /* 2026-06-12 Review #36: Emergency-Halt-Card — bewusst auffällig (roter Rand),
+     großer Button; Zustand (live/halted) setzt admin.js via loadHalt(). */
+  .halt-card{border-color:rgba(255,107,107,.45)}
+  button.halt-big{background:#c92a2a;color:#fff;font-size:15px;padding:14px 22px;border-radius:10px;letter-spacing:.04em}
+  button.halt-big:hover{background:#e03131}
+  button.resume-big{background:var(--green);color:#04120c;font-size:15px;padding:14px 22px;border-radius:10px}
 
   /* 2026-06-04 Restposten #7: Mobile-responsive admin panel */
   @media (max-width: 800px) {
@@ -51,6 +69,24 @@
   <div id="auth-err" class="err-banner"></div>
 
   <div id="content" style="display:none">
+    <!-- 2026-06-12 Review #36: Emergency-Halt UI — Panic-Stop für die ganze
+         Plattform ohne curl (POST /api/admin/halt pausiert ALLE User + setzt
+         EMERGENCY_HALT-Flag). Buttons via data-action, weil die CSP
+         (script-src 'self') inline-onclick blockt. -->
+    <div class="card halt-card">
+      <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:12px">
+        <div>
+          <h2>Emergency Control</h2>
+          <div id="halt-state" style="font-size:15px;font-weight:700">—</div>
+          <div id="halt-reason" class="mut" style="font-size:12px;margin-top:4px"></div>
+          <div id="halt-users" class="mut" style="font-size:12px"></div>
+        </div>
+        <div style="display:flex;align-items:center">
+          <button id="halt-btn" class="halt-big" data-action="haltAll">🚨 EMERGENCY HALT</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Health -->
     <div class="card">
       <h2>Health</h2>
@@ -61,7 +97,12 @@
         <div class="stat"><div class="stat-h">Signal-bot</div><div class="stat-v" id="h-sb">—</div></div>
       </div>
       <div class="mut" style="font-size:11px">Last signal-bot cycle: <code id="h-cycle">—</code></div>
-      <button class="ghost" data-action="loadAll" style="margin-top:8px">↻ Refresh</button>
+      <!-- 2026-06-12 Auto-Refresh-Indikator: admin.js aktualisiert Health/Users/Halt
+           alle 30s (nur bei sichtbarem Tab) und schreibt "Updated Xs ago" hierher. -->
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" data-action="loadAll">↻ Refresh</button>
+        <span id="updated-ago" class="mut" style="font-size:11px"></span>
+      </div>
     </div>
 
     <!-- Users -->
@@ -85,7 +126,7 @@
       </div>
       <div class="mut" style="font-size:11px" id="c-note">Estimate; real cost via Google Cloud Billing.</div>
       <!-- Phase 6+ (2026-06-03): real-cost-block from TOKEN_USAGE logs -->
-      <div style="margin-top:10px;padding:10px;background:#0a100d;border-radius:6px" id="real-cost-block">
+      <div style="margin-top:10px;padding:10px;background:var(--panel-2);border-radius:6px" id="real-cost-block">
         <span class="mut">Loading real token usage…</span>
       </div>
       <div style="overflow-x:auto;margin-top:8px"><table id="ctbl"><thead><tr>

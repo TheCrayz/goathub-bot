@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- 2026-06-12 Brand-Icon: geometrischer Goat-Head, Emerald auf Near-Black.
+       Eine Datei für Favicon + PWA-Manifest (sizes "any"). Kein Pillow im venv
+       verfügbar → SVG-only, keine PNG-Renders (Browser skalieren SVG sauber).
+       Maskable-safe: alle Pfade liegen innerhalb des 40%-Radius um die Mitte. -->
+  <rect width="512" height="512" rx="96" fill="#050607"/>
+  <g fill="none" stroke="#4af2b2" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Hörner -->
+    <path d="M178 92 C 144 116, 130 164, 148 204"/>
+    <path d="M334 92 C 368 116, 382 164, 364 204"/>
+    <!-- Kopf (eckig, geometrisch) -->
+    <path d="M148 204 L256 176 L364 204 L322 312 L256 420 L190 312 Z"/>
+    <!-- Augen (Punkte via round linecap) -->
+    <path d="M214 252 l0.01 0"/>
+    <path d="M298 252 l0.01 0"/>
+    <!-- Bart -->
+    <path d="M256 420 L256 446"/>
+  </g>
+</svg>
