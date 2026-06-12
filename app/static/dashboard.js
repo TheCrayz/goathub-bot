@@ -387,6 +387,12 @@ async function load(){
         ? "GoatHub Trading Bot · MAINNET — real money"
         : "GoatHub Trading Bot · Testnet — no real money";
     }
+    const heroStatus = document.getElementById("heroStatus");
+    const heroNet = document.getElementById("heroNet");
+    const heroWallet = document.getElementById("heroWallet");
+    if (heroStatus) heroStatus.textContent = d.user.bot_active ? "Trading enabled" : "Standby";
+    if (heroNet) heroNet.textContent = isMain ? "Mainnet" : "Testnet";
+    if (heroWallet) heroWallet.textContent = d.user.wallet_connected ? "Connected" : "Connect wallet";
     // Show Discord username + avatar if available, else email
     const displayName=d.user.discord_username||d.user.email;
     document.getElementById("uname").textContent=displayName;
@@ -399,6 +405,11 @@ async function load(){
       ubal.after(b);
     }
     const on=d.user.bot_active; botpill.textContent=on?"on":"off"; botpill.className="pill "+(on?"on":"off");
+    const netbadge = document.getElementById("netbadge");
+    if (netbadge) {
+      netbadge.textContent = isMain ? "MAINNET" : "testnet";
+      netbadge.className = "pill " + (isMain ? "off" : "on") + " pulse";
+    }
     document.getElementById("toggle").textContent=on?"Disable Bot":"Enable Bot";
     // Phase 3 (2026-06-02): admin link nur für is_admin user zeigen.
     const al=document.getElementById("adminlink"); if(al){if(d.user.is_admin)al.classList.remove("hide");else al.classList.add("hide")}

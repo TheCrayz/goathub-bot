@@ -6,38 +6,97 @@
 <!-- Phase 6 (2026-06-02): favicon via emoji (no extra file needed). -->
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22&gt;&lt;text y=%22.9em%22 font-size=%2290%22&gt;🐐&lt;/text&gt;&lt;/svg&gt;">
 <style>
-  *{box-sizing:border-box} body{margin:0;background:#0b0f0d;color:#e6f2ec;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-  .wrap{max-width:880px;margin:0 auto;padding:24px}
-  h1{font-size:22px;margin:0 0 2px} .sub{color:#7f9a90;font-size:13px;margin-bottom:14px}
-  .card{background:#0f1714;border:1px solid #1e2a24;border-radius:12px;padding:18px;margin:14px 0}
-  .card h2{font-size:15px;margin:0 0 12px;color:#10b981}
-  .warn{border-color:#5a3b0e;background:#17120a;color:#e9d6a8;font-size:13px}
-  label{display:block;font-size:12px;color:#9fb8af;margin:8px 0 3px}
-  input{width:100%;padding:9px 11px;background:#0a100d;border:1px solid #1e2a24;border-radius:8px;color:#e6f2ec;font-size:14px}
-  button{background:#10b981;color:#04120c;border:0;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;margin-top:10px}
-  button.ghost{background:transparent;color:#10b981;border:1px solid #0e7c5a}
+  :root{
+    --bg:#07100d; --panel:#0b1511; --panel-2:#101c17; --line:#1f342b; --text:#edf7f1; --mut:#9bb9ad;
+    --green:#4af2b2; --green-deep:#0e7c5a; --red:#ff8a8a; --amber:#ffd36b; --glow: rgba(74,242,178,.18);
+  }
+  *{box-sizing:border-box} html{scroll-behavior:smooth}
+  body{
+    margin:0; background:
+      radial-gradient(circle at top, rgba(74,242,178,0.08), transparent 18%),
+      radial-gradient(circle at right top, rgba(47,129,255,0.07), transparent 20%),
+      linear-gradient(160deg,#060b09 0%,#07110d 45%,#040806 100%);
+    color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow-x:hidden;
+  }
+  body::before, body::after{content:"";position:fixed;inset:-20vmax;pointer-events:none;z-index:-1;filter:blur(70px);opacity:.35;animation:drift 18s ease-in-out infinite alternate}
+  body::before{background:radial-gradient(circle,rgba(74,242,178,.07) 0%,transparent 35%);}
+  body::after{background:radial-gradient(circle,rgba(96,165,250,.08) 0%,transparent 30%);animation-duration:22s}
+  .wrap{max-width:1200px;margin:0 auto;padding:24px 18px 40px}
+  .hero{
+    background:linear-gradient(145deg, rgba(10,18,15,.96), rgba(8,14,11,.88));
+    border:1px solid rgba(74,242,178,.16); border-radius:24px; padding:18px 18px 14px; box-shadow:0 20px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
+    position:relative; overflow:hidden;
+  }
+  .hero::after{content:"";position:absolute;inset:-1px;border-radius:24px;padding:1px;background:linear-gradient(120deg, rgba(74,242,178,.22), rgba(96,165,250,.08), rgba(74,242,178,.18)); -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none}
+  .eyebrow{display:flex;align-items:center;gap:8px;color:#9fe8c8;font-size:12px;letter-spacing:.18em;text-transform:uppercase;font-weight:800}
+  .eyebrow .dot{width:8px;height:8px;border-radius:999px;background:linear-gradient(135deg,var(--green),#3ec9ff);box-shadow:0 0 0 4px rgba(74,242,178,.08), 0 0 14px rgba(74,242,178,.35)}
+  h1{font-size:26px;margin:8px 0 4px;line-height:1.1}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:8px}
+  .hero-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;align-items:stretch}
+  .mini-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.15);color:#c9ffe8;font-size:12px;font-weight:700}
+  .mini-pill strong{color:var(--text)}
+  .hero-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+  .hero-metric{background:linear-gradient(145deg, rgba(14,24,20,.96), rgba(9,15,12,.95)); border:1px solid rgba(255,255,255,.06); border-radius:16px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+  .hero-metric .label{color:var(--mut);font-size:11px;letter-spacing:.12em;text-transform:uppercase}
+  .hero-metric .value{font-size:18px;font-weight:800;margin-top:3px}
+  .card{background:linear-gradient(145deg, rgba(10,16,13,.96), rgba(7,11,9,.92)); border:1px solid rgba(255,255,255,.06); border-radius:18px; padding:16px; margin:14px 0; box-shadow:0 18px 40px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.03); position:relative; overflow:hidden}
+  .card::after{content:"";position:absolute;inset:auto -20% -60% auto;width:180px;height:180px;background:radial-gradient(circle,rgba(74,242,178,.06),transparent 60%);pointer-events:none}
+  .card h2{font-size:15px;margin:0 0 10px;color:#a8ffd8;display:flex;align-items:center;gap:8px}
+  .card h2::before{content:"";width:8px;height:8px;border-radius:999px;background:linear-gradient(135deg,var(--green),#7bd8ff);box-shadow:0 0 0 6px rgba(74,242,178,.08)}
+  .warn{border-color:rgba(255,211,107,.18);background:linear-gradient(145deg, rgba(25,18,8,.96), rgba(15,10,5,.96)); color:#ffeec2; font-size:13px}
+  label{display:block;font-size:12px;color:#b9d9ca;margin:8px 0 3px}
+  input, select{width:100%;padding:10px 11px;background:linear-gradient(180deg, rgba(8,13,10,.98), rgba(5,8,7,.98)); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text); font-size:14px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+  input:focus, select:focus{outline:none;border-color:rgba(74,242,178,.35); box-shadow:0 0 0 4px rgba(74,242,178,.08)}
+  button{background:linear-gradient(135deg,#18e0a2,#10b981); color:#03110b; border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; margin-top:10px; box-shadow:0 12px 24px rgba(16,185,129,.18); transition:transform .12s ease, box-shadow .2s ease, opacity .2s ease}
+  button:hover{transform:translateY(-1px); box-shadow:0 14px 28px rgba(16,185,129,.25)}
+  button.ghost{background:transparent;color:#75f2c1;border:1px solid rgba(74,242,178,.28); box-shadow:none}
   .row{display:flex;gap:12px;flex-wrap:wrap} .row>div{flex:1;min-width:120px}
-  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:700}
-  .on{background:#0e3b2b;color:#3fe0a0} .off{background:#3b1e1e;color:#ff8a8a}
-  table{width:100%;border-collapse:collapse;font-size:13px} td,th{text-align:left;padding:6px 4px;border-bottom:1px solid #1e2a24}
-  code{background:#0a100d;padding:2px 6px;border-radius:6px;font-size:12px;word-break:break-all}
-  .msg{font-size:13px;margin-top:8px;min-height:18px} .err{color:#ff8a8a} .ok{color:#3fe0a0}
-  .mut{color:#7f9a90;font-size:12px} a{color:#10b981} .hide{display:none}
-  .foot{color:#5e756b;font-size:11px;text-align:center;margin-top:26px;line-height:1.6}
-  .avatar{width:32px;height:32px;border-radius:50%;border:2px solid #10b981;vertical-align:middle;margin-right:8px}
-  .discord-user{display:flex;align-items:center;font-weight:700;font-size:15px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:800; border:1px solid transparent}
+  .on{background:rgba(74,242,178,.1);color:#9fffdc;border-color:rgba(74,242,178,.25)} .off{background:rgba(255,138,138,.08);color:#ffc4c4;border-color:rgba(255,138,138,.18)}
+  table{width:100%;border-collapse:collapse;font-size:13px} td,th{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.08)}
+  code{background:rgba(255,255,255,.04);padding:2px 6px;border-radius:6px;font-size:12px;word-break:break-all}
+  .msg{font-size:13px;margin-top:8px;min-height:18px} .err{color:#ffb7b7} .ok{color:#9fffdc}
+  .mut{color:var(--mut);font-size:12px} a{color:#91ffd9} .hide{display:none}
+  .foot{color:#8ca79a;font-size:11px;text-align:center;margin-top:26px;line-height:1.6}
+  .avatar{width:32px;height:32px;border-radius:50%;border:2px solid rgba(74,242,178,.35);vertical-align:middle;margin-right:8px;box-shadow:0 0 0 4px rgba(74,242,178,.08)}
+  .discord-user{display:flex;align-items:center;font-weight:800;font-size:15px}
   .stats{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
-  .stat{flex:1;min-width:150px;background:#0f1714;border:1px solid #1e2a24;border-radius:12px;padding:16px}
-  .stat-h{color:#7f9a90;font-size:11px;letter-spacing:.07em;text-transform:uppercase;margin-bottom:8px}
+  .stat{flex:1;min-width:150px;background:linear-gradient(145deg, rgba(10,16,13,.96), rgba(8,13,10,.92)); border:1px solid rgba(255,255,255,.06); border-radius:18px; padding:16px; box-shadow:0 18px 34px rgba(0,0,0,.26); transition:transform .15s ease, border-color .2s ease}
+  .stat:hover{transform:translateY(-2px); border-color:rgba(74,242,178,.18)}
+  .stat-h{color:#b7d6ca;font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}
   .stat-v{font-size:26px;font-weight:800;line-height:1.1}
-  .pos{color:#3fe0a0} .neg{color:#ff8a8a}
-  .tf{display:inline-flex;gap:2px;background:#0a100d;border-radius:8px;padding:2px;margin-bottom:10px}
-  .tfbtn{background:transparent;color:#7f9a90;border:0;border-radius:6px;padding:3px 9px;font-size:11px;font-weight:700;cursor:pointer;margin:0}
-  .tfbtn.on{background:#10b981;color:#04120c}
-  #chart{width:100%;height:170px;display:block}
+  .pos{color:#98ffd6} .neg{color:#ffc7c7}
+  .tf{display:inline-flex;gap:2px;background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.04);border-radius:10px;padding:2px;margin-bottom:10px}
+  .tfbtn{background:transparent;color:#a3c3b5;border:0;border-radius:7px;padding:3px 8px;font-size:11px;font-weight:800;cursor:pointer;margin:0}
+  .tfbtn.on{background:linear-gradient(135deg,#18e0a2,#10b981);color:#04120c}
+  #chart{width:100%;height:170px;display:block;filter:drop-shadow(0 8px 18px rgba(74,242,178,.16))}
+  .pulse{animation:pulse 1.8s infinite}
+  @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.02)}}
+  @keyframes drift{from{transform:translate3d(0,0,0)}to{transform:translate3d(-2%,2%,0)}}
 
-  /* 2026-06-04 Restposten #7: Mobile-responsive polish */
+  @media (max-width: 980px){ .hero-grid{grid-template-columns:1fr} .hero-metrics{grid-template-columns:1fr 1fr} }
   @media (max-width: 720px) {
+    .wrap { padding: 12px; }
+    h1 { font-size: 18px; }
+    .sub { font-size: 12px; }
+    .card { padding: 12px; margin: 10px 0; border-radius: 14px; }
+    .card h2 { font-size: 14px; margin-bottom: 8px; }
+    .row { flex-direction: column; gap: 8px; }
+    .row > div { min-width: 0; width: 100%; }
+    .stats { gap: 8px; }
+    .stat { min-width: 0; padding: 10px 12px; flex: 1 1 calc(50% - 4px); }
+    .stat-v { font-size: 20px; }
+    .stat-h { font-size: 10px; }
+    button { padding: 12px 16px; font-size: 14px; width: auto; min-height: 44px; }
+    button:not(.ghost) + button { margin-top: 8px; }
+    input { font-size: 16px; padding: 11px 12px; }
+    .card table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+    code { font-size: 11px; word-break: break-all; }
+    .pill { font-size: 11px; }
+    .foot { font-size: 10px; margin-top: 16px; }
+  }
+  @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
+</style>  @media (max-width: 720px) {
     .wrap { padding: 12px; }
     h1 { font-size: 18px; }
     .sub { font-size: 12px; }
@@ -75,8 +134,25 @@
   }
 </style></head>
 <body><div class="wrap">
-  <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill on">testnet</span></h1>
-  <div class="sub" id="netline">Community Copy-Trading on Hyperliquid</div>
+  <section class="hero">
+    <div class="eyebrow"><span class="dot"></span> Live trading dashboard</div>
+    <div class="hero-grid">
+      <div>
+        <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill on pulse">testnet</span></h1>
+        <div class="sub" id="netline">Community copy-trading on Hyperliquid — smoother, brighter, and built for fast decisions.</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+          <span class="mini-pill">⚡ Real-time PnL</span>
+          <span class="mini-pill">🛡️ Risk controls</span>
+          <span class="mini-pill">📈 Builder-ready</span>
+        </div>
+      </div>
+      <div class="hero-metrics">
+        <div class="hero-metric"><div class="label">Status</div><div class="value" id="heroStatus">Online</div></div>
+        <div class="hero-metric"><div class="label">Network</div><div class="value" id="heroNet">Testnet</div></div>
+        <div class="hero-metric"><div class="label">Wallet</div><div class="value" id="heroWallet">Ready</div></div>
+      </div>
+    </div>
+  </section>
 
   <!-- 2026-06-08: Risk-Disclosure — IMMER sichtbar (pre-login + logged-in).
        Network-Toggle (Testnet/MAINNET) wird per JS in load() updaten. -->
