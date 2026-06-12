@@ -1,7 +1,7 @@
 # GoatHub Backup & Verification Notes
 
 ## Current verified state
-- Dashboard UI pass: website-style sections, mobile/web-app metadata, and trading desk navigation.
+- Dashboard UI pass: polished trading sections, mobile-friendly metadata, and trading desk navigation.
 - Test verification: `python3 -m pytest -q` → `17 passed in 1.80s`.
 - Deployment path: systemd service via [goathub.service](goathub.service), not Docker.
 

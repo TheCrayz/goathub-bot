@@ -44,20 +44,6 @@
   .site-nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
   .site-nav a{display:inline-flex;align-items:center;gap:6px;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:#e7fff4;text-decoration:none;font-size:12px;font-weight:700}
   .site-nav a:hover{background:rgba(74,242,178,.08);border-color:rgba(74,242,178,.18)}
-  .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-  .hero-cta{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-  .hero-cta .btn-main,.hero-cta .btn-secondary{border-radius:999px;padding:10px 12px;font-size:13px;font-weight:800;text-decoration:none}
-  .btn-main{background:linear-gradient(135deg,#18e0a2,#10b981);color:#03110b;box-shadow:0 12px 24px rgba(16,185,129,.18)}
-  .btn-secondary{background:rgba(255,255,255,.04);color:#e7fff4;border:1px solid rgba(74,242,178,.18)}
-  .topbar-brand{display:flex;align-items:center;gap:10px}
-  .topbar-brand .logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg, rgba(74,242,178,.18), rgba(96,165,250,.12)); border:1px solid rgba(74,242,178,.18); display:grid;place-items:center;font-size:20px}
-  .topbar-actions{display:flex;gap:8px;flex-wrap:wrap}
-  .topbar-btn{background:linear-gradient(135deg,#18e0a2,#10b981); color:#03110b; border:0; border-radius:999px; padding:8px 12px; font-weight:800; font-size:12px; box-shadow:0 10px 18px rgba(16,185,129,.18)}
-  .topbar-btn.ghost{background:transparent;color:#75f2c1;border:1px solid rgba(74,242,178,.28); box-shadow:none}
-  .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-  .feature-card{background:linear-gradient(145deg, rgba(12,19,16,.98), rgba(8,13,10,.98)); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:12px; box-shadow:0 14px 28px rgba(0,0,0,.24)}
-  .feature-card strong{display:block;font-size:14px;margin-bottom:4px}
-  .feature-card span{color:#bcd8c8;font-size:12px}
   .section-kicker{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#9fe8c8;font-weight:800}
   .hero-metric{background:linear-gradient(145deg, rgba(14,24,20,.96), rgba(9,15,12,.95)); border:1px solid rgba(255,255,255,.06); border-radius:16px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
   .desk-strip{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}
@@ -161,32 +147,12 @@
   @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .mini-grid{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
 </style></head>
 <body><div class="wrap">
-  <div class="topbar">
-    <div class="topbar-brand">
-      <div class="logo">🐐</div>
-      <div>
-        <div class="eyebrow" style="font-size:10px">GoatHub Platform</div>
-        <div style="font-size:18px;font-weight:800">Trading Desk · Web App Ready</div>
-      </div>
-    </div>
-    <div class="topbar-actions">
-      <button class="topbar-btn ghost" id="topOpenWallet">Wallet</button>
-      <button class="topbar-btn ghost" id="topOpenRisk">Risk</button>
-      <button class="topbar-btn" id="topOpenOverview">Overview</button>
-    </div>
-  </div>
-
   <section class="hero">
     <div class="eyebrow"><span class="dot"></span> Live trading dashboard</div>
     <div class="hero-grid">
       <div>
         <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill off pulse">MAINNET</span></h1>
         <div class="sub" id="netline">Community copy-trading on Hyperliquid — smoother, brighter, and built for fast decisions.</div>
-        <div class="hero-cta">
-          <a class="btn-main" href="#overview">Open trading desk</a>
-          <a class="btn-secondary" href="#wallet">Connect wallet</a>
-          <a class="btn-secondary" href="#history">View history</a>
-        </div>
         <div class="desk-strip">
           <div style="display:flex;flex-wrap:wrap;gap:8px">
             <span class="desk-tag">⚡ Trading Desk</span>
@@ -288,14 +254,8 @@
       </div>
     </section>
 
-    <section class="card" style="border-color:rgba(74,242,178,.18)">
-      <div class="section-kicker">Platform</div>
-      <h2 style="margin-top:6px">Trader At-a-Glance</h2>
-      <div class="feature-grid" style="margin-top:8px">
-        <article class="feature-card"><strong>Desk Mode</strong><span>Live account, PnL, and position data in one workspace.</span></article>
-        <article class="feature-card"><strong>Risk Layer</strong><span>Exposure, leverage cap, and capital controls are always visible.</span></article>
-        <article class="feature-card"><strong>Web App Ready</strong><span>Mobile Safari / Android-friendly layout and standalone feel.</span></article>
-      </div>
+    <section class="card">
+      <h2>Trader At-a-Glance</h2>
       <div class="chip-row">
         <span class="chip">⚡ Live PnL</span>
         <span class="chip">📊 Hyperliquid snapshot</span>
@@ -477,12 +437,6 @@
       <div class="mut" id="actempty">No activity yet.</div>
     </section>
   </div>
-
-  <section class="card" style="border-color:rgba(74,242,178,.18)">
-    <div class="section-kicker">App</div>
-    <h2 style="margin-top:6px">Safari / Android Web App Style</h2>
-    <div class="mut">The interface is now framed like a real trading platform: clear sections, quick entry points, and mobile-friendly presentation for standalone browser use.</div>
-  </section>
 
   <div class="foot"><span id="foot-net">GoatHub Trading Bot</span> · not financial advice · trade at your own risk<br>
     Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>

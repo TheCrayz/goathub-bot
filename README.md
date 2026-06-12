@@ -83,7 +83,7 @@ Keep `ENABLE_LISTENER=false` and `HL_TESTNET=true` locally.
 
 ## Current status (2026-06-12)
 
-- Latest verified UI pass: website-style dashboard, app-style sections, mobile/web-app metadata, and live trading overview cards.
+- Latest verified UI pass: polished dashboard sections, mobile-friendly metadata, and live trading overview cards.
 - Verified locally with `python3 -m pytest -q` → `17 passed in 1.80s`.
 - Deployment path is `systemd`, not Docker: [goathub.service](goathub.service) runs `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
 - CI/CD auto-deploys on push to `main` (`.github/workflows/deploy.yml` → SSH `git pull` + service restart).
