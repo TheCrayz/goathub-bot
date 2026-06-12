@@ -1523,31 +1523,37 @@ async def reconcile_stop_coverage(user_ids=None):
             if abs(szi) == 0:
                 continue
             try:
-                sz = abs(szi)
-                covered = await asyncio.to_thread(trader.covered_stop_size, coin)
-                if covered >= sz * 0.999:
-                    continue  # voll per SL gedeckt — nichts zu tun
-                uncovered = sz - covered
-                sl, tps = _load_protection_params(user_id, coin)
-                if sl is None:
-                    _log_activity(
-                        user_id, "error",
-                        f"{coin}: Position qty {sz:.6g} nur zu {covered:.6g} per SL gedeckt, KEIN "
-                        f"SL-Preis im managed_trade bekannt — bitte manuell absichern/schließen.")
-                    continue
-                is_buy = szi > 0
-                # Schutz für die FEHLENDE Menge nachlegen (reduce-only stackt mit
-                # vorhandenen Stops bei gleichem Trigger → Summe deckt die Position).
-                prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, uncovered, sl, tps)
-                if prot.get("sl_ok"):
-                    _log_activity(
-                        user_id, "update",
-                        f"{coin}: Reconciler hat Unter-Deckung gefixt — SL/TP für fehlende "
-                        f"{uncovered:.6g} nachgelegt (war {covered:.6g}/{sz:.6g}, SL {sl}).")
-                else:
-                    _log_activity(
-                        user_id, "error",
-                        f"{coin}: Unter-Deckung ({covered:.6g}/{sz:.6g}) — Schutz nachlegen "
-                        f"FEHLGESCHLAGEN ({str(prot.get('sl'))[:120]}). Manuell absichern!")
+                # 2026-06-13 Review-Fix: Coverage-Read + place_protection unter
+                # demselben (user,coin)-Lock wie Engine/Watcher. Seit der Loop
+                # PERIODISCH läuft (nicht mehr startup-only), konnte er sonst
+                # parallel zu _adjust/_protect_when_filled doppelten Schutz
+                # nachlegen oder gegen einen gerade laufenden Cancel rennen.
+                async with _lock_for(user_id, coin):
+                    sz = abs(szi)
+                    covered = await asyncio.to_thread(trader.covered_stop_size, coin)
+                    if covered >= sz * 0.999:
+                        continue  # voll per SL gedeckt — nichts zu tun
+                    uncovered = sz - covered
+                    sl, tps = _load_protection_params(user_id, coin)
+                    if sl is None:
+                        _log_activity(
+                            user_id, "error",
+                            f"{coin}: Position qty {sz:.6g} nur zu {covered:.6g} per SL gedeckt, KEIN "
+                            f"SL-Preis im managed_trade bekannt — bitte manuell absichern/schließen.")
+                        continue
+                    is_buy = szi > 0
+                    # Schutz für die FEHLENDE Menge nachlegen (reduce-only stackt mit
+                    # vorhandenen Stops bei gleichem Trigger → Summe deckt die Position).
+                    prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, uncovered, sl, tps)
+                    if prot.get("sl_ok"):
+                        _log_activity(
+                            user_id, "update",
+                            f"{coin}: Reconciler hat Unter-Deckung gefixt — SL/TP für fehlende "
+                            f"{uncovered:.6g} nachgelegt (war {covered:.6g}/{sz:.6g}, SL {sl}).")
+                    else:
+                        _log_activity(
+                            user_id, "error",
+                            f"{coin}: Unter-Deckung ({covered:.6g}/{sz:.6g}) — Schutz nachlegen "
+                            f"FEHLGESCHLAGEN ({str(prot.get('sl'))[:120]}). Manuell absichern!")
             except Exception as e:
                 log.warning("reconcile: protect failed user %s coin %s: %s", user_id, coin, e)

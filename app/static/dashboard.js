@@ -228,7 +228,7 @@ async function saveSettings(){
   let errMsg=null;
   if(!isFinite(rp)||rp<0.05||rp>5) errMsg="Risk % muss zwischen 0.05 und 5 liegen (0.5 = 0.5 % pro Trade).";
   else if(!isFinite(lv)||lv<1||lv>50) errMsg="Max Leverage Cap muss zwischen 1 und 50 liegen.";
-  else if(!isFinite(mp)||mp<1) errMsg="Max Open Positions muss mindestens 1 sein.";
+  else if(!isFinite(mp)||mp<1||mp>20) errMsg="Max Open Positions muss zwischen 1 und 20 liegen.";
   else if(!isFinite(cp)||cp<0) errMsg="Capital Cap darf nicht negativ sein (0 = ganzer Account).";
   if(errMsg){show(smsgEl,errMsg,"err");toast("Settings nicht gespeichert: "+errMsg,"err");return;}
   try{
@@ -742,6 +742,10 @@ async function load(){
     if(e.status===401){
       localStorage.removeItem("ght");   // Legacy-Token ist wirklich tot
       LOGGED_IN=false;
+      // 2026-06-13 Review-Fix: Polling stoppen — sonst hämmert der Interval
+      // nach Session-Ablauf alle 15s weiter gegen 401. startPolling() re-armt
+      // nach dem nächsten erfolgreichen Login/load().
+      if(POLL){clearInterval(POLL);POLL=null;}
       document.getElementById("app").classList.add("hide");
       document.getElementById("auth").classList.remove("hide");
       hideLoadErr();
@@ -913,9 +917,14 @@ function render(d){
     const ok=!!h&&(h.status==="ok"||h.ok===true);   // h.ok: Alt-Server während Deploy-Übergang
     setHero("heroStatus",ok?"Online":"Offline");
     setHero("heroWallet","—");
+    // 2026-06-13 Review-Fix: heroNet bleibt pre-login bewusst neutral (LOW-10),
+    // aber der Skeleton-Shimmer muss trotzdem aufgelöst werden — sonst
+    // schimmert das Feld für ausgeloggte Besucher endlos.
+    setHero("heroNet","—");
   }catch(e){
     if(LOGGED_IN||!document.getElementById("app").classList.contains("hide"))return;
     setHero("heroStatus","Offline");
+    setHero("heroNet","—");
   }
 })();
 

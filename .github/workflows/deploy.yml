@@ -66,9 +66,22 @@ jobs:
             # 2026-06-12 (#38): DB-Backup VOR dem Pull — init_db fährt teils
             # destruktive Recreate-Migrationen (DROP TABLE in db.py); ohne
             # Backup wäre ein kaputter Deploy = Datenverlust aller User.
+            # 2026-06-13 Review-Fix: sqlite Online-Backup-API statt `cp` — die
+            # DB läuft im WAL-Modus (db.py PRAGMA journal_mode=WAL); ein cp am
+            # laufenden Service verliert uncheckpointete Transaktionen bzw.
+            # kann mid-checkpoint eine kaputte Datei ziehen — genau im
+            # Szenario, für das das Backup existiert.
             if [ -f goathub.db ]; then
-              cp goathub.db "goathub.db.bak-$(date +%Y%m%d-%H%M%S)"
+              venv/bin/python -c "import sqlite3,datetime;ts=datetime.datetime.now().strftime('%Y%m%d-%H%M%S');s=sqlite3.connect('file:goathub.db?mode=ro',uri=True);d=sqlite3.connect(f'goathub.db.bak-{ts}');s.backup(d);d.close();s.close();print(f'backup: goathub.db.bak-{ts}')"
+              # Aufräumen: nur die letzten 7 Deploy-Backups behalten
+              ls -1t goathub.db.bak-* 2>/dev/null | tail -n +8 | xargs -r rm --
             fi
+
+            # 2026-06-13 Review-Fix: nach dem one-time `chown -R goathub:goathub`
+            # (siehe goathub.service) gehört das Repo nicht mehr root — git
+            # >= 2.35.2 verweigert sonst JEDEN pull ("dubious ownership").
+            # Idempotent, daher bei jedem Deploy gesetzt.
+            git config --global --add safe.directory /var/www/goathub-bot || true
 
             echo "📥 Pulling latest code..."
             git pull https://${{ secrets.GH_TOKEN }}@github.com/TheCrayz/goathub-bot.git main || \

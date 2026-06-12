@@ -10,9 +10,12 @@
 <link rel="manifest" href="/static/manifest.json">
 <!-- 2026-06-12 Frontend-Overhaul: echtes Goat-Mark als Favicon statt Emoji
      (Emoji rendert auf jedem OS anders; das SVG ist das Brand-Asset, das auch
-     manifest.json nutzt). Kein apple-touch-icon: dafür bräuchten wir PNG,
-     Pillow ist im venv nicht installiert — SVG-only bis PNGs generiert sind. -->
+     manifest.json nutzt).
+     2026-06-13 Review-Fix (#48): PNGs nachgerendert (qlmanage+sips aus icon.svg)
+     → echte 192/512-Manifest-Icons + apple-touch-icon, damit Android-Install-
+     Prompt und iOS "Zum Home-Bildschirm" das Goat-Mark statt Screenshot zeigen. -->
 <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <style>
   /* 2026-06-12 Brand-Pass: Base von grün-getöntem #07100d auf neutrales
      Near-Black (#050607-#0a0c0b) — Emerald ist für DATEN und ACTIONS
@@ -415,7 +418,7 @@
           <div><label for="risk">Risk % per trade</label><input id="risk" type="number" step="0.05" min="0.05" max="5" inputmode="decimal" placeholder="0.5">
             <div id="riskhint" class="mut" style="font-size:11px;min-height:14px"></div></div>
           <div><label for="lev">Max Leverage Cap (Auto)</label><input id="lev" type="number" step="1" min="1" max="50"></div>
-          <div><label for="maxp">Max Open Positions</label><input id="maxp" type="number" step="1" min="1"></div>
+          <div><label for="maxp">Max Open Positions</label><input id="maxp" type="number" step="1" min="1" max="20"></div>
           <div><label for="cap">Capital Cap (USDC, 0 = full account)</label><input id="cap" type="number" step="50" min="0"></div>
         </div>
         <button id="saveSettingsBtn">Save Settings</button>
@@ -540,5 +543,5 @@
     Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>
 </div>
 <div id="toasts" aria-live="polite"></div>
-<script src="/static/dashboard.js?v=20260612v" defer></script>
+<script src="/static/dashboard.js?v=20260613a" defer></script>
 </body></html>

@@ -300,7 +300,14 @@ function _renderAgo(){
 async function refreshLive(){
   if(document.visibilityState!=="visible")return;
   if(document.getElementById("content").style.display==="none")return;
-  await Promise.allSettled([loadHealth(),loadUsers(),loadHalt()]);
+  // 2026-06-13 Review-Fix: Users-Tabelle NICHT neu bauen, während der Admin
+  // mit Maus/Fokus drin ist — sonst wandert der pause/resume-Button beim
+  // 30s-Tick unter dem Cursor weg (UX-Hazard auf einem Emergency-Control).
+  const utbl=document.getElementById("utbl");
+  const userTableBusy=utbl&&(utbl.matches(":hover")||utbl.contains(document.activeElement));
+  const jobs=[loadHealth(),loadHalt()];
+  if(!userTableBusy)jobs.push(loadUsers());
+  await Promise.allSettled(jobs);
   _markRefreshed();
 }
 setInterval(refreshLive,30000);

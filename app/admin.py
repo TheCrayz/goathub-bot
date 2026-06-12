@@ -26,11 +26,10 @@ from app.models import Activity, ManagedTrade, User
 
 # 2026-06-12 H-C: derselbe slowapi-Limiter wie in main.py (gleiches Pattern
 # wie alle anderen rate-limited Routes, gleiche _client_ip-Key-Func).
-# Zirkular-sicher: main.py definiert `limiter` VOR `from app.admin import
-# router` — beim normalen Import-Pfad (uvicorn/Tests laden app.main) ist er
-# hier also schon da. app.admin deshalb NIE direkt vor app.main importieren
-# (macht aktuell auch niemand — einziger Importer ist main.py selbst).
-from app.main import limiter
+# 2026-06-13 Review-Fix: aus app.ratelimit statt app.main — der alte
+# `from app.main import limiter` war ein echter Zirkular-Import und crashte
+# bei direktem `import app.admin` (Tests/Tools) mit ImportError.
+from app.ratelimit import limiter
 
 log = logging.getLogger("goathub.admin")
 

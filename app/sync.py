@@ -206,7 +206,8 @@ async def _reconcile_one_user(user_id: int, address: str):
 
     # Jede open managed_trade prüfen
     db = SessionLocal()
-    flipped_coins = []   # LOW-5: Coins, deren Row hier auf 'closed' geflippt wurde
+    flipped_coins = []     # LOW-5: Coins, deren Row hier auf 'closed' geflippt wurde
+    resting_cancels = []   # 2026-06-13 Review-Fix: (coin, oid) der auf 'open' geflippten Rows
     try:
         closed_count = 0
         reopened_count = 0
@@ -215,6 +216,12 @@ async def _reconcile_one_user(user_id: int, address: str):
             if mt is None or mt.status != "resting":
                 continue
             mt.status = "open"
+            # 2026-06-13 Review-Fix: der Limit-Entry kann PARTIAL gefüllt haben —
+            # der Rest der Order liegt dann noch im Buch und würde später ohne
+            # Watcher/Schutz nachfüllen. Oid merken und nach dem Commit
+            # best-effort canceln (gleiches Muster wie LOW-5).
+            if mt.resting_oid:
+                resting_cancels.append((coin, mt.resting_oid))
             db.add(Activity(
                 user_id=user_id,
                 kind="error",
@@ -226,7 +233,9 @@ async def _reconcile_one_user(user_id: int, address: str):
         if not strikes_allowed:
             if reopened_count > 0:
                 db.commit()
-            return
+            # 2026-06-13 Review-Fix: NICHT mehr early-return — die resting_cancels
+            # unten müssen auch in diesem Pfad laufen. Strike-Logik überspringen.
+            open_coins = []
         for mt_id, coin in open_coins:
             mt = db.get(ManagedTrade, mt_id)
             if mt is None or mt.status == "closed":
@@ -269,6 +278,12 @@ async def _reconcile_one_user(user_id: int, address: str):
     for coin in flipped_coins:
         await _cancel_leftover_orders(user_id, coin)
 
+    # 2026-06-13 Review-Fix: Rest einer (partial gefüllten) Limit-Entry-Order
+    # der auf 'open' geflippten Rows canceln — sonst füllt der Order-Rest später
+    # ohne Watcher/Schutz nach. Best-effort wie LOW-5.
+    for coin, oid in resting_cancels:
+        await _cancel_resting_remainder(user_id, coin, oid)
+
 
 async def _cancel_leftover_orders(user_id: int, coin: str):
     """LOW-5 (2026-06-12): TP/SL-Trigger-Orders eines gerade auf 'closed'
@@ -305,3 +320,24 @@ async def _cancel_leftover_orders(user_id: int, coin: str):
                          user_id, coin, n)
     except Exception as e:
         log.warning("leftover-order-cancel user=%d coin=%s failed: %s", user_id, coin, e)
+
+
+async def _cancel_resting_remainder(user_id: int, coin: str, oid):
+    """2026-06-13 Review-Fix: einzelne (Rest-)Limit-Entry-Order per oid canceln,
+    nachdem ihre resting-Row auf 'open' geflippt wurde. Anders als
+    _cancel_leftover_orders KEIN Sweep über alle Orders des Coins — die Position
+    ist ja live und der Coverage-Reconciler legt gleich SL/TP nach, die wir
+    nicht wegräumen dürfen. Best-effort: Fehler nur loggen."""
+    try:
+        from app.engine import _build_trader, _get_user, _lock_for
+        u = _get_user(user_id)
+        if u is None or not u.hl_api_secret_enc:
+            return
+        async with _lock_for(user_id, coin):
+            trader = await _build_trader(u)
+            await asyncio.to_thread(trader.cancel_order, coin, int(oid))
+            log.info("position-sync user=%d coin=%s: Rest der Limit-Entry-Order %s gecancelt",
+                     user_id, coin, oid)
+    except Exception as e:
+        log.warning("resting-remainder-cancel user=%d coin=%s oid=%s failed: %s",
+                    user_id, coin, oid, e)

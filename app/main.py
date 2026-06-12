@@ -35,31 +35,12 @@ from app.discord_oauth import exchange_code, get_discord_user, get_guild_member,
 # 10/5min-Limit. Jetzt: Proxy-Header werden NUR vertraut, wenn der direkte
 # TCP-Peer localhost ist (= Caddy auf derselben Maschine; uvicorn wird im
 # systemd-Unit auf 127.0.0.1 gebunden). Jeder andere Peer = seine eigene IP.
-_TRUSTED_PROXY_PEERS = ("127.0.0.1", "::1")
-
-
-def _client_ip(request: Request) -> str:
-    peer = request.client.host if request.client else None
-    if peer in _TRUSTED_PROXY_PEERS:
-        # Direkter Peer ist der lokale Reverse-Proxy (Caddy) → dessen Header
-        # sind vertrauenswürdig. Primary: X-Real-IP (proxy-kontrolliert).
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
-        # Fallback: letzter Wert in der XFF-Chain (Proxy appendet als letztes).
-        # Achtung: NICHT der erste — der ist attacker-controlled wenn der
-        # Proxy kein XFF-Clearing macht.
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            return xff.split(",")[-1].strip()
-    # Kein (vertrauenswürdiger) Proxy davor → TCP-Peer zählt. Header von
-    # Nicht-localhost-Peers werden bewusst IGNORIERT (Spoofing-Schutz).
-    return peer or get_remote_address(request)
-
-
-limiter = Limiter(key_func=_client_ip)
-LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "10/5minute")
-REGISTER_RATE_LIMIT = os.getenv("REGISTER_RATE_LIMIT", "5/5minute")
+# 2026-06-13 Review-Fix: limiter + _client_ip nach app/ratelimit.py verschoben
+# (Zirkular-Import app.main ↔ app.admin). Re-Export hier für Backwards-Compat.
+from app.ratelimit import (  # noqa: F401
+    _TRUSTED_PROXY_PEERS, _client_ip, limiter,
+    LOGIN_RATE_LIMIT, REGISTER_RATE_LIMIT,
+)
 
 OAUTH_STATE_COOKIE = "discord_oauth_state"
 OAUTH_STATE_TTL_S = 600  # 10 min, plenty for a sane user flow
@@ -209,16 +190,22 @@ async def lifespan(app: FastAPI):
     # TOKEN_USAGE-Zeilen in unsere DB, damit Historie auch nach Log-Rotation
     # erhalten bleibt. Liest bot.log alle 5 Minuten, idempotent (skip wenn
     # ts+counts schon in DB).
-    # 2026-06-12 #54: nur noch per Opt-in (SIGNALBOT_LOG_PATH in .env). Der
-    # Loop pollte sonst in JEDEM Deployment einen fremden TradingHub-Docker-
-    # Pfad — auf Hosts ohne dieses Volume ein stiller No-Op alle 5 Minuten.
-    if config.SIGNALBOT_LOG_PATH:
+    # 2026-06-12 #54: nur noch per Opt-in. Der Loop pollte sonst in JEDEM
+    # Deployment einen fremden TradingHub-Docker-Pfad — auf Hosts ohne dieses
+    # Volume ein stiller No-Op alle 5 Minuten.
+    # 2026-06-13 Review-Fix (Integration): Gate auf TOKEN_SCRAPER_ENABLED —
+    # denselben Knopf, den der Loop selbst prüft. Vorher gateten wir hier auf
+    # SIGNALBOT_LOG_PATH (Legacy-Alias); wer nur TOKEN_USAGE_LOG_PATH bzw.
+    # TOKEN_SCRAPER_ENABLED=true setzte (so dokumentiert es .env.example),
+    # bekam einen Scraper, der nie startete.
+    if config.TOKEN_SCRAPER_ENABLED:
         from app.token_usage_scraper import token_usage_scrape_loop
         t = asyncio.create_task(token_usage_scrape_loop())
         _attach_logger(t, "token_usage_scrape_loop")
         tasks.append(t)
     else:
-        log.info("Token-Usage-Scraper AUS (SIGNALBOT_LOG_PATH nicht gesetzt).")
+        log.info("Token-Usage-Scraper AUS (TOKEN_SCRAPER_ENABLED=false — "
+                 "Pfad via TOKEN_USAGE_LOG_PATH/SIGNALBOT_LOG_PATH setzen).")
     yield
     for t in tasks:
         t.cancel()
@@ -840,11 +827,19 @@ def submit_builder_approval(
     if action_builder != config.BUILDER_ADDRESS.lower():
         raise HTTPException(400, f"action.builder mismatch (got {action_builder[:10]}…, expected our builder)")
     # Sanity: maxFeeRate <= konfigurierte BUILDER_FEE (fee_to_int raised bei >0.1%)
+    # 2026-06-13 Review-Fix: maxFeeRate ist PFLICHT. fee_to_int(None/garbage)
+    # liefert 0 → "0 <= required" hätte eine Action OHNE maxFeeRate durch-
+    # gewunken; HL interpretiert das Feld selbst, wir relayen nur Verifiziertes.
+    raw_fee = body.action.get("maxFeeRate")
+    if raw_fee in (None, ""):
+        raise HTTPException(400, "action.maxFeeRate missing")
     try:
         required_bps = fee_to_int(config.BUILDER_FEE)
-        submitted_bps = fee_to_int(body.action.get("maxFeeRate"))
+        submitted_bps = fee_to_int(raw_fee)
     except ValueError as e:
         raise HTTPException(400, f"Invalid maxFeeRate: {e}")
+    if submitted_bps <= 0:
+        raise HTTPException(400, f"Invalid maxFeeRate: {str(raw_fee)[:32]!r}")
     if submitted_bps > required_bps:
         raise HTTPException(
             400, f"maxFeeRate too high (got {submitted_bps} bps, our configured fee is "

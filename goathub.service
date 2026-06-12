@@ -10,6 +10,7 @@
 #   mkdir -p /var/lib/goathub && chown goathub:goathub /var/lib/goathub && chmod 700 /var/lib/goathub
 #   mkdir -p /var/backups/goathub && chown goathub:goathub /var/backups/goathub && chmod 700 /var/backups/goathub
 #   chown -R goathub:goathub /var/www/goathub-bot
+#   git config --global --add safe.directory /var/www/goathub-bot   # root pullt im goathub-Repo (deploy.yml setzt das auch selbst)
 #   cp goathub.service goathub-backup.service goathub-backup.timer /etc/systemd/system/
 #   systemctl daemon-reload && systemctl restart goathub && systemctl enable --now goathub-backup.timer
 # Danach installiert der Deploy-Workflow Unit-Updates automatisch (gated auf
@@ -32,10 +33,13 @@ WorkingDirectory=/var/www/goathub-bot
 # Caddys X-Forwarded-For → Rate-Limit-Key in main.py wäre spoofbar gewesen
 # (Pair-Fix mit _client_ip in app/main.py).
 ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
-# 2026-06-12 (#8): on-failure statt always — bei sauberem `systemctl stop` /
-# exit 0 (z.B. bewusstem Operator-Halt) soll systemd den Bot nicht sofort
-# wieder hochziehen; Crashes werden weiterhin neu gestartet.
-Restart=on-failure
+# 2026-06-13 Review-Fix: zurück auf always. `systemctl stop` restartet bei
+# systemd NIE automatisch (Restart= gilt nur für unrequested exits) — der
+# Operator-Halt war also nie das Problem. on-failure hätte dagegen einen
+# unerwarteten sauberen Selbst-Exit (exit 0, z.B. stray SIGTERM mit graceful
+# uvicorn-Shutdown) liegen lassen: Engine down, kein Sync, niemand merkt's.
+# Für eine Trading-Engine ist Verfügbarkeit der sichere Default.
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

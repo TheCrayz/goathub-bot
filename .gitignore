@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 .env
 goathub.db
+goathub.db.bak-*
 *.db
 *.db-shm
 *.db-wal
