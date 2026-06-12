@@ -113,7 +113,7 @@ def admin_pause_user(
     if u.id == admin.id:
         raise HTTPException(400, "Cannot pause yourself via admin API")
     u.bot_active = False
-    db.add(Activity(user_id=u.id, kind="error", text=f"Bot pausiert (admin: {admin.email or admin.discord_username}): {reason[:200]}"))
+    db.add(Activity(user_id=u.id, kind="error", text=f"Bot paused (admin: {admin.email or admin.discord_username}): {reason[:200]}"))
     db.commit()
     return {"ok": True, "user_id": u.id, "bot_active": False}
 
@@ -132,7 +132,7 @@ def admin_resume_user(
     if _key_len(u.hl_api_secret_enc) != 66:
         raise HTTPException(400, "User's key looks malformed (length != 66). They need to re-save in their dashboard first.")
     u.bot_active = True
-    db.add(Activity(user_id=u.id, kind="order", text=f"Bot wieder aktiviert (admin: {admin.email or admin.discord_username})"))
+    db.add(Activity(user_id=u.id, kind="order", text=f"Bot re-activated (admin: {admin.email or admin.discord_username})"))
     db.commit()
     return {"ok": True, "user_id": u.id, "bot_active": True}
 
@@ -181,10 +181,10 @@ def admin_halt(admin: User = Depends(current_admin_user), db: Session = Depends(
     db.add(Activity(
         user_id=admin.id, kind="error",
         text=f"🚨 PANIC-HALT triggered by admin {admin.email or admin.discord_username}: "
-             f"{paused} user(s) paused + EMERGENCY_HALT-Flag gesetzt."
+             f"{paused} user(s) paused + EMERGENCY_HALT flag set."
     ))
     db.commit()
-    _set_emergency_halt(reason=f"Manuell durch admin {admin.email or admin.discord_username}")
+    _set_emergency_halt(reason=f"Manual halt by admin {admin.email or admin.discord_username}")
     return {"ok": True, "users_paused": paused, "emergency_halt": True}
 
 
@@ -197,7 +197,7 @@ def admin_halt_clear(admin: User = Depends(current_admin_user), db: Session = De
     db.add(Activity(
         user_id=admin.id, kind="order",
         text=f"EMERGENCY_HALT cleared by admin {admin.email or admin.discord_username}. "
-             f"User müssen sich selbst wieder aktivieren."
+             f"Users must re-activate themselves."
     ))
     db.commit()
     return {"ok": True, "emergency_halt": False}

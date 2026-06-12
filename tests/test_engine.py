@@ -125,7 +125,7 @@ def test_pause_user_bad_key_idempotent():
     activities = db.query(Activity).filter(Activity.user_id == 1).all()
     assert u_fresh.bot_active is False, "bot sollte pausiert sein"
     assert len(activities) == 1, f"genau 1 Activity erwartet, hab {len(activities)}"
-    assert "Agent-Key ungültig" in activities[0].text, "klare Fehlermeldung erwartet"
+    assert "Agent-Key invalid" in activities[0].text, "klare Fehlermeldung erwartet"
     db.close()
 
     # Zweiter Aufruf: schon pausiert → no-op (KEIN zweiter Activity-Eintrag)
@@ -547,7 +547,7 @@ def test_position_unknown_aborts_safely():
         engine._build_trader = orig_build
 
     errs = _activities(1, "error")
-    assert sum("Positionsstatus" in t for t in errs) == 2, errs
+    assert sum("position status" in t for t in errs) == 2, errs
     db = SessionLocal()
     st = db.query(ManagedTrade).filter_by(user_id=1, coin="BTC").first().status
     db.close()
@@ -692,7 +692,7 @@ def test_missing_direction_skips_new_trade():
     assert all(c[0] != "place_entry" for c in stub.calls), \
         f"Signal ohne Direction darf NICHT ausgeführt werden, hab {stub.calls}"
     errs = _activities(1, "error")
-    assert any("Direction" in t for t in errs), errs
+    assert any("direction" in t for t in errs), errs
     print("missing_direction_skips_new_trade: OK")
 
 

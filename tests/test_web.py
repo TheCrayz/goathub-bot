@@ -305,3 +305,76 @@ def test_health_is_minimal(client):
     # Exakte Shape: KEIN listener-Status, KEIN testnet/mainnet-Leak mehr —
     # die Details stehen auth-gated in /api/admin/health.
     assert r.json() == {"status": "ok"}
+
+
+# ── Referral: /api/referral-status ──────────────────────────────────────────
+def _connect_wallet(client, hdrs):
+    """Verbindet eine valide (Master, Agent)-Wallet für den eingeloggten User."""
+    from eth_account import Account
+    agent = Account.create()
+    agent_key = agent.key.hex()
+    if not agent_key.startswith("0x"):
+        agent_key = "0x" + agent_key
+    addr = "0x" + "33" * 20
+    r = client.post("/api/wallet", json={"hl_account_address": addr,
+                                         "hl_api_secret": agent_key}, headers=hdrs)
+    assert r.status_code == 200, r.text[:200]
+    return addr
+
+
+def test_referral_status_without_wallet(client):
+    """Ohne verbundene Wallet: kein HL-Call, exakte Shape mit Code/Link aus config."""
+    from app import config
+    r = _register(client, "ref-nowallet@test.local", "refpw12345")
+    assert r.status_code == 200
+    rr = client.get("/api/referral-status", headers=_auth_headers(r))
+    assert rr.status_code == 200, rr.text[:200]
+    body = rr.json()
+    assert body == {
+        "code": config.REFERRAL_CODE,
+        "link": config.REFERRAL_LINK,
+        "wallet_connected": False,
+        "referred_by": None,
+        "is_ours": False,
+        "error": None,
+    }
+
+
+def test_referral_status_with_mocked_trader(client, monkeypatch):
+    """Mit Wallet + gemocktem Trader, dessen referral_state() unseren Code liefert
+    → is_ours=True, wallet_connected=True, kein echter HL-Call."""
+    import app.engine as engine
+    from app import config
+
+    r = _register(client, "ref-wallet@test.local", "refpw12345")
+    assert r.status_code == 200
+    hdrs = _auth_headers(r)
+    _connect_wallet(client, hdrs)
+
+    class _StubTrader:
+        def referral_state(self):
+            return {"referred_by_code": config.REFERRAL_CODE,
+                    "referrer_addr": "0x" + "ab" * 20, "raw": {}}
+
+    async def _fake_build_trader(u):
+        return _StubTrader()
+
+    monkeypatch.setattr(engine, "_build_trader", _fake_build_trader)
+    rr = client.get("/api/referral-status", headers=hdrs)
+    assert rr.status_code == 200, rr.text[:200]
+    body = rr.json()
+    assert body["wallet_connected"] is True
+    assert body["referred_by"] == config.REFERRAL_CODE
+    assert body["is_ours"] is True
+    assert body["error"] is None
+
+
+def test_set_referrer_without_wallet_is_clean(client):
+    """POST /api/set-referrer ohne Wallet → {ok: false} mit Hinweis, nie 500."""
+    r = _register(client, "ref-set-nowallet@test.local", "refpw12345")
+    assert r.status_code == 200
+    rr = client.post("/api/set-referrer", headers=_auth_headers(r))
+    assert rr.status_code == 200, rr.text[:200]
+    body = rr.json()
+    assert body["ok"] is False
+    assert "wallet" in body["detail"].lower()

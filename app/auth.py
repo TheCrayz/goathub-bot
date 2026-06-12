@@ -167,26 +167,26 @@ def current_user(
     """
     token = request.cookies.get(SESSION_COOKIE_NAME) or bearer
     if not token:
-        raise HTTPException(401, "Nicht angemeldet")
+        raise HTTPException(401, "Not signed in")
     try:
         payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
         uid = int(payload["sub"])
         tv = int(payload.get("tv", 0))
         jwt_identity = str(payload.get("id", ""))
     except (JWTError, KeyError, ValueError):
-        raise HTTPException(401, "Ungültiger Token")
+        raise HTTPException(401, "Invalid token")
     u = db.get(User, uid)
     if not u:
-        raise HTTPException(401, "Nutzer nicht gefunden")
+        raise HTTPException(401, "User not found")
     # Phase 1: stale tokens nach Logout/Pw-Change abweisen.
     if int(getattr(u, "token_version", 0) or 0) != tv:
-        raise HTTPException(401, "Session abgelaufen — bitte neu einloggen")
+        raise HTTPException(401, "Session expired — please log in again")
     # 2026-06-07: Identity-binding gegen Recycled-ID-Bug. JWT ohne `id`-Field
     # (alte Tokens) werden als ungültig abgewiesen — User loggt sich neu ein.
     if not jwt_identity:
-        raise HTTPException(401, "Session muss erneuert werden — bitte neu einloggen")
+        raise HTTPException(401, "Session must be renewed — please log in again")
     if jwt_identity != _user_identity(u):
         # Token zeigt auf user_id X, aber X gehört jetzt einem anderen Identitäts-Owner
         # → Account-Recycling oder versuchter Account-Takeover.
-        raise HTTPException(401, "Session ungültig (Identity-Mismatch) — bitte neu einloggen")
+        raise HTTPException(401, "Session invalid (identity mismatch) — please log in again")
     return u

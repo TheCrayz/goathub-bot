@@ -336,6 +336,23 @@
       <section id="wallet" class="card">
         <div class="section-kicker">Account</div>
         <h2 style="margin-top:6px"><svg class="ico"><use href="#i-user"/></svg> Account &amp; Wallet</h2>
+
+        <!-- 2026-06-13 Referral-Onboarding: neue Nutzer sollen ihren Hyperliquid-
+             Account über Michaels Referral-Link anlegen, damit ihre Trading-Fees
+             mit GoatHub verknüpft sind. Status + Action via /api/referral-status
+             und /api/set-referrer (Logik in dashboard.js). Optik wie Builder-Card. -->
+        <div id="referral" style="margin:4px 0 12px;background:#0c1410;border:1px solid #1f2e23;border-radius:10px;padding:10px 12px">
+          <div style="font-weight:700;color:#a8ffd8;display:flex;align-items:center;gap:7px;font-size:13px"><svg class="ico"><use href="#i-tag"/></svg> Referral</div>
+          <div class="mut" style="margin-top:6px;font-size:13px;line-height:1.6">
+            New to Hyperliquid? Create your account with our
+            <a href="https://app.hyperliquid.xyz/join/TRETAGHUNBERG" target="_blank" rel="noopener">referral link</a>
+            first — it links your trading fees to GoatHub at no extra cost to you.
+          </div>
+          <div style="margin-top:8px">Referral: <span id="refstat" class="pill off">—</span></div>
+          <button id="refbtn" class="ghost">Link referral now</button>
+          <div class="msg" id="refmsg"></div>
+        </div>
+
         <div class="row">
           <div>
             <div class="mut">Logged in as</div>
@@ -365,35 +382,35 @@
              ohne 1:1-Erklärung onboarden können. Vorher haben mind. 2 von 3
              Testern die Adresse statt des Keys eingegeben. -->
         <details id="walletWizard" style="margin-top:10px;background:#0c1410;border:1px solid #1f2e23;border-radius:8px;padding:8px 12px">
-          <summary style="cursor:pointer;color:#7ce0a8;font-weight:600">Wie hole ich Master-Adresse + Agent-Key? (Klick für Anleitung)</summary>
+          <summary style="cursor:pointer;color:#7ce0a8;font-weight:600">How do I get the Master Address + Agent Key? (click for the guide)</summary>
           <ol style="font-size:13px;line-height:1.7;color:#cfe6d4;margin:8px 0 4px 18px;padding:0">
-            <li>Geh auf <a id="hl-url" href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> und logge dich mit MetaMask ein. <span class="mut">(URL passt sich automatisch an deinen Netzwerk-Modus an)</span></li>
-            <li>Oben rechts auf dein Wallet-Icon → <b>„API"</b>.</li>
-            <li>Klick <b>„Generate"</b> bei „API Wallet". Es erscheint eine rote Warnung-Box mit einem Private-Key — das ist dein <b>Agent-Key</b> (lang, 66 Zeichen mit „0x"). <b style="color:#ff8a8a">Kopier ihn jetzt — du siehst ihn nur einmal!</b></li>
-            <li>Im selben Dialog steht oben eine <b>Address</b> (42 Zeichen) — das ist die Agent-Adresse (NICHT was wir brauchen). Schließ den Dialog.</li>
-            <li>Auf der HL-Seite oben rechts steht jetzt deine richtige <b>Master-Adresse</b> (z.B. <code>0x12E3…9D95</code>). Die kopierst du ebenfalls.</li>
-            <li>Hier unten:
+            <li>Go to <a id="hl-url" href="https://app.hyperliquid-testnet.xyz" target="_blank" rel="noopener" style="color:#7ce0a8">app.hyperliquid-testnet.xyz</a> and log in with MetaMask. <span class="mut">(the URL adapts automatically to your network mode)</span></li>
+            <li>Top right, click your wallet icon → <b>"API"</b>.</li>
+            <li>Click <b>"Generate"</b> under "API Wallet". A red warning box appears with a private key — that is your <b>Agent Key</b> (long, 66 characters with "0x"). <b style="color:#ff8a8a">Copy it now — you only see it once!</b></li>
+            <li>The same dialog shows an <b>Address</b> at the top (42 characters) — that is the agent address (NOT what we need). Close the dialog.</li>
+            <li>Top right of the HL page you now see your real <b>Master Address</b> (e.g. <code>0x12E3…9D95</code>). Copy that one too.</li>
+            <li>Down here:
               <ul style="margin:4px 0;padding-left:18px">
-                <li>Ins Feld <b>„MASTER Address"</b> → die <b>kurze</b> (42 Zeichen) → deine Haupt-Wallet</li>
-                <li>Ins Feld <b>„Agent Private Key"</b> → der <b>lange</b> (66 Zeichen) aus der roten Box</li>
+                <li>In the <b>"MASTER Address"</b> field → the <b>short</b> one (42 characters) → your main wallet</li>
+                <li>In the <b>"Agent Private Key"</b> field → the <b>long</b> one (66 characters) from the red box</li>
               </ul>
             </li>
-            <li>Save klicken — der Bot validiert die Längen sofort.</li>
+            <li>Click Save — the bot validates the lengths immediately.</li>
           </ol>
           <div class="mut" style="font-size:12px;margin-top:6px">
-            ⚠️ Der Agent-Key hat <b>keine Withdraw-Rechte</b> — auch wenn jemand ihn hätte, kommt er nicht an dein Geld. Trotzdem: behandle ihn wie ein Passwort.
+            ⚠️ The Agent Key has <b>no withdrawal rights</b> — even if someone had it, they could not touch your funds. Still, treat it like a password.
           </div>
         </details>
 
         <label style="margin-top:12px">
-          MASTER Address <span class="mut" style="font-size:11px">(deine Haupt-Wallet, 42 Zeichen)</span>
+          MASTER Address <span class="mut" style="font-size:11px">(your main wallet, 42 characters)</span>
           <span id="addrlen" class="mut" style="float:right;font-family:monospace">0 / 42</span>
         </label>
         <input id="addr" placeholder="0x…" autocomplete="off" spellcheck="false">
         <div id="addrhint" class="mut" style="font-size:11px;min-height:14px"></div>
 
         <label style="margin-top:10px">
-          Agent Private Key <span class="mut" style="font-size:11px">(aus der „API"-Box, 66 Zeichen)</span>
+          Agent Private Key <span class="mut" style="font-size:11px">(from the "API" box, 66 characters)</span>
           <span id="seclen" class="mut" style="float:right;font-family:monospace">0 / 66</span>
         </label>
         <input id="sec" type="password" placeholder="0x…" autocomplete="off" spellcheck="false">
@@ -401,7 +418,7 @@
 
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button id="savewalletbtn">Save Wallet</button>
-          <button type="button" class="ghost" id="walletAnleitungBtn">Anleitung öffnen</button>
+          <button type="button" class="ghost" id="walletAnleitungBtn">Open guide</button>
         </div>
       </details>
 
@@ -424,13 +441,13 @@
         <button id="saveSettingsBtn">Save Settings</button>
         <div class="msg" id="smsg"></div>
         <div class="mut" style="margin-top:8px">
-          <b>Risk % pro Trade:</b> Eingabe in Prozent — <code>0.5</code> heißt 0,5 % deines Account-Werts
-          pro Trade (gespeichert als Anteil 0.005). Erlaubt: 0.05–5 %.
-          <br><b>Auto-Leverage:</b> der Bot wählt pro Trade selbst den optimalen Hebel aus SL-Distanz × Signal-Confidence,
-          gedeckelt durch deinen <i>Max Leverage Cap</i> (1-50, default 50 = HL-Maximum).
-          Beispiel SL 2% von Entry → safe ~25x; SL 0.5% → cap 50x; SL 5% → ~9x.
-          <br>Risk-Amount (% × Account) bleibt bei jedem Trade gleich — Hebel ändert nur margin-usage, nicht Verlustpotenzial bei SL-Trigger.
-          <br>Cap 1000 = bei 100k Account werden nur 1000 USDC fürs Sizing genutzt.
+          <b>Risk % per trade:</b> entered as a percentage — <code>0.5</code> means 0.5% of your account value
+          per trade (stored as the fraction 0.005). Allowed: 0.05–5%.
+          <br><b>Auto-Leverage:</b> the bot picks the optimal leverage per trade from SL distance × signal confidence,
+          capped by your <i>Max Leverage Cap</i> (1-50, default 50 = HL maximum).
+          Example: SL 2% from entry → safe ~25x; SL 0.5% → cap 50x; SL 5% → ~9x.
+          <br>The risk amount (% × account) stays the same on every trade — leverage only changes margin usage, not your loss potential when the SL triggers.
+          <br>Cap 1000 = with a 100k account only 1000 USDC is used for sizing.
         </div>
       </details>
 
@@ -454,7 +471,7 @@
         <button id="verifyBuilderBtn" class="ghost">Check on-chain status</button>
         <div class="msg" id="bmsg"></div>
         <div class="mut" style="font-size:11px;margin-top:6px">
-          Der orange Button öffnet MetaMask und lässt dich on-chain freigeben — danach setzt der Bot automatisch das DB-Flag. Funktioniert nur wenn deine MetaMask die <b>MASTER-Adresse</b> dieser Wallet ist (nicht der Agent-Key).
+          The orange button opens MetaMask and lets you approve on-chain — the bot then sets the DB flag automatically. This only works if your MetaMask is the <b>MASTER address</b> of this wallet (not the Agent Key).
         </div>
       </section>
     </div>
@@ -489,7 +506,7 @@
       <section id="positions" class="card">
         <div class="section-kicker">Positions</div>
         <h2 style="margin-top:6px"><svg class="ico"><use href="#i-layers"/></svg> Open Positions</h2>
-        <div class="mut" style="margin-bottom:8px">Die wichtigsten offenen Trades auf einen Blick — Entry/Mark, SL/TP, Hebel, Liquidationspreis und PnL aus dem Bot-Snapshot.</div>
+        <div class="mut" style="margin-bottom:8px">Your most important open trades at a glance — Entry/Mark, SL/TP, leverage, liquidation price and PnL from the bot snapshot.</div>
         <div id="positionCards" class="position-grid"><div class="skeleton" style="height:96px;border-radius:14px"></div><div class="skeleton" style="height:96px;border-radius:14px"></div></div>
         <div class="mut" id="posempty" style="display:none">No open positions.</div>
       </section>
@@ -512,13 +529,13 @@
         <div class="section-kicker">Filter</div>
         <h2 style="margin-top:6px"><svg class="ico"><use href="#i-shield"/></svg> Per-Coin Filter Status</h2>
         <div class="mut" style="margin-bottom:8px">
-          Der Bot blockt automatisch neue Positionen für Coins auf denen du eine schwache Performance hast.
-          Schwelle: ≥<span id="pcMinTrades">10</span> Trades und Win-Rate <span id="pcMinRate">&lt; 30%</span>.
-          Existing positions werden NICHT angefasst — nur neue Entries.
+          The bot automatically blocks new positions for coins where your performance is weak.
+          Threshold: ≥<span id="pcMinTrades">10</span> trades and win rate <span id="pcMinRate">&lt; 30%</span>.
+          Existing positions are NOT touched — only new entries.
         </div>
         <table id="pctbl"><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Win-Rate</th><th>Status</th></tr></thead>
           <tbody><tr><td colspan="5"><span class="skeleton" style="display:block;height:14px"></span></td></tr></tbody></table>
-        <div class="mut" id="pcempty" style="display:none">Noch keine Trade-History auf HL — nichts geblockt.</div>
+        <div class="mut" id="pcempty" style="display:none">No trade history on HL yet — nothing blocked.</div>
       </section>
 
       <section id="activity" class="card">
@@ -543,5 +560,5 @@
     Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>
 </div>
 <div id="toasts" aria-live="polite"></div>
-<script src="/static/dashboard.js?v=20260613a" defer></script>
+<script src="/static/dashboard.js?v=20260613b" defer></script>
 </body></html>

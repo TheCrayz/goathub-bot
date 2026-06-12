@@ -279,7 +279,7 @@ async function loadAll(){
     banner.style.display="block";
     if((e.message||"").includes("Admin")){
       banner.innerHTML="🚫 Admin only — you don't have access to this page. <a href='/'>Back to dashboard</a>";
-    }else if((e.message||"").includes("Nicht angemeldet")||(e.message||"").includes("401")){
+    }else if((e.message||"").includes("Not signed in")||(e.message||"").includes("Nicht angemeldet")||(e.message||"").includes("401")){
       banner.innerHTML="Not logged in. <a href='/'>Log in here</a> then come back.";
     }else{
       banner.textContent="Error: "+e.message;

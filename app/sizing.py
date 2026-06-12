@@ -23,7 +23,7 @@ def size_trade(*, account_value: float, capital_cap: float, risk_pct: float,
     eff = account_value if not capital_cap or capital_cap <= 0 else min(account_value, capital_cap)
     sl = abs(entry - stop_loss)
     if entry <= 0 or sl <= 0:
-        raise ValueError("entry > 0 und stop_loss != entry erforderlich")
+        raise ValueError("entry > 0 and stop_loss != entry required")
     risk_amount = eff * risk_pct
     qty = risk_amount / sl
     notional = qty * entry
@@ -71,10 +71,10 @@ def auto_leverage(*, entry: float, stop_loss: float, confidence=None,
     Wirft ValueError bei entry≤0 oder sl=entry (gleicher Check wie size_trade).
     """
     if entry <= 0:
-        raise ValueError("entry > 0 erforderlich")
+        raise ValueError("entry > 0 required")
     sl_dist = abs(entry - stop_loss) / entry
     if sl_dist <= 0:
-        raise ValueError("stop_loss != entry erforderlich")
+        raise ValueError("stop_loss != entry required")
     safe_lev = 1.0 / (sl_dist * liq_safety)
     conf = max(conf_floor, float(confidence)) if confidence is not None else conf_floor
     chosen = safe_lev * conf

@@ -258,7 +258,7 @@ def test_open_new_happy_path():
     assert _signal_done(1, "hp-1"), "signal_id muss dedup-markiert sein (Entry platziert)"
     # Audit M-5: Throttle-Fenster startet erst nach erfolgreicher Platzierung
     assert (1, "ETH") in engine._trade_intervals, "Throttle-Stempel fehlt nach Entry"
-    assert any("eröffnet" in t for t in _activities(1, "order")), _activities(1)
+    assert any("opened" in t for t in _activities(1, "order")), _activities(1)
     print("open_new_happy_path: OK")
 
 
@@ -278,14 +278,14 @@ def test_sl_fail_and_emergency_close_fail():
         f"Row MUSS offen bleiben (Position lebt!), ist {mt and mt.status}"
 
     all_acts = _activities(1)
-    assert not any("Position geschlossen" in t for t in all_acts), \
-        f"darf NIE 'geschlossen' behaupten wenn close fail: {all_acts}"
+    assert not any("position closed" in t for t in all_acts), \
+        f"darf NIE 'closed' behaupten wenn close fail: {all_acts}"
     errs = _activities(1, "error")
-    assert any("NOTFALL" in t and "ungeschützt" in t for t in errs), errs
+    assert any("EMERGENCY" in t and "unprotected" in t for t in errs), errs
 
     # Audit H-A: mindestens ein UNGETHROTTLEDER Alert (key=None)
-    assert any(key is None and "NOTFALL" in text for text, key in alerts.calls), \
-        f"ungethrottleder NOTFALL-Alert fehlt: {alerts.calls}"
+    assert any(key is None and "EMERGENCY" in text for text, key in alerts.calls), \
+        f"ungethrottleder EMERGENCY-Alert fehlt: {alerts.calls}"
     print("sl_fail_and_emergency_close_fail: OK")
 
 
@@ -419,6 +419,67 @@ def test_round_px_hl_rules():
     print("round_px_hl_rules: OK")
 
 
+# ── (7) Referral-Methoden (HyperliquidTrader.referral_state / set_referrer) ──
+def test_referral_state_parses_referred_by():
+    """referral_state extrahiert code + addr aus HLs `referredBy`-dict; ein
+    fehlendes/None-Feld → (None, None); jede Exception → error-dict (nie raise)."""
+    from app.hyperliquid_exec import HyperliquidTrader
+
+    t = HyperliquidTrader.__new__(HyperliquidTrader)   # __init__ umgehen (kein Netz)
+    t.address = "0xMASTER"
+
+    # Fall 1: Referrer gesetzt → code + addr werden geparst
+    t.info = types.SimpleNamespace(
+        query_referral_state=lambda addr: {"referredBy": {"referrer": "0xREF", "code": "GOAT"}})
+    r = t.referral_state()
+    assert r == {"referred_by_code": "GOAT", "referrer_addr": "0xREF",
+                 "raw": {"referredBy": {"referrer": "0xREF", "code": "GOAT"}}}, r
+
+    # Fall 2: kein Referrer (referredBy=None) → beide None, kein error
+    t.info = types.SimpleNamespace(query_referral_state=lambda addr: {"referredBy": None})
+    r = t.referral_state()
+    assert r["referred_by_code"] is None and r["referrer_addr"] is None
+    assert "error" not in r, r
+
+    # Fall 3: Exception im Read → fail-safe error-dict, KEIN raise
+    def _boom(addr):
+        raise RuntimeError("HL down")
+    t.info = types.SimpleNamespace(query_referral_state=_boom)
+    r = t.referral_state()
+    assert r == {"referred_by_code": None, "referrer_addr": None, "error": "HL down"}, r
+    print("referral_state_parses_referred_by: OK")
+
+
+def test_set_referrer_ok_and_failsafe():
+    """set_referrer: status='ok' → ok=True; Reject (status='err') → ok=False
+    (kein raise); Exception → {"ok": False, "error": …} (HL lehnt z.B. bei
+    bereits gesetztem Referrer / Self-Referral ab — darf nie crashen)."""
+    from app.hyperliquid_exec import HyperliquidTrader
+
+    t = HyperliquidTrader.__new__(HyperliquidTrader)
+    t.address = "0xMASTER"
+
+    # Fall 1: Erfolg → {"status": "ok", "response": {"type": "default"}}
+    t.exchange = types.SimpleNamespace(
+        set_referrer=lambda code: {"status": "ok", "response": {"type": "default"}})
+    res = t.set_referrer("GOAT")
+    assert res["ok"] is True and res["raw"]["status"] == "ok", res
+
+    # Fall 2: HL-Reject (z.B. schon ein Referrer gesetzt) → ok=False, kein raise
+    t.exchange = types.SimpleNamespace(
+        set_referrer=lambda code: {"status": "err", "response": "Referrer already set"})
+    res = t.set_referrer("GOAT")
+    assert res["ok"] is False and res["raw"]["status"] == "err", res
+
+    # Fall 3: Exception (z.B. Agent-Key darf nicht signieren) → error-dict, KEIN raise
+    def _boom(code):
+        raise RuntimeError("must be master account")
+    t.exchange = types.SimpleNamespace(set_referrer=_boom)
+    res = t.set_referrer("GOAT")
+    assert res == {"ok": False, "error": "must be master account"}, res
+    print("set_referrer_ok_and_failsafe: OK")
+
+
 if __name__ == "__main__":
     test_open_new_happy_path()
     test_sl_fail_and_emergency_close_fail()
@@ -426,4 +487,6 @@ if __name__ == "__main__":
     test_watcher_aborts_on_generation_change()
     test_protection_orders_carry_cloid()
     test_round_px_hl_rules()
+    test_referral_state_parses_referred_by()
+    test_set_referrer_ok_and_failsafe()
     print("\nALLE TRADING-PATH-TESTS BESTANDEN ✅")

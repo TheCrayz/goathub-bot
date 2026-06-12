@@ -92,6 +92,10 @@ HL_TESTNET = _b("HL_TESTNET", "true")
 BUILDER_ADDRESS = _g("BUILDER_ADDRESS")      # deine HL-Adresse (braucht >=100 USDC perps)
 BUILDER_FEE = _g("BUILDER_FEE", "0.05%")     # f bis 0.1% (perps max)
 
+# Hyperliquid-Referral: User verknüpfen ihren HL-Account über Michaels Code.
+REFERRAL_CODE = _g("REFERRAL_CODE", "TRETAGHUNBERG")
+REFERRAL_LINK = _g("REFERRAL_LINK", "https://app.hyperliquid.xyz/join/TRETAGHUNBERG")
+
 # Signal-Quelle (#signals von Bot 1, privat)
 DISCORD_BOT_TOKEN = _g("DISCORD_BOT_TOKEN")
 SIGNALS_CHANNEL_ID = _i("SIGNALS_CHANNEL_ID", 0)

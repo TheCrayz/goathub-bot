@@ -408,7 +408,7 @@ def logout(u: User = Depends(current_user), db: Session = Depends(get_db)):
     httpOnly session cookie too."""
     u.token_version = int(getattr(u, "token_version", 0) or 0) + 1
     db.commit()
-    response = JSONResponse({"ok": True, "message": "Alle bestehenden Sessions invalidiert."})
+    response = JSONResponse({"ok": True, "message": "All existing sessions invalidated."})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
 
@@ -924,6 +924,68 @@ def mark_builder_approved(u: User = Depends(current_user), db: Session = Depends
     return {"ok": True, "approved_bps": approved_bps, "required_bps": required_bps}
 
 
+# ── Referral (HL-Account über Michaels Code verknüpfen) ──────────────────────
+# Selbe Auth/Trader-Beschaffung wie die Builder-Endpoints: engine._build_trader(u)
+# baut (async) einen HyperliquidTrader aus dem entschlüsselten Agent-Key des
+# Users; darauf laufen referral_state()/set_referrer() (in hyperliquid_exec.py).
+@app.get("/api/referral-status")
+async def referral_status(u: User = Depends(current_user)):
+    """Aktueller Referral-Status des Users.
+
+    Ohne verbundene Wallet kein HL-Call — gibt nur Code/Link zurück. Jede
+    Exception landet im error-Feld, der Endpoint wirft nie 500."""
+    out = {
+        "code": config.REFERRAL_CODE,
+        "link": config.REFERRAL_LINK,
+        "wallet_connected": bool(u.hl_account_address),
+        "referred_by": None,
+        "is_ours": False,
+        "error": None,
+    }
+    if not u.hl_account_address:
+        return out
+    try:
+        from app.engine import _build_trader
+        trader = await _build_trader(u)
+        state = await asyncio.to_thread(trader.referral_state)
+        if state.get("error"):
+            out["error"] = str(state["error"])
+            return out
+        referred_by = state.get("referred_by_code")
+        out["referred_by"] = referred_by or None
+        if referred_by and config.REFERRAL_CODE:
+            out["is_ours"] = referred_by.lower() == config.REFERRAL_CODE.lower()
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+@app.post("/api/set-referrer")
+@limiter.limit("5/minute")
+async def set_referrer(request: Request, u: User = Depends(current_user)):
+    """Verknüpft den HL-Account des Users mit Michaels Referral-Code.
+
+    Self-Referral (Michaels eigener Account) und "bereits referred" sind
+    erwartete Fehlerfälle von HL → sauber als {ok: false, detail} zurück,
+    nie 500."""
+    if not u.hl_account_address:
+        return {"ok": False, "detail": "Connect your wallet before linking a referral."}
+    try:
+        from app.engine import _build_trader
+        trader = await _build_trader(u)
+        res = await asyncio.to_thread(trader.set_referrer, config.REFERRAL_CODE)
+    except Exception as e:
+        return {"ok": False,
+                "detail": f"Could not link the referral: {e}. "
+                          f"You can also register via the referral link if this keeps failing: {config.REFERRAL_LINK}"}
+    if res.get("ok"):
+        return {"ok": True, "detail": "Referral linked ✓"}
+    return {"ok": False,
+            "detail": f"Could not link the referral: {res.get('error')}. "
+                      f"If you already have a referrer or this is your own account this is expected — "
+                      f"otherwise register via the referral link if this keeps failing: {config.REFERRAL_LINK}"}
+
+
 # ── Dashboard-Daten (Live-PNL/Positionen + Aktivität) ────────────────────────
 # 2026-06-08 Mainnet-Hardening C2: Snapshot-Cache.
 # Vorher: jeder /api/dashboard call → 2-3 HL-Info-API-Calls. Bei 30 User
@@ -1114,9 +1176,9 @@ def _demo_dashboard(u):
                       {"t": now_ms - 18000000, "coin": "VIRTUAL", "dir": "Close Long", "px": "0.5646", "pnl": -110.64},
                   ]},
         "activity": [
-            {"ts": "2026-06-12 12:00:00", "kind": "order", "text": "SHORT SUI eröffnet (qty 2624), SL+TP gesetzt"},
-            {"ts": "2026-06-12 11:30:00", "kind": "update", "text": "ETH: These angepasst — SL 1645, TP nachgezogen"},
-            {"ts": "2026-06-12 11:00:00", "kind": "skip", "text": "ADA nicht gefüllt — kein Trade"},
+            {"ts": "2026-06-12 12:00:00", "kind": "order", "text": "Opened SHORT SUI (qty 2624), SL+TP set"},
+            {"ts": "2026-06-12 11:30:00", "kind": "update", "text": "ETH: thesis adjusted — SL 1645, TP trailed"},
+            {"ts": "2026-06-12 11:00:00", "kind": "skip", "text": "ADA not filled — no trade"},
         ],
         "net": "mainnet",   # Demo zeigt den echten Mainnet-Look
         "builder": {"address": config.BUILDER_ADDRESS or "", "fee": config.BUILDER_FEE},

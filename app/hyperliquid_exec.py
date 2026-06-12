@@ -510,3 +510,53 @@ class HyperliquidTrader:
         except Exception as e:
             log.warning("market_close(%s) final fail: %s", coin, e)
             return {"ok": False, "closed": 0.0, "error": str(e)}
+
+    def referral_state(self):
+        """Referral-Status der MASTER-Adresse von HL lesen (read-only).
+
+        HL liefert ein dict mit `referredBy`: None, solange kein Referrer
+        gesetzt ist; sonst {"referrer": "0x…", "code": "CODE"}. Wir parsen das
+        defensiv (jedes Feld kann fehlen) und reduzieren es auf die zwei Werte,
+        die der Builder-/Referral-Flow braucht.
+
+        Returns:
+            {"referred_by_code": <str|None>, "referrer_addr": <str|None>, "raw": <raw>}
+            bei Erfolg, oder {"referred_by_code": None, "referrer_addr": None,
+            "error": <str>} bei jeder Exception (nie raisen).
+        """
+        try:
+            raw = self.info.query_referral_state(self.address)
+            referred_by = (raw or {}).get("referredBy") if isinstance(raw, dict) else None
+            code = None
+            addr = None
+            if isinstance(referred_by, dict):
+                code = referred_by.get("code")
+                addr = referred_by.get("referrer")
+            return {"referred_by_code": code, "referrer_addr": addr, "raw": raw}
+        except Exception as e:
+            log.warning("referral_state(%s): %s", self.address, e)
+            return {"referred_by_code": None, "referrer_addr": None, "error": str(e)}
+
+    def set_referrer(self, code):
+        """Referral-Code für die MASTER-Adresse setzen (signierte Exchange-Action).
+
+        Fail-safe by design: HL lehnt setReferrer ab, wenn (a) schon ein
+        Referrer gesetzt ist, (b) Self-Referral, (c) evtl. wenn nur der
+        Agent-Key statt des Masters signiert. In ALLEN Fällen geben wir
+        {"ok": False, "error": …} zurück und raisen NIE.
+
+        # Testnet-Verifikation ausstehend: ob Agent-Key setReferrer signieren darf
+
+        Returns:
+            {"ok": <bool>, "raw": <res>} bei Antwort, sonst {"ok": False, "error": <str>}.
+        """
+        try:
+            res = hl_retry(lambda: self.exchange.set_referrer(code),
+                           max_attempts=3, label="set_referrer")
+            # setReferrer liefert {"status": "ok", "response": {"type": "default"}}
+            # (kein per-Order-`statuses`-Array → _status_ok greift hier NICHT).
+            ok = isinstance(res, dict) and res.get("status") == "ok"
+            return {"ok": ok, "raw": res}
+        except Exception as e:
+            log.warning("set_referrer(%s): %s", code, e)
+            return {"ok": False, "error": str(e)}

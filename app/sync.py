@@ -225,9 +225,9 @@ async def _reconcile_one_user(user_id: int, address: str):
             db.add(Activity(
                 user_id=user_id,
                 kind="error",
-                text=(f"{coin}: ruhender Limit-Entry wurde OHNE aktiven Fill-Watcher gefüllt "
-                      f"(HL-Position da, managed_trade id={mt_id}) — Row auf 'open'; "
-                      f"Coverage-Reconciler legt fehlenden Schutz automatisch nach."),
+                text=(f"{coin}: resting limit entry filled WITHOUT an active fill-watcher "
+                      f"(HL position present, managed_trade id={mt_id}) — row set to 'open'; "
+                      f"coverage-reconciler adds the missing protection automatically."),
             ))
             reopened_count += 1
         if not strikes_allowed:
@@ -259,8 +259,8 @@ async def _reconcile_one_user(user_id: int, address: str):
             db.add(Activity(
                 user_id=user_id,
                 kind="close",
-                text=(f"{coin}: autonom auf HL geschlossen — Position-Sync hat stale DB-Status "
-                      f"(managed_trade id={mt_id}, {strikes} strikes) auf 'closed' angepasst"),
+                text=(f"{coin}: closed autonomously on HL — position-sync adjusted stale DB status "
+                      f"(managed_trade id={mt_id}, {strikes} strikes) to 'closed'"),
             ))
             _stale_counter.pop(key, None)
             closed_count += 1

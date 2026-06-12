@@ -102,7 +102,7 @@ async function saveWallet(){
     await api("POST","/api/wallet",{hl_account_address:addr.value,hl_api_secret:sec.value});
     toast("Wallet saved ✓","ok");
     sec.value="";updateWalletLens();load();
-  }catch(e){toast("Wallet nicht gespeichert: "+e.message,"err")}
+  }catch(e){toast("Wallet not saved: "+e.message,"err")}
 }
 // Phase 2 (2026-06-02): live length indicators on the wallet form. The
 // address-in-key-field bug ate ~3 testers (users 3, 4, 6) — none knew
@@ -118,30 +118,30 @@ function updateWalletLens(){
   const ael=document.getElementById("addrlen"), sel=document.getElementById("seclen");
   const ahint=document.getElementById("addrhint"), shint=document.getElementById("sechint");
   let aMsg=al+" / 42";
-  if(al===42 && !aPrefix) aMsg += " ✗ braucht 0x-Prefix";
+  if(al===42 && !aPrefix) aMsg += " ✗ needs 0x prefix";
   else if(aok) aMsg += " ✓";
   ael.textContent=aMsg; ael.style.color=al===0?"":(aok?"#3fe0a0":"#ff8a8a");
   let sMsg=sl+" / 66";
-  if(sl===66 && !sPrefix) sMsg += " ✗ braucht 0x-Prefix";
+  if(sl===66 && !sPrefix) sMsg += " ✗ needs 0x prefix";
   else if(sok) sMsg += " ✓";
   sel.textContent=sMsg; sel.style.color=sl===0?"":(sok?"#3fe0a0":"#ff8a8a");
   // Inline hints
   if(ahint){
     let m="", c="";
     if(al===0) {m=""; c="";}
-    else if(al===66) {m="⚠ Das sieht aus wie der lange Agent-Key. MASTER ist die KURZE (42 Zeichen).";c="#ffaa44";}
-    else if(al===42 && !aPrefix) {m="✗ Adresse braucht 0x-Prefix.";c="#ff8a8a";}
-    else if(aok) {m="✓ Sieht gut aus.";c="#3fe0a0";}
-    else {m=`Adresse hat 42 Zeichen, du hast ${al}.`;c="#ff8a8a";}
+    else if(al===66) {m="⚠ This looks like the long Agent Key. MASTER is the SHORT one (42 characters).";c="#ffaa44";}
+    else if(al===42 && !aPrefix) {m="✗ Address needs a 0x prefix.";c="#ff8a8a";}
+    else if(aok) {m="✓ Looks good.";c="#3fe0a0";}
+    else {m=`Address has 42 characters, you have ${al}.`;c="#ff8a8a";}
     ahint.textContent=m; ahint.style.color=c;
   }
   if(shint){
     let m="", c="";
     if(sl===0) {m=""; c="";}
-    else if(sl===42) {m="⚠ Das sieht aus wie eine Adresse, nicht der Key. AGENT-KEY ist die LANGE (66 Zeichen, aus der roten Box).";c="#ffaa44";}
-    else if(sl===66 && !sPrefix) {m="✗ Key braucht 0x-Prefix.";c="#ff8a8a";}
-    else if(sok) {m="✓ Sieht gut aus.";c="#3fe0a0";}
-    else {m=`Key hat 66 Zeichen, du hast ${sl}.`;c="#ff8a8a";}
+    else if(sl===42) {m="⚠ This looks like an address, not the key. AGENT KEY is the LONG one (66 characters, from the red box).";c="#ffaa44";}
+    else if(sl===66 && !sPrefix) {m="✗ Key needs a 0x prefix.";c="#ff8a8a";}
+    else if(sok) {m="✓ Looks good.";c="#3fe0a0";}
+    else {m=`Key has 66 characters, you have ${sl}.`;c="#ff8a8a";}
     shint.textContent=m; shint.style.color=c;
   }
   const btn=document.getElementById("savewalletbtn");
@@ -165,6 +165,7 @@ document.addEventListener("DOMContentLoaded",function(){
   wire("signbtn", signBuilderApproval);
   wire("bbtn", approveBuilder);
   wire("verifyBuilderBtn", verifyBuilder);
+  wire("refbtn", linkReferral);
   wire("walletAnleitungBtn", function(){
     const w=document.getElementById("walletWizard");
     if(w){w.open=true; const wc=document.getElementById("wallet-connect"); if(wc)wc.open=true; w.scrollIntoView({behavior:"smooth"});}
@@ -198,7 +199,7 @@ function riskHintUpd(){
   if(!el||!r)return;
   const v=parseFloat(r.value);
   if(!isFinite(v)){el.textContent="";return;}
-  el.textContent=trimNum(v)+" % = Anteil "+(v/100).toFixed(4)+" vom Account-Wert pro Trade";
+  el.textContent=trimNum(v)+"% = fraction "+(v/100).toFixed(4)+" of account value per trade";
   el.style.color=(v<0.05||v>5)?"#ffaa44":"";
 }
 function applySettings(s){
@@ -219,18 +220,18 @@ async function saveSettings(){
   // Blank-Guard für ALLE Felder
   for(const el of [r,l,m,c]){
     if(!el||el.value.trim()===""){
-      show(smsgEl,"Bitte alle Felder ausfüllen — ein leeres Feld wird NICHT als 0 gespeichert.","err");
-      toast("Settings nicht gespeichert — leeres Feld.","err");
+      show(smsgEl,"Please fill in all fields — an empty field is NOT saved as 0.","err");
+      toast("Settings not saved — empty field.","err");
       return;
     }
   }
   const rp=parseFloat(r.value), lv=parseFloat(l.value), mp=parseFloat(m.value), cp=parseFloat(c.value);
   let errMsg=null;
-  if(!isFinite(rp)||rp<0.05||rp>5) errMsg="Risk % muss zwischen 0.05 und 5 liegen (0.5 = 0.5 % pro Trade).";
-  else if(!isFinite(lv)||lv<1||lv>50) errMsg="Max Leverage Cap muss zwischen 1 und 50 liegen.";
-  else if(!isFinite(mp)||mp<1||mp>20) errMsg="Max Open Positions muss zwischen 1 und 20 liegen.";
-  else if(!isFinite(cp)||cp<0) errMsg="Capital Cap darf nicht negativ sein (0 = ganzer Account).";
-  if(errMsg){show(smsgEl,errMsg,"err");toast("Settings nicht gespeichert: "+errMsg,"err");return;}
+  if(!isFinite(rp)||rp<0.05||rp>5) errMsg="Risk % must be between 0.05 and 5 (0.5 = 0.5% per trade).";
+  else if(!isFinite(lv)||lv<1||lv>50) errMsg="Max Leverage Cap must be between 1 and 50.";
+  else if(!isFinite(mp)||mp<1||mp>20) errMsg="Max Open Positions must be between 1 and 20.";
+  else if(!isFinite(cp)||cp<0) errMsg="Capital Cap cannot be negative (0 = full account).";
+  if(errMsg){show(smsgEl,errMsg,"err");toast("Settings not saved: "+errMsg,"err");return;}
   try{
     const resp=await api("PUT","/api/settings",{
       risk_pct:rp/100,                 // Prozent → Fraction
@@ -243,7 +244,7 @@ async function saveSettings(){
     show(smsgEl,"","ok");
     toast("Settings saved ✓","ok");
     load();
-  }catch(e){show(smsgEl,e.message,"err");toast("Settings nicht gespeichert: "+e.message,"err")}
+  }catch(e){show(smsgEl,e.message,"err");toast("Settings not saved: "+e.message,"err")}
 }
 async function approveBuilder(){
   try{
@@ -269,13 +270,13 @@ async function loadPerCoinStatus(){
     if(!tb) return;
     tb.innerHTML="";
     if(!s.connected){
-      if(empty) {empty.textContent="Wallet nicht verbunden — Per-Coin-Tracking inaktiv.";empty.style.display="block";}
+      if(empty) {empty.textContent="Wallet not connected — per-coin tracking inactive.";empty.style.display="block";}
       document.getElementById("pctbl").style.display="none";
       return;
     }
     const coins=s.coins||[];
     if(coins.length===0){
-      if(empty) {empty.textContent="Noch keine Trade-History auf HL — nichts geblockt. Trade ein paar Coins damit der Filter Daten hat.";empty.style.display="block";}
+      if(empty) {empty.textContent="No trade history on HL yet — nothing blocked. Trade a few coins so the filter has data.";empty.style.display="block";}
       document.getElementById("pctbl").style.display="none";
       return;
     }
@@ -284,9 +285,9 @@ async function loadPerCoinStatus(){
     coins.forEach(c=>{
       const winPct=(c.win_rate*100).toFixed(1)+"%";
       const status=c.blocked
-        ? `<span class="pill off" title="Block aktiv: Win-Rate unter Schwelle">blocked</span>`
+        ? `<span class="pill off" title="Block active: win rate below threshold">blocked</span>`
         : (c.trades<(s.min_trades_required||10)
-            ? `<span class="pill mut" title="Noch unter Trade-Schwelle — Filter inaktiv">sampling</span>`
+            ? `<span class="pill mut" title="Still below trade threshold — filter inactive">sampling</span>`
             : `<span class="pill on" title="Performance ok">✓ allowed</span>`);
       tb.insertAdjacentHTML("beforeend",
         `<tr><td>${esc(c.coin)}</td><td>${c.trades}</td><td>${c.wins}</td><td>${esc(winPct)}</td><td>${status}</td></tr>`);
@@ -436,12 +437,12 @@ async function signBuilderApproval(){
     // User soll den Confirm-Schritt gleich nochmal klicken. Vorher zeigte
     // das UI hier fälschlich "bestätigt ✓".
     if(res&&res.ok){
-      show(bmsg,`Builder-Approval on-chain bestätigt (${res.approved_bps||"?"} bps) ✓`,"ok");
-      toast("Builder approval on-chain bestätigt ✓","ok");
+      show(bmsg,`Builder approval confirmed on-chain (${res.approved_bps||"?"} bps) ✓`,"ok");
+      toast("Builder approval confirmed on-chain ✓","ok");
     }else{
       const pendMsg=(res&&res.detail)||"Approval submitted — on-chain verification pending. Click \"Re-verify\" in a moment.";
       show(bmsg,pendMsg,"err");
-      toast("Builder approval pending — bitte gleich erneut bestätigen.","err");
+      toast("Builder approval pending — please confirm again shortly.","err");
     }
     setBtn(_orig,false);
     load();          // refresh dashboard (bot_active, builder_approved, etc.)
@@ -466,6 +467,30 @@ async function verifyBuilder(){
       if(el){el.textContent="✗ not approved on-chain ("+s.on_chain_bps+" bps, need "+s.required_bps+") — approve in Hyperliquid UI"; el.style.color="#ff8a8a"}
     }
   }catch(e){if(el){el.textContent="error: "+e.message; el.style.color="#ff8a8a"}}
+}
+// 2026-06-13 Referral: Status (über unseren Code referred?) + One-Click-Set.
+// Backend: GET /api/referral-status, POST /api/set-referrer (siehe main.py).
+async function loadReferral(){
+  const stat=document.getElementById("refstat");
+  const btn=document.getElementById("refbtn");
+  if(!stat)return;
+  const showBtn=(on)=>{if(btn)btn.style.display=on?"":"none";};
+  try{
+    const r=await api("GET","/api/referral-status");
+    if(!r.wallet_connected){stat.textContent="connect wallet first";stat.className="pill off";showBtn(false);return;}
+    if(r.error){stat.textContent="unavailable";stat.className="pill off";showBtn(true);return;}
+    if(r.is_ours){stat.textContent="✓ linked ("+(r.referred_by||r.code)+")";stat.className="pill on";showBtn(false);}
+    else if(r.referred_by){stat.textContent="linked to another referrer";stat.className="pill off";showBtn(false);}
+    else{stat.textContent="not linked";stat.className="pill off";showBtn(true);}
+  }catch(e){stat.textContent="unavailable";stat.className="pill off";showBtn(false);}
+}
+async function linkReferral(){
+  const msg=document.getElementById("refmsg");
+  try{
+    const r=await api("POST","/api/set-referrer");
+    if(r&&r.ok){if(msg)show(msg,r.detail||"Referral linked ✓","ok");toast("Referral linked ✓","ok");loadReferral();}
+    else{if(msg)show(msg,((r&&r.detail)||"Could not link referral.")+" You can also register via the link above.","err");}
+  }catch(e){if(msg)show(msg,"Error: "+e.message+" — you can register via the referral link above.","err");}
 }
 async function toggleBot(){
   // 2026-06-12: alert() → Toast (Proposal "Toast system").
@@ -869,6 +894,7 @@ function render(d){
     // Phase 6 (2026-06-02): Button-Text je nach Status.
     const bbtn=document.getElementById("bbtn"); if(bbtn){bbtn.textContent=ba?"Re-verify on-chain":"Builder fee approved — confirm";}
   }
+  loadReferral();
   renderPositions(d.account.positions||[]);
   // 2026-06-04: Per-Coin Filter Status (Restposten #4). 2026-06-12: max. alle
   // 5 min — der Endpoint macht teure HL-Calls (16 Coins) und die Daten ändern

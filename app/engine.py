@@ -502,23 +502,23 @@ def _pause_user_bad_key(user_id, err_msg, reason="invalid_key"):
         u.bot_active = False
         if reason == "not_authorized":
             text = (
-                "Bot pausiert: Agent-Key ist gültig, aber NICHT als ExtraAgent "
-                "auf Hyperliquid autorisiert (HL: 'User or API Wallet does not exist'). "
-                "Im HL UI → API → 'Approve API Wallet' für den existierenden Agent klicken, "
-                "ODER neuen Agent generieren und im Dashboard speichern. Dann Bot manuell wieder aktivieren."
+                "Bot paused: Agent-Key is valid but NOT authorized as an ExtraAgent "
+                "on Hyperliquid (HL: 'User or API Wallet does not exist'). "
+                "In the HL UI → API → click 'Approve API Wallet' for the existing agent, "
+                "OR generate a new agent and save it in the dashboard. Then re-activate the bot manually."
             )
         elif reason == "decrypt_failed":
             text = (
-                "Bot pausiert: gespeicherter Agent-Key nicht entschlüsselbar "
-                "(Schlüssel nicht entschlüsselbar — ENCRYPTION_KEY geändert oder "
-                "Daten korrupt). Bitte Agent-Key im Dashboard neu eingeben, "
-                "dann Bot selbst wieder aktivieren."
+                "Bot paused: stored Agent-Key could not be decrypted "
+                "(decryption failed — ENCRYPTION_KEY changed or data corrupted). "
+                "Please re-enter the Agent-Key in the dashboard, "
+                "then re-activate the bot yourself."
             )
         else:
             text = (
-                "Agent-Key ungültig (sieht aus wie eine 42-Zeichen-Adresse, "
-                "erwartet wird der 66-Zeichen-Agent-Key). Bot pausiert. "
-                "Im Dashboard den korrekten Agent-Key neu speichern, dann selbst wieder aktivieren."
+                "Agent-Key invalid (looks like a 42-character address, "
+                "but the 66-character Agent-Key is expected). Bot paused. "
+                "Save the correct Agent-Key again in the dashboard, then re-activate yourself."
             )
         db.add(Activity(user_id=user_id, kind="error", text=text))
         db.commit()
@@ -685,7 +685,7 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
         try:
             trader = await _build_trader(u)
             if not trader.is_tradable(coin):
-                _log_activity(user_id, "skip", f"{coin}: nicht auf Hyperliquid handelbar — übersprungen")
+                _log_activity(user_id, "skip", f"{coin}: not tradable on Hyperliquid — skipped")
                 return
             # 2026-06-12 (Review #0): position_size raised jetzt bei API-Fehlern
             # statt 0.0 zu liefern. Unbekannter Positionsstatus = sicherer Abbruch
@@ -695,8 +695,8 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
                 pos = await asyncio.to_thread(trader.position_size, coin)
             except Exception as e:
                 _log_activity(user_id, "error",
-                              f"{coin}: Positionsstatus nicht lesbar ({str(e)[:160]}) — "
-                              f"{action_type} abgebrochen (kein 'flat' angenommen, nichts verändert).")
+                              f"{coin}: position status unreadable ({str(e)[:160]}) — "
+                              f"{action_type} aborted (not assumed 'flat', nothing changed).")
                 return
             if abs(pos) > 0:
                 # H-2 (2026-06-12): Gegenrichtungs-Signal auf offener Position NICHT
@@ -708,16 +708,16 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
                 if sig_dir in ("LONG", "SHORT") and (sig_dir == "LONG") != (pos > 0):
                     _log_activity(
                         user_id, "skip",
-                        f"{coin}: {sig_dir}-Signal widerspricht offener "
-                        f"{'LONG' if pos > 0 else 'SHORT'}-Position — Update abgelehnt "
-                        f"(kein Flip, keine falsche Schutz-Seite). Bestehender Schutz bleibt.")
+                        f"{coin}: {sig_dir} signal contradicts open "
+                        f"{'LONG' if pos > 0 else 'SHORT'} position — update rejected "
+                        f"(no flip, no wrong protection side). Existing protection kept.")
                     return
                 await _adjust(trader, u, sig, pos)        # Position offen -> SL/TP nachziehen
             else:
                 if action_type == "UPDATE_TRADE":
                     _log_activity(user_id, "skip",
-                                  f"{coin}: UPDATE_TRADE ohne offene Position — nicht neu eröffnet "
-                                  f"(Original-Position evtl. manuell oder per SL geschlossen).")
+                                  f"{coin}: UPDATE_TRADE without open position — not re-opened "
+                                  f"(original position likely closed manually or via SL).")
                     _close_managed(user_id, coin)         # DB-State aufräumen
                     return
                 # 2026-06-12 (Review #19): Throttle HIER (nur echte Neueröffnungen),
@@ -727,7 +727,7 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
                     log.info("Skip NEW_TRADE %s for user %s — min-trade-interval not elapsed (%ds)",
                              coin, user_id, config.MIN_TRADE_INTERVAL_S)
                     _log_activity(user_id, "skip",
-                                  f"{coin}: trade-interval-throttle aktiv (min {config.MIN_TRADE_INTERVAL_S}s), skip.")
+                                  f"{coin}: trade-interval throttle active (min {config.MIN_TRADE_INTERVAL_S}s), skip.")
                     return
                 # 2026-06-12 (Review #6): alten Fill-Watcher VOR cancel_orders beenden,
                 # sonst hält er den Fill des NEUEN Entries für seinen und setzt
@@ -769,8 +769,8 @@ async def _open_new(trader, u, sig):
     direction = (sig.direction or "").strip().upper()
     if direction not in ("LONG", "SHORT"):
         _log_activity(u.id, "error",
-                      f"{coin}: Signal ohne gültige Direction ({sig.direction!r}) — "
-                      f"NEW_TRADE übersprungen (nicht als SHORT geraten).")
+                      f"{coin}: signal without valid direction ({sig.direction!r}) — "
+                      f"NEW_TRADE skipped (not guessed as SHORT).")
         return
 
     # C3 (2026-06-09): Replay-Dedup. Wurde dieses signal_id für den User schon
@@ -779,7 +779,7 @@ async def _open_new(trader, u, sig):
     # Neustart, wenn der In-Memory-Throttle weg ist.
     if sig.signal_id and _signal_already_done(u.id, sig.signal_id):
         _log_activity(u.id, "skip",
-                      f"{coin}: signal_id {sig.signal_id} bereits ausgeführt — Replay übersprungen")
+                      f"{coin}: signal_id {sig.signal_id} already executed — replay skipped")
         return
 
     # Phase 2 #27 (2026-06-02): Per-Coin Auto-Filter. Schaut auf den User's
@@ -791,8 +791,8 @@ async def _open_new(trader, u, sig):
         _log_activity(
             u.id, "skip",
             f"{coin}: per-coin filter — "
-            f"win-rate {stats['win_rate']*100:.0f}% über {stats['trades']} Trades "
-            f"< {config.PERCOIN_MIN_WINRATE*100:.0f}%-Schwelle — NEW_TRADE skipped"
+            f"win-rate {stats['win_rate']*100:.0f}% over {stats['trades']} trades "
+            f"< {config.PERCOIN_MIN_WINRATE*100:.0f}% threshold — NEW_TRADE skipped"
         )
         return
 
@@ -804,12 +804,12 @@ async def _open_new(trader, u, sig):
         # was wirklich los ist. Kein Trade-Open ohne verifiziertes Balance.
         from app.hyperliquid_exec import HLOutageError
         if isinstance(e, HLOutageError):
-            _log_activity(u.id, "error", f"{coin}: HL Info-API down — Trade-Open abgebrochen ({e})")
+            _log_activity(u.id, "error", f"{coin}: HL Info-API down — trade-open aborted ({e})")
         else:
-            _log_activity(u.id, "error", f"{coin}: account_value-Fehler ({e}) — Trade-Open abgebrochen")
+            _log_activity(u.id, "error", f"{coin}: account_value error ({e}) — trade-open aborted")
         return
     if balance <= 0:
-        _log_activity(u.id, "skip", f"{coin}: kein handelbares Guthaben")
+        _log_activity(u.id, "skip", f"{coin}: no tradable balance")
         return
 
     # 2026-06-08 Mainnet-Hardening C1: Max-Drawdown Lifetime-Cap.
@@ -825,8 +825,8 @@ async def _open_new(trader, u, sig):
             _log_activity(
                 u.id, "error",
                 f"🚨 MAX-DRAWDOWN-CAP: balance ${balance:.2f} < threshold ${threshold:.2f} "
-                f"(peak ${peak:.2f}, cap {max_dd:.0%}). Bot pausiert. Sieh dir die Trades "
-                f"an, justiere risk_pct/leverage, dann selbst wieder aktivieren."
+                f"(peak ${peak:.2f}, cap {max_dd:.0%}). Bot paused. Review your trades, "
+                f"adjust risk_pct/leverage, then re-activate yourself."
             )
             _db = SessionLocal()
             try:
@@ -850,7 +850,7 @@ async def _open_new(trader, u, sig):
 
     open_pos = await asyncio.to_thread(trader.open_positions_count)
     if open_pos >= u.max_open_positions:
-        _log_activity(u.id, "skip", f"{coin}: max. Positionen ({open_pos}/{u.max_open_positions})")
+        _log_activity(u.id, "skip", f"{coin}: max positions reached ({open_pos}/{u.max_open_positions})")
         return
 
     # C1 (2026-06-09, korrigiert): Aggregat-Margin-Cap gegen die GESAMT-Equity.
@@ -867,8 +867,8 @@ async def _open_new(trader, u, sig):
     if util >= config.MAX_MARGIN_UTILIZATION:
         _log_activity(
             u.id, "skip",
-            f"{coin}: Margin-Auslastung {util*100:.0f}% ≥ Cap {config.MAX_MARGIN_UTILIZATION*100:.0f}% "
-            f"(frei ${avail:.0f} von ${balance:.0f}) — kein neuer Entry. NEW_TRADE skipped clean")
+            f"{coin}: margin utilization {util*100:.0f}% ≥ cap {config.MAX_MARGIN_UTILIZATION*100:.0f}% "
+            f"(free ${avail:.0f} of ${balance:.0f}) — no new entry. NEW_TRADE skipped clean")
         return
 
     sl_distance = abs(sig.entry - sig.stop_loss)
@@ -884,7 +884,7 @@ async def _open_new(trader, u, sig):
             confidence=sig.confidence, max_cap=int(u.leverage or 50),
         )
     except ValueError as e:
-        _log_activity(u.id, "error", f"{coin}: auto-lev failed ({e}) — skipping")
+        _log_activity(u.id, "error", f"{coin}: auto-leverage failed ({e}) — skipping")
         return
 
     # 2026-06-12 (Review #17): auf das Asset-Max aus meta clampen (viele Alts
@@ -896,7 +896,7 @@ async def _open_new(trader, u, sig):
     except Exception:
         asset_max = 0
     if asset_max > 0 and chosen_lev > asset_max:
-        lev_reason = f"{lev_reason} — auf Asset-Max {asset_max}x geclampt"
+        lev_reason = f"{lev_reason} — clamped to asset-max {asset_max}x"
         chosen_lev = asset_max
 
     # Phase 6+ Margin Pre-Check (2026-06-08, korrigiert für Unified-Accounts).
@@ -925,14 +925,14 @@ async def _open_new(trader, u, sig):
             _log_activity(
                 u.id, "skip",
                 f"{coin}: insufficient margin — need ~${est_margin:.2f} "
-                f"(mit Puffer ${needed:.2f}), available ${avail:.2f}. "
-                f"Funde dein HL-Konto. NEW_TRADE skipped clean"
+                f"(with buffer ${needed:.2f}), available ${avail:.2f}. "
+                f"Fund your HL account. NEW_TRADE skipped clean"
             )
             return
     plan = size_trade(account_value=balance, capital_cap=u.capital_cap_usdc, risk_pct=u.risk_pct,
                       entry=sig.entry, stop_loss=sig.stop_loss, leverage=chosen_lev)
     if plan.notional < config.MIN_NOTIONAL_USDC:
-        _log_activity(u.id, "skip", f"{coin}: Notional {plan.notional:.2f} < {config.MIN_NOTIONAL_USDC}")
+        _log_activity(u.id, "skip", f"{coin}: notional {plan.notional:.2f} < {config.MIN_NOTIONAL_USDC}")
         return
 
     is_buy = (direction == "LONG")
@@ -944,13 +944,13 @@ async def _open_new(trader, u, sig):
     lev_res = await asyncio.to_thread(trader.set_leverage, coin, chosen_lev)
     if not (isinstance(lev_res, dict) and lev_res.get("status") == "ok"):
         _log_activity(u.id, "error",
-                      f"{coin}: set_leverage({chosen_lev}x) fehlgeschlagen "
-                      f"({str(lev_res)[:160]}) — Entry übersprungen (kein Trade mit unbestätigtem Hebel).")
+                      f"{coin}: set_leverage({chosen_lev}x) failed "
+                      f"({str(lev_res)[:160]}) — entry skipped (no trade with unconfirmed leverage).")
         return
     _log_activity(u.id, "update", f"{coin}: {lev_reason}")
     entry = await asyncio.to_thread(trader.place_entry, coin, is_buy, plan.qty, sig.entry)
     if not entry["ok"]:
-        _log_activity(u.id, "error", f"Entry-Fehler {coin}: {entry.get('error')}")
+        _log_activity(u.id, "error", f"Entry error {coin}: {entry.get('error')}")
         return
 
     # C3 (2026-06-09): Order ist platziert (filled ODER resting) → signal_id als
@@ -989,10 +989,10 @@ async def _open_new(trader, u, sig):
                 # Row mit SL-Params offen halten, damit der Coverage-Reconciler
                 # (sync-Loop) den Schutz nachlegen kann.
                 _save_managed(u.id, coin, sig, status="open")
-                msg = (f"NOTFALL: Emergency-Close fehlgeschlagen — Position offen & ungeschützt! "
-                       f"{coin}: SL nach Entry fehlgeschlagen UND Market-Close fehlgeschlagen "
+                msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
+                       f"{coin}: SL after entry failed AND market-close failed "
                        f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
-                       f"Sofort manuell prüfen. HL (SL): {err_detail[:120]}")
+                       f"Check manually immediately. HL (SL): {err_detail[:120]}")
                 # Audit H-A (2026-06-12): UNGETHROTTLEDER Alert (key=None) — dieser
                 # Fall darf NIE im (user,coin)-Throttle untergehen.
                 _post_alert(f"🚨 [user {u.id}] {msg}", key=None)
@@ -1000,13 +1000,13 @@ async def _open_new(trader, u, sig):
                 return
             await asyncio.to_thread(trader.cancel_orders, coin)
             _log_activity(u.id, "error",
-                          f"{coin}: SL nach Entry fehlgeschlagen — Position geschlossen. "
+                          f"{coin}: SL after entry failed — position closed. "
                           f"HL response: {err_detail[:180]}")
             return
-        _log_activity(u.id, "order", f"{sig.direction} {coin} eröffnet (qty {sz:.6g}), SL+TP gesetzt")
+        _log_activity(u.id, "order", f"{sig.direction} {coin} opened (qty {sz:.6g}), SL+TP set")
         _save_managed(u.id, coin, sig, status="open")
     else:
-        _log_activity(u.id, "order", f"{sig.direction} {coin}: Limit ruht @ {sig.entry}, warte auf Fill")
+        _log_activity(u.id, "order", f"{sig.direction} {coin}: limit resting @ {sig.entry}, waiting for fill")
         _save_managed(u.id, coin, sig, status="resting", resting_oid=entry.get("resting_oid"))
         # 2026-06-12 (Review #6): Watcher registrieren, damit ein späteres Signal/
         # CANCEL ihn gezielt beenden kann (genau einer pro user+coin).
@@ -1037,7 +1037,7 @@ async def _adjust(trader, u, sig, pos):
     is_buy = pos > 0
     if sig.stop_loss is None:
         # Update ohne neuen SL -> bestehende Schutz-Orders NICHT anfassen (nie ungeschützt lassen)
-        _log_activity(u.id, "update", f"{coin}: Update ohne neuen SL — bestehender Schutz bleibt")
+        _log_activity(u.id, "update", f"{coin}: update without new SL — existing protection kept")
         _save_managed(u.id, coin, sig, status="open")
         return
 
@@ -1052,8 +1052,8 @@ async def _adjust(trader, u, sig, pos):
     if current_sl is not None and db_direction and db_direction != hl_direction:
         _log_activity(
             u.id, "update",
-            f"{coin}: Direction-Flip erkannt (DB={db_direction}, HL={hl_direction}) — "
-            f"SL-Ratchet übersprungen, neuer SL {sig.stop_loss} wird gesetzt."
+            f"{coin}: direction flip detected (DB={db_direction}, HL={hl_direction}) — "
+            f"SL-ratchet skipped, new SL {sig.stop_loss} will be set."
         )
         current_sl = None  # Ratchet ausschalten, sauber neu setzen
     if current_sl is not None:
@@ -1061,8 +1061,8 @@ async def _adjust(trader, u, sig, pos):
         if loosens:
             _log_activity(
                 u.id, "update",
-                f"{coin}: SL-Update {sig.stop_loss} abgelehnt (würde Risiko erhöhen — "
-                f"aktueller SL {current_sl}, {hl_direction}). Bestehender Schutz bleibt."
+                f"{coin}: SL-update {sig.stop_loss} rejected (would increase risk — "
+                f"current SL {current_sl}, {hl_direction}). Existing protection kept."
             )
             # WICHTIG: managed_trade NICHT überschreiben, sonst zukünftige
             # Ratchet-Checks vergleichen gegen den falschen Wert.
@@ -1097,9 +1097,9 @@ async def _adjust(trader, u, sig, pos):
             side = "LONG" if is_buy else "SHORT"
             _log_activity(
                 u.id, "update",
-                f"{coin}: SL-Update {sig.stop_loss} skipped (würde sofort triggern — "
-                f"{side} mark={mark}, regel: {'LONG SL<mark' if is_buy else 'SHORT SL>mark'}). "
-                f"Bestehender Schutz bleibt unverändert."
+                f"{coin}: SL-update {sig.stop_loss} skipped (would trigger immediately — "
+                f"{side} mark={mark}, rule: {'LONG SL<mark' if is_buy else 'SHORT SL>mark'}). "
+                f"Existing protection unchanged."
             )
             return  # alter SL bleibt aktiv, kein cancel, keine Position-Close
 
@@ -1132,12 +1132,12 @@ async def _adjust(trader, u, sig, pos):
                 reprot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sl_old, tps_old)
                 if reprot.get("sl_ok"):
                     _log_activity(u.id, "update",
-                                  f"{coin}: SL-Update {sig.stop_loss} würde sofort triggern (Mark-Race) → "
-                                  f"vorheriger Schutz (SL {sl_old}) wiederhergestellt, Position NICHT geschlossen.")
+                                  f"{coin}: SL-update {sig.stop_loss} would trigger immediately (mark race) → "
+                                  f"previous protection (SL {sl_old}) restored, position NOT closed.")
                     return
             _log_activity(u.id, "error",
-                          f"{coin}: SL-Update would-trigger + Wiederherstellung fehlgeschlagen — Position evtl. "
-                          f"UNGESCHÜTZT, bitte manuell prüfen (NICHT auto-geschlossen).")
+                          f"{coin}: SL-update would-trigger + restore failed — position possibly "
+                          f"UNPROTECTED, please check manually (NOT auto-closed).")
             return
         # 2026-06-12 (Review #4): close_position-Resultat prüfen statt blind
         # "geschlossen" zu loggen — bei Fail ist die Position OFFEN und der alte
@@ -1147,18 +1147,18 @@ async def _adjust(trader, u, sig, pos):
             # Audit H-A (2026-06-12): Row mit SL-Params OFFEN lassen (sync-Loop +
             # Coverage-Reconciler beobachten weiter) + ungethrottleder Alert.
             _save_managed(u.id, coin, sig, status="open")
-            msg = (f"NOTFALL: Emergency-Close fehlgeschlagen — Position offen & ungeschützt! "
-                   f"{coin}: SL-Update fehlgeschlagen UND Market-Close fehlgeschlagen "
+            msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
+                   f"{coin}: SL-update failed AND market-close failed "
                    f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
-                   f"Sofort manuell prüfen. HL (SL): {err_detail[:120]}")
+                   f"Check manually immediately. HL (SL): {err_detail[:120]}")
             _post_alert(f"🚨 [user {u.id}] {msg}", key=None)
             _log_activity(u.id, "error", msg)
             return
         await asyncio.to_thread(trader.cancel_orders, coin)
         _log_activity(u.id, "error",
-                      f"{coin}: SL-Update failed → Position geschlossen. HL response: {err_detail[:180]}")
+                      f"{coin}: SL-update failed → position closed. HL response: {err_detail[:180]}")
         return
-    _log_activity(u.id, "update", f"{coin}: These angepasst — SL {sig.stop_loss}, TP nachgezogen (qty {abs(pos):.6g})")
+    _log_activity(u.id, "update", f"{coin}: thesis adjusted — SL {sig.stop_loss}, TP trailed (qty {abs(pos):.6g})")
     _save_managed(u.id, coin, sig, status="open")
 
 
@@ -1189,16 +1189,16 @@ async def _cancel(user_id, sig):
                 pos = await asyncio.to_thread(trader.position_size, coin)
             except Exception as e:
                 _log_activity(user_id, "error",
-                              f"{coin}: Positionsstatus nicht lesbar ({str(e)[:160]}) — "
-                              f"CANCEL abgebrochen (keine Orders gecancelt, Schutz bleibt).")
+                              f"{coin}: position status unreadable ({str(e)[:160]}) — "
+                              f"CANCEL aborted (no orders cancelled, protection kept).")
                 return
 
             if abs(pos) > 0:
                 # Position OFFEN -> CANCEL ignorieren, SL/TP übernehmen den Exit.
                 _log_activity(
                     user_id, "skip",
-                    f"{coin}: CANCEL ignoriert — Position offen (qty {abs(pos):.6g}). "
-                    f"Exit erfolgt über SL/TP."
+                    f"{coin}: CANCEL ignored — position open (qty {abs(pos):.6g}). "
+                    f"Exit happens via SL/TP."
                 )
                 return
 
@@ -1207,7 +1207,7 @@ async def _cancel(user_id, sig):
             _cancel_fill_watcher(user_id, coin)
             n = await asyncio.to_thread(trader.cancel_orders, coin)
             if n > 0:
-                _log_activity(user_id, "close", f"{coin}: pre-entry Limit gecancelt (n={n}) — These invalidiert")
+                _log_activity(user_id, "close", f"{coin}: pre-entry limit cancelled (n={n}) — thesis invalidated")
             _close_managed(user_id, coin)
         except InvalidToken:
             # Audit M-4: siehe _open_or_update — undecryptbarer Key pausiert
@@ -1263,16 +1263,16 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
         close_res = trader.close_position(coin)
         if not close_res.get("ok"):
             _save_managed(user_id, coin, sig, status="open")
-            msg = (f"NOTFALL: Emergency-Close fehlgeschlagen — Position offen & ungeschützt! "
-                   f"{coin}: SL nach Fill fehlgeschlagen UND Market-Close fehlgeschlagen "
+            msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
+                   f"{coin}: SL after fill failed AND market-close failed "
                    f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
-                   f"Sofort manuell prüfen. HL (SL): {err[:120]}")
+                   f"Check manually immediately. HL (SL): {err[:120]}")
             # Audit H-A: ungethrottleder Alert (key=None) — darf nie untergehen.
             _post_alert(f"🚨 [user {user_id}] {msg}", key=None)
             _log_activity(user_id, "error", msg)
             return False, True
         trader.cancel_orders(coin)
-        _log_activity(user_id, "error", f"{coin}: SL nach Fill fehlgeschlagen — Position geschlossen. HL: {err[:180]}")
+        _log_activity(user_id, "error", f"{coin}: SL after fill failed — position closed. HL: {err[:180]}")
         _close_managed(user_id, coin)
         return False, True
 
@@ -1309,7 +1309,7 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
                     protected = psz
                     stable = 0
                     _save_managed(user_id, coin, sig, status="open")
-                    _log_activity(user_id, "order", f"{coin} gefüllt (qty {psz:.6g}) — SL+TP voll abgedeckt")
+                    _log_activity(user_id, "order", f"{coin} filled (qty {psz:.6g}) — SL+TP fully covered")
             elif protected > 0:
                 stable += 1
                 if stable >= 2:   # 2 Polls keine neuen Fills → Order fertig gefüllt
@@ -1332,8 +1332,8 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
             # während ein echter Fill ungeschützt liegen konnte. Jetzt: nichts
             # anfassen, Row offen lassen — Startup-/Coverage-Reconciler übernimmt.
             _log_activity(user_id, "error",
-                          f"{coin}: Fill-Watcher-Timeout, Positionsstatus nicht lesbar "
-                          f"({str(e)[:120]}) — nichts gecancelt, Reconciler übernimmt.")
+                          f"{coin}: fill-watcher timeout, position status unreadable "
+                          f"({str(e)[:120]}) — nothing cancelled, reconciler takes over.")
             return
         if psz_final > protected * 1.001:
             ok, fatal = await asyncio.to_thread(_protect_delta, psz_final)
@@ -1342,7 +1342,7 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
             if ok:
                 protected = psz_final
                 _save_managed(user_id, coin, sig, status="open")
-                _log_activity(user_id, "order", f"{coin}: last-second fill (qty {psz_final:.6g}) — SL+TP nachgesetzt")
+                _log_activity(user_id, "order", f"{coin}: last-second fill (qty {psz_final:.6g}) — SL+TP placed")
         if protected > 0:
             # H-1 (2026-06-12): Watcher endet (Teil-/Voll-Fill) → ruhenden Entry-Rest
             # canceln, sonst füllt der Rest später NACKT (sync.py prüft keine Coverage).
@@ -1351,7 +1351,7 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
             return
         # Nie gefüllt → ruhende Order canceln.
         await asyncio.to_thread(trader.cancel_orders, coin)
-        _log_activity(user_id, "skip", f"{coin} nicht gefüllt — kein Trade")
+        _log_activity(user_id, "skip", f"{coin} not filled — no trade")
         _close_managed(user_id, coin)
         # Audit LOW-1: es wurde NIE getradet → Dedup-Marke freigeben, damit ein
         # Re-Emit desselben signal_id wieder ausgeführt werden kann.
@@ -1433,8 +1433,8 @@ async def _rearm_resting_watchers(user_ids):
         except Exception as e:
             log.warning("rearm: trader build failed user %s: %s", user_id, e)
             _log_activity(user_id, "error",
-                          f"{coin}: ruhender Entry nach Neustart, Trader nicht baubar "
-                          f"({str(e)[:120]}) — Order evtl. noch live auf HL, bitte manuell prüfen.")
+                          f"{coin}: resting entry after restart, trader not buildable "
+                          f"({str(e)[:120]}) — order possibly still live on HL, please check manually.")
             continue
         try:
             if r["stop_loss"] is None or r["direction"] not in ("LONG", "SHORT"):
@@ -1445,8 +1445,8 @@ async def _rearm_resting_watchers(user_ids):
                     await asyncio.to_thread(trader.cancel_orders, coin)
                 _close_managed(user_id, coin)
                 _log_activity(user_id, "error",
-                              f"{coin}: ruhender Entry nach Neustart ohne SL/Direction in der DB — "
-                              f"Order gecancelt + Row geschlossen (kein nackter Fill möglich).")
+                              f"{coin}: resting entry after restart without SL/direction in the DB — "
+                              f"order cancelled + row closed (no naked fill possible).")
                 continue
             tps_pairs = []
             if r["take_profits"]:
@@ -1463,8 +1463,8 @@ async def _rearm_resting_watchers(user_ids):
                 pos = await asyncio.to_thread(trader.position_size, coin)
             except Exception as e:
                 _log_activity(user_id, "error",
-                              f"{coin}: ruhender Entry nach Neustart, Positionsstatus nicht lesbar "
-                              f"({str(e)[:120]}) — bitte manuell prüfen.")
+                              f"{coin}: resting entry after restart, position status unreadable "
+                              f"({str(e)[:120]}) — please check manually.")
                 continue
             if abs(pos) > 0:
                 # Gefüllt während down: Row auf 'open' (Sync übernimmt sie), Entry-Rest
@@ -1473,8 +1473,8 @@ async def _rearm_resting_watchers(user_ids):
                 if r["resting_oid"]:
                     await asyncio.to_thread(trader.cancel_order, coin, r["resting_oid"])
                 _log_activity(user_id, "update",
-                              f"{coin}: ruhender Entry hat während des Neustarts gefüllt "
-                              f"(qty {abs(pos):.6g}) — Row auf 'open', Coverage-Reconciler prüft Schutz.")
+                              f"{coin}: resting entry filled during the restart "
+                              f"(qty {abs(pos):.6g}) — row set to 'open', coverage-reconciler checks protection.")
                 continue
             is_buy = r["direction"] == "LONG"
             tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
@@ -1484,13 +1484,13 @@ async def _rearm_resting_watchers(user_ids):
             t = _spawn(_protect_when_filled(trader, user_id, sig, is_buy, tps, r["resting_oid"]))
             _register_fill_watcher(user_id, coin, t)
             _log_activity(user_id, "update",
-                          f"{coin}: Fill-Watcher nach Neustart re-armiert "
-                          f"(ruhender Entry @ {r['entry']}, SL {r['stop_loss']}).")
+                          f"{coin}: fill-watcher re-armed after restart "
+                          f"(resting entry @ {r['entry']}, SL {r['stop_loss']}).")
         except Exception as e:
             log.exception("rearm failed user %s coin %s: %s", user_id, coin, e)
             _log_activity(user_id, "error",
-                          f"{coin}: Resting-Reconcile nach Neustart fehlgeschlagen ({str(e)[:120]}) — "
-                          f"ruhende Order evtl. unbewacht, bitte manuell prüfen.")
+                          f"{coin}: resting reconcile after restart failed ({str(e)[:120]}) — "
+                          f"resting order possibly unguarded, please check manually.")
 
 
 async def reconcile_stop_coverage(user_ids=None):
@@ -1538,8 +1538,8 @@ async def reconcile_stop_coverage(user_ids=None):
                     if sl is None:
                         _log_activity(
                             user_id, "error",
-                            f"{coin}: Position qty {sz:.6g} nur zu {covered:.6g} per SL gedeckt, KEIN "
-                            f"SL-Preis im managed_trade bekannt — bitte manuell absichern/schließen.")
+                            f"{coin}: position qty {sz:.6g} only covered {covered:.6g} by SL, NO "
+                            f"SL price known in managed_trade — please secure/close manually.")
                         continue
                     is_buy = szi > 0
                     # Schutz für die FEHLENDE Menge nachlegen (reduce-only stackt mit
@@ -1548,12 +1548,12 @@ async def reconcile_stop_coverage(user_ids=None):
                     if prot.get("sl_ok"):
                         _log_activity(
                             user_id, "update",
-                            f"{coin}: Reconciler hat Unter-Deckung gefixt — SL/TP für fehlende "
-                            f"{uncovered:.6g} nachgelegt (war {covered:.6g}/{sz:.6g}, SL {sl}).")
+                            f"{coin}: reconciler fixed under-coverage — added SL/TP for missing "
+                            f"{uncovered:.6g} (was {covered:.6g}/{sz:.6g}, SL {sl}).")
                     else:
                         _log_activity(
                             user_id, "error",
-                            f"{coin}: Unter-Deckung ({covered:.6g}/{sz:.6g}) — Schutz nachlegen "
-                            f"FEHLGESCHLAGEN ({str(prot.get('sl'))[:120]}). Manuell absichern!")
+                            f"{coin}: under-coverage ({covered:.6g}/{sz:.6g}) — adding protection "
+                            f"FAILED ({str(prot.get('sl'))[:120]}). Secure manually!")
             except Exception as e:
                 log.warning("reconcile: protect failed user %s coin %s: %s", user_id, coin, e)
