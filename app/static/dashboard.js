@@ -326,8 +326,8 @@ function drawChart(pts){
     '<stop offset="0" stop-color="#10b981" stop-opacity="0.32"/>'+
     '<stop offset="1" stop-color="#10b981" stop-opacity="0"/></linearGradient></defs>'+
     '<line x1="0" y1="'+zeroY+'" x2="'+W+'" y2="'+zeroY+'" stroke="#26342d" stroke-width="1" stroke-dasharray="4 4"/>'+
-    '<path d="'+area+'" fill="url(#gpnl)"/>'+
-    '<path d="'+line+'" fill="none" stroke="#10b981" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
+    '<path class="area" d="'+area+'" fill="url(#gpnl)"/>'+
+    '<path class="line" d="'+line+'" fill="none" stroke="#10b981" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>';
 }
 function renderStats(){
   if(!STATS) return;
@@ -346,6 +346,10 @@ function renderStats(){
   const miniUnrealized=document.getElementById("miniUnrealized"); if(miniUnrealized){ miniUnrealized.textContent=fmtSigned(unrealized); miniUnrealized.className="mini-value "+(unrealized>=0?"pos":"neg"); }
   const miniOpen=document.getElementById("miniOpen"); if(miniOpen) miniOpen.textContent=openCount;
   const miniClosed=document.getElementById("miniClosed"); if(miniClosed) miniClosed.textContent=(STATS.closed_trades||0);
+  const marketWin=document.getElementById("marketWin"); if(marketWin) marketWin.textContent=(STATS.win_rate||0)+"%";
+  const marketClosed=document.getElementById("marketClosed"); if(marketClosed) marketClosed.textContent=(STATS.closed_trades||0);
+  const marketExposure=document.getElementById("marketExposure"); if(marketExposure) marketExposure.textContent="$"+exposure.toFixed(2);
+  const marketRisk=document.getElementById("marketRisk"); if(marketRisk) marketRisk.textContent=(ACCOUNT && ACCOUNT.risk_pct != null ? ACCOUNT.risk_pct : (STATS.risk_pct || 0)) + "% / trade";
   const w=seriesFor(TF);
   const el=document.getElementById("statpnl");
   el.textContent=fmtUsd(w.total); el.className="stat-v "+(w.total>=0?"pos":"neg");
@@ -446,8 +450,30 @@ async function load(){
       if(onchain){onchain.textContent="Builder-Fee aktuell deaktiviert — Trades laufen ohne Builder-Code.";onchain.style.color="";}
     }
     const pb=document.querySelector("#postbl tbody");pb.innerHTML="";
-    (d.account.positions||[]).forEach(p=>{pb.insertAdjacentHTML("beforeend",`<tr><td>${esc(p.coin)}</td><td>${esc(p.size)}</td><td>${esc(p.entry)}</td><td>${esc(p.uPnl)}</td></tr>`)});
-    posempty.style.display=(d.account.positions||[]).length?"none":"block";
+    const cards=document.getElementById("positionCards"); if(cards) cards.innerHTML="";
+    const positions=d.account.positions||[];
+    positions.forEach(p=>{
+      const side=(Number(p.size)||0) >= 0 ? "Long" : "Short";
+      const up=(Number(p.uPnl)||0);
+      pb.insertAdjacentHTML("beforeend",`<tr><td>${esc(p.coin)}</td><td>${esc(p.size)}</td><td>${esc(p.entry)}</td><td class="${up>=0?'pos':'neg'}">${up>=0?'+':''}${esc(Number(p.uPnl||0).toFixed(2))}</td></tr>`);
+      if(cards){ cards.insertAdjacentHTML("beforeend", `
+        <article class="position-card ${up>=0?'heat-positive':'heat-negative'}">
+          <div class="position-top">
+            <div>
+              <div class="position-coin">${esc(p.coin)}</div>
+              <div class="position-side">${esc(side)} position</div>
+            </div>
+            <span class="pill ${up>=0?'on':'off'}">${up>=0?'+':''}${Number(up).toFixed(2)} uPnL</span>
+          </div>
+          <div class="position-metrics">
+            <div class="metric-box"><div class="label">Size</div><div class="value">${esc(Number(p.size||0).toFixed(4))}</div></div>
+            <div class="metric-box"><div class="label">Entry</div><div class="value">$${esc(Number(p.entry||0).toFixed(2))}</div></div>
+            <div class="metric-box"><div class="label">uPnL</div><div class="value ${up>=0?'pos':'neg'}">${up>=0?'+':''}${esc(Number(p.uPnl||0).toFixed(2))}</div></div>
+            <div class="metric-box"><div class="label">Notional</div><div class="value">$${esc((Math.abs(Number(p.size||0))*Math.abs(Number(p.entry||0))).toFixed(2))}</div></div>
+          </div>
+        </article>`); }
+    });
+    posempty.style.display=positions.length?"none":"block";
     // 2026-06-04: Per-Coin Filter Status für den User (Restposten #4).
     loadPerCoinStatus();
     const ab=document.querySelector("#acttbl tbody");ab.innerHTML="";
