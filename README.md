@@ -81,10 +81,12 @@ Keep `ENABLE_LISTENER=false` and `HL_TESTNET=true` locally.
 
 ---
 
-## Current status (2026-05-29)
+## Current status (2026-06-12)
 
-- Deployed at HEAD `a459d6f` (pre-beta hardening + managed-trade lifecycle). CI/CD auto-deploys on push to `main` (`.github/workflows/deploy.yml` → SSH `git pull` + service restart).
-- `systemd` unit `goathub` active; listener connected as `GoatHub Copy Trading Bot#2523`, channel `…294`, **testnet**.
+- Latest verified UI pass: website-style dashboard, app-style sections, mobile/web-app metadata, and live trading overview cards.
+- Verified locally with `python3 -m pytest -q` → `17 passed in 1.80s`.
+- Deployment path is `systemd`, not Docker: [goathub.service](goathub.service) runs `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+- CI/CD auto-deploys on push to `main` (`.github/workflows/deploy.yml` → SSH `git pull` + service restart).
 - **Builder off** (`BUILDER_ADDRESS` empty) → 0 builder errors in the last 24h.
 - **Active users:** id 2 (`tretaghunberg`, key OK, **trading fine** — ETH long + DOGE short open with SL/TP). ids 3 & 4 active but **broken** (below). All other accounts inactive.
 
