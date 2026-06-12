@@ -90,6 +90,9 @@ document.addEventListener("DOMContentLoaded",function(){
     const w=document.getElementById("walletWizard");
     if(w){w.open=true; w.scrollIntoView({behavior:"smooth"});}
   });
+  const topOpenWallet=document.getElementById("topOpenWallet"); if(topOpenWallet) topOpenWallet.addEventListener("click", ()=>document.getElementById("wallet")?.scrollIntoView({behavior:"smooth"}));
+  const topOpenRisk=document.getElementById("topOpenRisk"); if(topOpenRisk) topOpenRisk.addEventListener("click", ()=>document.getElementById("risk")?.scrollIntoView({behavior:"smooth"}));
+  const topOpenOverview=document.getElementById("topOpenOverview"); if(topOpenOverview) topOpenOverview.addEventListener("click", ()=>document.getElementById("overview")?.scrollIntoView({behavior:"smooth"}));
 });
 async function saveSettings(){try{await api("PUT","/api/settings",{risk_pct:+risk.value,leverage:+lev.value,max_open_positions:+maxp.value,capital_cap_usdc:+cap.value});show(smsg,"Saved ✓","ok")}catch(e){show(smsg,e.message,"err")}}
 async function approveBuilder(){try{const r=await api("POST","/api/builder-approved");show(bmsg,`Thank you — referral confirmed on-chain (${r.approved_bps} bps) ✓`,"ok");load();verifyBuilder()}catch(e){show(bmsg,e.message,"err")}}

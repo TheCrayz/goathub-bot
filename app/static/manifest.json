@@ -1,0 +1,9 @@
+{
+  "name": "GoatHub Trading Bot",
+  "short_name": "GoatHub",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07100d",
+  "theme_color": "#07100d",
+  "icons": []
+}

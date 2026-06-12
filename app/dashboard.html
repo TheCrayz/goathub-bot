@@ -1,8 +1,13 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07100d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GoatHub">
 <title>GoatHub Trading Bot</title>
+<link rel="manifest" href="/static/manifest.json">
 <!-- Phase 6 (2026-06-02): favicon via emoji (no extra file needed). -->
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22&gt;&lt;text y=%22.9em%22 font-size=%2290%22&gt;🐐&lt;/text&gt;&lt;/svg&gt;">
 <style>
@@ -36,6 +41,24 @@
   .mini-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.15);color:#c9ffe8;font-size:12px;font-weight:700}
   .mini-pill strong{color:var(--text)}
   .hero-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
+  .site-nav{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .site-nav a{display:inline-flex;align-items:center;gap:6px;padding:8px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:#e7fff4;text-decoration:none;font-size:12px;font-weight:700}
+  .site-nav a:hover{background:rgba(74,242,178,.08);border-color:rgba(74,242,178,.18)}
+  .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .hero-cta{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .hero-cta .btn-main,.hero-cta .btn-secondary{border-radius:999px;padding:10px 12px;font-size:13px;font-weight:800;text-decoration:none}
+  .btn-main{background:linear-gradient(135deg,#18e0a2,#10b981);color:#03110b;box-shadow:0 12px 24px rgba(16,185,129,.18)}
+  .btn-secondary{background:rgba(255,255,255,.04);color:#e7fff4;border:1px solid rgba(74,242,178,.18)}
+  .topbar-brand{display:flex;align-items:center;gap:10px}
+  .topbar-brand .logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg, rgba(74,242,178,.18), rgba(96,165,250,.12)); border:1px solid rgba(74,242,178,.18); display:grid;place-items:center;font-size:20px}
+  .topbar-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .topbar-btn{background:linear-gradient(135deg,#18e0a2,#10b981); color:#03110b; border:0; border-radius:999px; padding:8px 12px; font-weight:800; font-size:12px; box-shadow:0 10px 18px rgba(16,185,129,.18)}
+  .topbar-btn.ghost{background:transparent;color:#75f2c1;border:1px solid rgba(74,242,178,.28); box-shadow:none}
+  .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .feature-card{background:linear-gradient(145deg, rgba(12,19,16,.98), rgba(8,13,10,.98)); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:12px; box-shadow:0 14px 28px rgba(0,0,0,.24)}
+  .feature-card strong{display:block;font-size:14px;margin-bottom:4px}
+  .feature-card span{color:#bcd8c8;font-size:12px}
+  .section-kicker{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#9fe8c8;font-weight:800}
   .hero-metric{background:linear-gradient(145deg, rgba(14,24,20,.96), rgba(9,15,12,.95)); border:1px solid rgba(255,255,255,.06); border-radius:16px; padding:10px 12px; box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
   .desk-strip{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:8px}
   .desk-tag{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:rgba(74,242,178,.08);border:1px solid rgba(74,242,178,.16);color:#dffbf2;font-size:12px;font-weight:700}
@@ -138,12 +161,32 @@
   @media (max-width: 440px) { .hero-metrics{grid-template-columns:1fr} .mini-grid{grid-template-columns:1fr} .stat { flex: 1 1 100%; } .stat-v { font-size: 22px; } }
 </style></head>
 <body><div class="wrap">
+  <div class="topbar">
+    <div class="topbar-brand">
+      <div class="logo">🐐</div>
+      <div>
+        <div class="eyebrow" style="font-size:10px">GoatHub Platform</div>
+        <div style="font-size:18px;font-weight:800">Trading Desk · Web App Ready</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button class="topbar-btn ghost" id="topOpenWallet">Wallet</button>
+      <button class="topbar-btn ghost" id="topOpenRisk">Risk</button>
+      <button class="topbar-btn" id="topOpenOverview">Overview</button>
+    </div>
+  </div>
+
   <section class="hero">
     <div class="eyebrow"><span class="dot"></span> Live trading dashboard</div>
     <div class="hero-grid">
       <div>
         <h1>🐐 GoatHub Trading Bot <span id="netbadge" class="pill off pulse">MAINNET</span></h1>
         <div class="sub" id="netline">Community copy-trading on Hyperliquid — smoother, brighter, and built for fast decisions.</div>
+        <div class="hero-cta">
+          <a class="btn-main" href="#overview">Open trading desk</a>
+          <a class="btn-secondary" href="#wallet">Connect wallet</a>
+          <a class="btn-secondary" href="#history">View history</a>
+        </div>
         <div class="desk-strip">
           <div style="display:flex;flex-wrap:wrap;gap:8px">
             <span class="desk-tag">⚡ Trading Desk</span>
@@ -152,6 +195,13 @@
           </div>
           <span class="mini-pill">Builder-ready • Hyperliquid snapshot</span>
         </div>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="#overview">Overview</a>
+          <a href="#wallet">Wallet</a>
+          <a href="#risk">Risk</a>
+          <a href="#positions">Positions</a>
+          <a href="#history">History</a>
+        </nav>
       </div>
       <div class="hero-metrics">
         <div class="hero-metric"><div class="label">Status</div><div class="value" id="heroStatus">Online</div></div>
@@ -214,8 +264,12 @@
 
   <!-- APP -->
   <div id="app" class="hide">
-    <!-- Stats -->
-    <div class="stats">
+    <!-- Overview -->
+    <section id="overview" class="card">
+      <div class="section-kicker">Overview</div>
+      <h2 style="margin-top:6px">Trading Desk Overview</h2>
+      <div class="mut" style="margin-bottom:8px">A clearer multi-section workspace for live account data, risk controls, and activity history.</div>
+      <div class="stats">
       <div class="stat">
         <div class="stat-h">$ Total PnL</div>
         <div class="tf">
@@ -231,10 +285,17 @@
       <div class="stat"><div class="stat-h">🧭 Open Exposure</div><div id="statExposure" class="stat-v">—</div><div class="mut">Estimated notional exposure</div></div>
       <div class="stat"><div class="stat-h">📍 Open Positions</div><div id="statOpen" class="stat-v">—</div><div class="mut">Active trades on the book</div></div>
       <div class="stat"><div class="stat-h">✓ Win Rate</div><div id="statwin" class="stat-v">—</div><div class="mut" id="stattrades">—</div></div>
-    </div>
+      </div>
+    </section>
 
-    <div class="card">
-      <h2>Trader At-a-Glance</h2>
+    <section class="card" style="border-color:rgba(74,242,178,.18)">
+      <div class="section-kicker">Platform</div>
+      <h2 style="margin-top:6px">Trader At-a-Glance</h2>
+      <div class="feature-grid" style="margin-top:8px">
+        <article class="feature-card"><strong>Desk Mode</strong><span>Live account, PnL, and position data in one workspace.</span></article>
+        <article class="feature-card"><strong>Risk Layer</strong><span>Exposure, leverage cap, and capital controls are always visible.</span></article>
+        <article class="feature-card"><strong>Web App Ready</strong><span>Mobile Safari / Android-friendly layout and standalone feel.</span></article>
+      </div>
       <div class="chip-row">
         <span class="chip">⚡ Live PnL</span>
         <span class="chip">📊 Hyperliquid snapshot</span>
@@ -251,9 +312,9 @@
         <div class="market-card"><div class="market-label">Closed trades</div><div id="marketClosed" class="market-value">—</div></div>
         <div class="market-card"><div class="market-label">Risk layer</div><div id="marketRisk" class="market-value">—</div></div>
       </div>
-    </div>
+    </section>
 
-    <div class="card">
+    <section class="card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
         <h2 style="margin-bottom:0">Cumulative PnL Performance</h2>
         <div class="chip-row" style="margin-top:0">
@@ -270,10 +331,11 @@
         <svg id="chart" viewBox="0 0 600 170" preserveAspectRatio="none"></svg>
         <div class="mut" id="chartempty" style="display:none">No closed trades in this period yet.</div>
       </div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Account</h2>
+    <section id="wallet" class="card">
+      <div class="section-kicker">Wallet</div>
+      <h2 style="margin-top:6px">Account & Wallet</h2>
       <div class="row">
         <div>
           <div class="mut">Logged in as</div>
@@ -288,10 +350,11 @@
       <button id="toggle" style="margin-top:14px">Enable Bot</button>
       <button id="logoutBtn" class="ghost">Logout</button>
       <a id="adminlink" href="/admin" class="hide" style="margin-left:8px;color:#10b981;font-size:12px;text-decoration:none">⚙ Admin →</a>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>1. Connect Hyperliquid Wallet</h2>
+    <section id="wallet-connect" class="card">
+      <div class="section-kicker">Setup</div>
+      <h2 style="margin-top:6px">1. Connect Hyperliquid Wallet</h2>
       <div class="mut">Status: <b id="wstat">not connected</b></div>
 
       <!-- 2026-06-04 Wallet-Wizard (Restposten #1): step-by-step damit Tester
@@ -337,10 +400,11 @@
         <button type="button" class="ghost" id="walletAnleitungBtn">Anleitung öffnen</button>
       </div>
       <div class="msg" id="wmsg"></div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>2. Risk Management &amp; Capital Cap</h2>
+    <section id="risk" class="card">
+      <div class="section-kicker">Risk</div>
+      <h2 style="margin-top:6px">2. Risk Management &amp; Capital Cap</h2>
       <div class="row">
         <div><label>Risk % / Trade</label><input id="risk" type="number" step="0.005"></div>
         <div><label>Max Leverage Cap (Auto)</label><input id="lev" type="number" step="1" min="1" max="50"></div>
@@ -356,10 +420,11 @@
         <br>Risk-Amount (% × Account) bleibt bei jedem Trade gleich — Hebel ändert nur margin-usage, nicht Verlustpotenzial bei SL-Trigger.
         <br>Cap 1000 = bei 100k Account werden nur 1000 USDC fürs Sizing genutzt.
       </div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>3. Builder Fee / Referral</h2>
+    <section id="builder" class="card">
+      <div class="section-kicker">Builder</div>
+      <h2 style="margin-top:6px">3. Builder Fee / Referral</h2>
       <div class="mut">Trades carry a builder code. Approve the fee once in the Hyperliquid UI
         (<i>approve builder fee</i>) for this address, then confirm here. Phase 5 (2026-06-02):
         the dashboard now verifies on-chain — clicking confirm will only succeed if the approval
@@ -375,18 +440,20 @@
       <div class="mut" style="font-size:11px;margin-top:6px">
         Der orange Button öffnet MetaMask und lässt dich on-chain freigeben — danach setzt der Bot automatisch das DB-Flag. Funktioniert nur wenn deine MetaMask die <b>MASTER-Adresse</b> dieser Wallet ist (nicht der Agent-Key).
       </div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Open Positions</h2>
+    <section id="positions" class="card">
+      <div class="section-kicker">Positions</div>
+      <h2 style="margin-top:6px">Open Positions</h2>
       <div class="mut" style="margin-bottom:8px">Die wichtigsten offenen Trades direkt auf einem Blick – mit PnL, Größe und Entry aus dem Bot-Snapshot.</div>
       <div id="positionCards" class="position-grid"></div>
       <table id="postbl" style="margin-top:10px"><thead><tr><th>Coin</th><th>Size</th><th>Entry</th><th>uPnL</th></tr></thead><tbody></tbody></table>
       <div class="mut" id="posempty">No open positions.</div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Per-Coin Filter Status</h2>
+    <section id="history" class="card">
+      <div class="section-kicker">History</div>
+      <h2 style="margin-top:6px">Per-Coin Filter Status</h2>
       <div class="mut" style="margin-bottom:8px">
         Der Bot blockt automatisch neue Positionen für Coins auf denen du eine schwache Performance hast.
         Schwelle: ≥<span id="pcMinTrades">10</span> Trades und Win-Rate <span id="pcMinRate">&lt; 30%</span>.
@@ -394,20 +461,28 @@
       </div>
       <table id="pctbl"><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Win-Rate</th><th>Status</th></tr></thead><tbody></tbody></table>
       <div class="mut" id="pcempty">Noch keine Trade-History auf HL — nichts geblockt.</div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Recent History</h2>
+    <section class="card" style="border-color:rgba(96,165,250,.16)">
+      <div class="section-kicker">History</div>
+      <h2 style="margin-top:6px">Recent History</h2>
       <table id="histtbl"><thead><tr><th>Date</th><th>Asset</th><th>Direction</th><th>Price</th><th>PnL</th></tr></thead><tbody></tbody></table>
       <div class="mut" id="histempty">No trades yet.</div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Bot Activity</h2>
+    <section class="card" style="border-color:rgba(255,211,107,.16)">
+      <div class="section-kicker">Activity</div>
+      <h2 style="margin-top:6px">Bot Activity</h2>
       <table id="acttbl"><thead><tr><th>Time</th><th>Type</th><th>Info</th></tr></thead><tbody></tbody></table>
       <div class="mut" id="actempty">No activity yet.</div>
-    </div>
+    </section>
   </div>
+
+  <section class="card" style="border-color:rgba(74,242,178,.18)">
+    <div class="section-kicker">App</div>
+    <h2 style="margin-top:6px">Safari / Android Web App Style</h2>
+    <div class="mut">The interface is now framed like a real trading platform: clear sections, quick entry points, and mobile-friendly presentation for standalone browser use.</div>
+  </section>
 
   <div class="foot"><span id="foot-net">GoatHub Trading Bot</span> · not financial advice · trade at your own risk<br>
     Automated leveraged trading can result in total loss of capital. Hyperliquid restricts certain jurisdictions — verify your local regulations.</div>
