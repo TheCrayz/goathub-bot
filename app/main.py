@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import httpx
 from slowapi import Limiter
@@ -485,7 +486,18 @@ def register(request: Request, body: Register, db: Session = Depends(get_db)):
              risk_pct=config.DEFAULT_RISK_PCT, leverage=config.DEFAULT_LEVERAGE,
              max_open_positions=config.DEFAULT_MAX_OPEN)
     db.add(u)
-    db.commit()
+    # 2026-06-13 fastapi-patterns #3: der db.query(...).first()-Pre-Check oben
+    # ist nur Fast-Path-UX und race-anfällig (TOCTOU). Zwei gleichzeitige
+    # Registrierungen derselben Email können beide am Pre-Check vorbei, der
+    # zweite commit verletzt dann das UNIQUE(email)-Constraint. Vorher
+    # unbehandelt → 500. Jetzt sauber 409 wie der Pre-Check (Skill: auf das
+    # atomare DB-Constraint verlassen, nicht auf den race-anfälligen
+    # Application-Level-Check).
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Email already registered")
     db.refresh(u)
     tok = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
     response = JSONResponse({"access_token": tok, "token_type": "bearer"})
