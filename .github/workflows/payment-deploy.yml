@@ -11,7 +11,11 @@ on:
       run_backfill:
         description: "Member-Rollen-Backfill nach dem Deploy ausführen?"
         type: boolean
-        default: true
+        default: false
+      diag_username:
+        description: "Discord-Username diagnostizieren+fixen (leer = aus, z.B. xmiyagii)"
+        type: string
+        default: ""
 
 jobs:
   deploy-payments:
@@ -48,6 +52,13 @@ jobs:
             systemctl restart goathub-pay-api
             sleep 3
             systemctl is-active goathub-pay-api
+
+            DIAG_USER="${{ inputs.diag_username }}"
+            if [ -n "$DIAG_USER" ]; then
+              echo "🔎 Diagnose+Fix Member-Rolle für '$DIAG_USER'..."
+              cd "$APP"
+              sudo -u www-data "$APP/.venv/bin/python" -m backend.diag_member "$DIAG_USER"
+            fi
 
             if [ "${{ inputs.run_backfill }}" = "true" ]; then
               echo "⭐ Member-Rollen-Backfill (einmalig, idempotent)..."
