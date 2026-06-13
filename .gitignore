@@ -11,3 +11,4 @@ goathub.db.bak-*
 *.db-wal
 *.log
 .DS_Store
+.serena/
