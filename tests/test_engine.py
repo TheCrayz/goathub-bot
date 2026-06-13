@@ -484,7 +484,9 @@ class StubTrader:
     def open_positions(self):
         return []
 
-    def covered_stop_size(self, coin):
+    def covered_stop_size(self, coin, position_is_long=None):
+        # HOOK M-6: side-aware-Param (Default None = alt). Stub ignoriert ihn,
+        # akzeptiert ihn aber, damit der Reconciler-Call nicht crasht.
         return float("inf")
 
     def _round_sz(self, coin, sz):
@@ -804,6 +806,639 @@ def test_parser_update_without_entry():
     print("parser_update_without_entry: OK")
 
 
+# ── 2026-06-13 Audit-Runde 2 (Mediums + Lows + Cross-Agent-Hooks) ───────────
+def _sns_user(user_id=1, **over):
+    """SimpleNamespace-User für _open_new-Direkttests (kein ORM nötig)."""
+    base = dict(id=user_id, hl_account_address="0xA", risk_pct=0.02, leverage=3,
+                max_open_positions=10, capital_cap_usdc=0, max_drawdown_pct=0,
+                peak_account_value=0, builder_approved=False)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _new_sig(coin="BTC", direction="LONG", entry=70000.0, stop_loss=68000.0,
+             signal_id="n1", take_profits=None):
+    return Signal(signal_id=signal_id, ticker=f"{coin}/USDT", action="NEW_TRADE",
+                  direction=direction, entry=entry, stop_loss=stop_loss,
+                  take_profits=take_profits or [])
+
+
+def test_m1_avail_read_fail_aborts_entry():
+    """M-1: available_margin-Read-Fehler ⇒ fail-CLOSED (Entry abgebrochen, kein
+    place_entry), nicht fail-OPEN (avail=balance)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+
+    class _T(StubTrader):
+        def available_margin(self):
+            raise RuntimeError("503 service unavailable")
+    stub = _T(pos=0.0)
+    asyncio.run(engine._open_new(stub, _sns_user(), _new_sig()))
+    assert all(c[0] != "place_entry" for c in stub.calls), stub.calls
+    assert any("available margin unreadable" in t for t in _activities(1, "error"))
+    print("m1_avail_read_fail_aborts_entry: OK")
+
+
+def test_m2_open_count_raise_aborts_entry():
+    """HOOK M-2: open_positions_count RAISE ⇒ Entry fail-CLOSED abgebrochen."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+
+    class _T(StubTrader):
+        def open_positions_count(self):
+            raise RuntimeError("connection timeout")
+    stub = _T(pos=0.0)
+    asyncio.run(engine._open_new(stub, _sns_user(), _new_sig()))
+    assert all(c[0] != "place_entry" for c in stub.calls), stub.calls
+    assert any("open-position count unreadable" in t for t in _activities(1, "error"))
+    print("m2_open_count_raise_aborts_entry: OK")
+
+
+def test_m4_update_on_resting_modifies_pending():
+    """M-4: UPDATE_TRADE bei pos==0 mit RUHENDER Row ⇒ modify-pending (Row-SL
+    aktualisiert, Row bleibt 'resting', NICHT geschlossen, kein cancel)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="resting",
+                       resting_oid="111", signal_id="orig")
+    db.close()
+
+    stub = StubTrader(pos=0.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        sig = Signal(signal_id="upd1", ticker="ETH/USDT", action="UPDATE_TRADE",
+                     direction="LONG", entry=None, stop_loss=1850.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig, "UPDATE_TRADE"))
+    finally:
+        engine._build_trader = orig_build
+
+    db = SessionLocal()
+    mt = db.query(ManagedTrade).filter_by(user_id=1, coin="ETH").order_by(ManagedTrade.id.desc()).first()
+    db.close()
+    assert mt.status == "resting", f"Row darf NICHT geschlossen werden, ist {mt.status}"
+    assert float(mt.stop_loss) == 1850.0, "neuer (tighter) SL muss in die Row"
+    assert all(c[0] not in ("cancel_orders", "cancel_order", "cancel_order_oid", "close_position")
+               for c in stub.calls), f"pending Entry darf nicht gecancelt werden: {stub.calls}"
+    print("m4_update_on_resting_modifies_pending: OK")
+
+
+def test_m4_modify_pending_ratchet_blocks_loosen():
+    """M-4: ein LOOSEN-UPDATE auf eine resting-Row wird vom Ratchet verworfen
+    (Row-SL bleibt der tightere alte Wert)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1850.0, take_profits="[]", status="resting",
+                       resting_oid="111", signal_id="orig")
+    db.close()
+
+    stub = StubTrader(pos=0.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        # LONG looser SL = niedriger (1800 < 1850) → muss verworfen werden.
+        sig = Signal(signal_id="upd2", ticker="ETH/USDT", action="UPDATE_TRADE",
+                     direction="LONG", entry=None, stop_loss=1800.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig, "UPDATE_TRADE"))
+    finally:
+        engine._build_trader = orig_build
+    db = SessionLocal()
+    mt = db.query(ManagedTrade).filter_by(user_id=1, coin="ETH").order_by(ManagedTrade.id.desc()).first()
+    db.close()
+    assert float(mt.stop_loss) == 1850.0, "looser SL darf die resting-Row NICHT verschlechtern"
+    print("m4_modify_pending_ratchet_blocks_loosen: OK")
+
+
+def test_m20_update_replay_deduped():
+    """HOOK M-20: ein exakter UPDATE_TRADE-Replay (gleiches signal_id) wird beim
+    2. Mal geskippt (kein zweiter _adjust/place_protection)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="open")
+    db.close()
+
+    stub = StubTrader(pos=1.0)
+    orig_build, orig_mark = engine._build_trader, engine._get_mark
+    engine._build_trader = _async_return(stub)
+    engine._get_mark = lambda coin: 1950.0
+    try:
+        sig = Signal(signal_id="dup1", ticker="ETH/USDT", action="UPDATE_TRADE",
+                     direction="LONG", entry=None, stop_loss=1850.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig, "UPDATE_TRADE"))
+        n1 = len(stub.protection_calls)
+        # exakter Replay
+        asyncio.run(engine._open_or_update(1, sig, "UPDATE_TRADE"))
+        n2 = len(stub.protection_calls)
+    finally:
+        engine._build_trader, engine._get_mark = orig_build, orig_mark
+    assert n1 == 1 and n2 == 1, f"Replay darf _adjust nicht erneut laufen lassen (n1={n1}, n2={n2})"
+    assert any("already" in t for t in _activities(1, "skip"))
+    print("m20_update_replay_deduped: OK")
+
+
+def test_m15_direction_flip_cancels_remainder():
+    """M-15: Gegenrichtungs-Signal bei offener Position ⇒ Skip, ABER der ruhende
+    Entry-Remainder (resting_oid) wird gezielt gecancelt (per oid), Position +
+    Schutz bleiben unberührt."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed_full(db, user_id=1, coin="BTC", direction="LONG", entry=70000.0,
+                            stop_loss=68000.0, take_profits="[]", status="open",
+                            resting_oid="999")
+    # Ownership bekannt machen (bot_filled_sz gesetzt) + entry_oid.
+    mt.bot_filled_sz = 1.0
+    mt.entry_oid = "999"
+    db.add(mt); db.commit(); db.close()
+
+    stub = StubTrader(pos=1.0)   # LONG offen
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        # SHORT-Signal widerspricht der LONG-Position.
+        sig = Signal(signal_id="flip1", ticker="BTC/USDT", action="UPDATE_TRADE",
+                     direction="SHORT", entry=None, stop_loss=71000.0, take_profits=[])
+        asyncio.run(engine._open_or_update(1, sig, "UPDATE_TRADE"))
+    finally:
+        engine._build_trader = orig_build
+    assert ("cancel_order_oid", "BTC", "999") in stub.calls, \
+        f"Entry-Remainder muss gezielt gecancelt werden: {stub.calls}"
+    assert all(c[0] != "close_position" for c in stub.calls), "Position NICHT schließen"
+    assert len(stub.protection_calls) == 0, "kein Re-Protect auf der falschen Seite"
+    print("m15_direction_flip_cancels_remainder: OK")
+
+
+def test_m12_tp_reject_emits_error():
+    """M-12: eine abgelehnte TP-Order in place_protection['tp'] ⇒ error-Activity
+    (Position läuft sonst still SL-only)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+
+    class _T(StubTrader):
+        def place_protection(self, coin, is_buy, sz, sl, tps):
+            self.protection_calls.append({"coin": coin, "sz": sz, "sl": sl})
+            # SL ok, aber ein TP wird abgelehnt (status != ok).
+            return {"sl_ok": True, "sl": {"status": "ok"},
+                    "tp": [{"status": "ok", "response": {"data": {"statuses": [{"resting": {}}]}}},
+                           {"status": "err", "response": "tick size"}],
+                    "skip_reason": None}
+        def _status_ok(self, raw):
+            try:
+                if raw.get("status") != "ok":
+                    return False
+                st = raw["response"]["data"]["statuses"][0]
+                return "error" not in st
+            except Exception:
+                return False
+    stub = _T(pos=0.0)
+    sig = _new_sig(coin="BTC", take_profits=[TakeProfit(percent=50, price=72000.0),
+                                             TakeProfit(percent=50, price=74000.0)])
+    asyncio.run(engine._open_new(stub, _sns_user(), sig))
+    errs = _activities(1, "error")
+    assert any("take-profit order(s) were rejected" in t for t in errs), errs
+    print("m12_tp_reject_emits_error: OK")
+
+
+def test_m8_paused_user_aborts_after_lock():
+    """M-8: wird der User pausiert während der Task in der Queue stand, bricht
+    _open_or_update nach dem Lock ab (kein place_entry)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1, bot_active=False)   # schon pausiert
+    db.close()
+    stub = StubTrader(pos=0.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine._open_or_update(1, _new_sig(), "NEW_TRADE"))
+    finally:
+        engine._build_trader = orig_build
+    assert stub.calls == [], f"pausierter User: NICHTS traden, hab {stub.calls}"
+    print("m8_paused_user_aborts_after_lock: OK")
+
+
+def test_m23_generic_error_is_generic():
+    """M-23: ein roher Exception-Text landet NICHT in der user-facing Activity —
+    stattdessen eine generische EN-Meldung."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+
+    secret = "SUPER-SECRET-PAYLOAD-LEAK-1234"
+
+    class _T(StubTrader):
+        def is_tradable(self, coin):
+            raise RuntimeError(secret)
+    stub = _T(pos=0.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine._open_or_update(1, _new_sig(), "NEW_TRADE"))
+    finally:
+        engine._build_trader = orig_build
+    errs = _activities(1, "error")
+    assert errs, "eine Fehler-Activity erwartet"
+    assert all(secret not in t for t in errs), f"roher Fehlertext darf nicht leaken: {errs}"
+    assert any("internal error" in t for t in errs), errs
+    print("m23_generic_error_is_generic: OK")
+
+
+def test_l1_rate_cap_only_counts_new():
+    """L-1: UPDATE/CANCEL zählen NICHT zum Signal-Rate-Cap (nur NEW_TRADE)."""
+    _reset_db(); _reset_engine_state()
+    engine._signal_timestamps[:] = []
+    orig_cap = engine.config.MAX_SIGNALS_PER_HOUR
+    engine.config.MAX_SIGNALS_PER_HOUR = 2
+    engine._clear_emergency_halt()
+    try:
+        # 5 UPDATE-Embeds — dürfen den Cap nie auslösen.
+        for i in range(5):
+            embed = {"title": "ETH/USDT — UPDATE_TRADE", "description": f"Signal `u{i}`",
+                     "fields": [{"name": "Action", "value": "UPDATE_TRADE"},
+                                {"name": "Ticker", "value": "ETH/USDT"},
+                                {"name": "Stop Loss", "value": "1850"}]}
+            asyncio.run(engine.handle_signal(embed))
+        assert not engine._emergency_halt_active(), "UPDATEs dürfen den Auto-Halt NICHT auslösen"
+    finally:
+        engine.config.MAX_SIGNALS_PER_HOUR = orig_cap
+        engine._clear_emergency_halt()
+        engine._signal_timestamps[:] = []
+    print("l1_rate_cap_only_counts_new: OK")
+
+
+def test_l2_confidence_gate_exempts_update():
+    """L-2: ein low-confidence UPDATE_TRADE wird NICHT vom Confidence-Gate
+    verworfen (es ist risiko-reduzierend)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="open")
+    db.close()
+    stub = StubTrader(pos=1.0)
+    orig_build, orig_mark = engine._build_trader, engine._get_mark
+    engine._build_trader = _async_return(stub)
+    engine._get_mark = lambda coin: 1950.0
+    orig_conf = engine.config.MIN_CONFIDENCE
+    engine.config.MIN_CONFIDENCE = 0.75
+    engine._clear_emergency_halt()
+
+    async def _runner():
+        embed = {"title": "ETH/USDT — UPDATE_TRADE", "description": "Signal `lowconf`",
+                 "fields": [{"name": "Action", "value": "UPDATE_TRADE"},
+                            {"name": "Ticker", "value": "ETH/USDT"},
+                            {"name": "Stop Loss", "value": "1850"},
+                            {"name": "Confidence", "value": "0.60"}]}
+        await engine.handle_signal(embed)
+        # handle_signal spawnt _open_or_update als Task — im selben Loop abwarten.
+        pending = [t for t in list(engine._tasks) if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=2)
+    try:
+        asyncio.run(_runner())
+        assert len(stub.protection_calls) >= 1, \
+            f"low-confidence UPDATE muss durchlaufen: {_activities(1)}"
+    finally:
+        engine._build_trader, engine._get_mark = orig_build, orig_mark
+        engine.config.MIN_CONFIDENCE = orig_conf
+    print("l2_confidence_gate_exempts_update: OK")
+
+
+def test_l6_entry_unauthorized_pauses_user():
+    """L-6: 'does not exist'-Reject auf dem ENTRY-Pfad ⇒ User wird auto-pausiert
+    (nicht pro Signal ein Error)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1, bot_active=True); db.close()
+
+    class _T(StubTrader):
+        def place_entry(self, coin, is_buy, sz, px):
+            self.calls.append(("place_entry", coin))
+            return {"ok": False, "filled": False, "filled_sz": 0.0, "resting_oid": None,
+                    "error": "User or API Wallet 0xabc does not exist."}
+    stub = _T(pos=0.0)
+    asyncio.run(engine._open_new(stub, _sns_user(), _new_sig()))
+    db = SessionLocal(); u = db.get(User, 1); db.close()
+    assert u.bot_active is False, "unauthorized Entry-Reject muss den Bot pausieren"
+    print("l6_entry_unauthorized_pauses_user: OK")
+
+
+def test_l14_malformed_tp_logged(capfd=None):
+    """L-14: malformed TP-JSON in der Row ⇒ _load_protection_params droppt sie,
+    gibt aber (sl, []) zurück (kein Crash; SL bleibt nutzbar)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="NOT-JSON{{", status="open")
+    db.close()
+    sl, tps = engine._load_protection_params(1, "ETH")
+    assert sl == 1800.0 and tps == [], (sl, tps)
+    print("l14_malformed_tp_logged: OK")
+
+
+def test_m18_dropped_tps_activity():
+    """HOOK M-18: sig.dropped_tps nicht leer ⇒ info-Activity pro User."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1, bot_active=True); db.close()
+    engine._clear_emergency_halt()
+    # Embed mit falsch-seitigem TP → Parser legt es in dropped_tps.
+    # LONG-Entry 70000; ein TP UNTER dem Entry (65000) ist falsch-seitig → dropped.
+    embed = {"title": "BTC/USDT — NEW_TRADE", "description": "Signal `dtp`",
+             "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                        {"name": "Ticker", "value": "BTC/USDT"},
+                        {"name": "Direction", "value": "LONG"},
+                        {"name": "Entry", "value": "70000"},
+                        {"name": "Stop Loss", "value": "68000"},
+                        {"name": "Take Profits", "value": "50% @ 72000, 50% @ 65000"}]}
+    from app.parser import parse_signal
+    parsed = parse_signal(embed)
+    if not parsed or not parsed.dropped_tps:
+        print("m18_dropped_tps_activity: SKIP (parser dropped_tps not populated for this shape)")
+        return
+    stub = StubTrader(pos=0.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine.handle_signal(embed))
+        import time as _t; _t.sleep(0.2)
+    finally:
+        engine._build_trader = orig_build
+    infos = _activities(1, "info")
+    assert any("take-profit(s) dropped" in t for t in infos), infos
+    print("m18_dropped_tps_activity: OK")
+
+
+def test_m6_hook_reconciler_passes_side():
+    """HOOK M-6: der Reconciler ruft covered_stop_size(coin, position_is_long) MIT
+    dem side-Flag auf (szi>0)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    _make_managed_full(db, user_id=1, coin="ETH", direction="LONG", entry=1900.0,
+                       stop_loss=1800.0, take_profits="[]", status="open")
+    db.close()
+    seen = {}
+
+    class _T(StubTrader):
+        def open_positions(self):
+            return [{"coin": "ETH", "szi": 2.0}]   # LONG
+        def covered_stop_size(self, coin, position_is_long=None):
+            seen["is_long"] = position_is_long
+            return float("inf")   # voll gedeckt → kein weiterer Eingriff
+    stub = _T(pos=2.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine.reconcile_stop_coverage([1]))
+    finally:
+        engine._build_trader = orig_build
+    assert seen.get("is_long") is True, f"position_is_long muss True sein (LONG szi>0): {seen}"
+    print("m6_hook_reconciler_passes_side: OK")
+
+
+def test_m5_reconciler_skips_coins_without_row():
+    """M-5: eine offene Position OHNE managed-Row (manuelle Position) wird vom
+    Reconciler übersprungen — kein 'secure manually'-Alert."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()   # KEINE managed-Row
+
+    class _T(StubTrader):
+        def open_positions(self):
+            return [{"coin": "DOGE", "szi": 100.0}]   # manuelle Position, keine Row
+        def covered_stop_size(self, coin, position_is_long=None):
+            return 0.0   # ungedeckt — würde ohne M-5 alerten
+    stub = _T(pos=100.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine.reconcile_stop_coverage([1]))
+    finally:
+        engine._build_trader = orig_build
+    errs = _activities(1, "error")
+    assert not any("secure" in t.lower() for t in errs), \
+        f"manuelle Position ohne Row darf NICHT alerten: {errs}"
+    print("m5_reconciler_skips_coins_without_row: OK")
+
+
+def test_m9_register_watcher_cancels_old():
+    """M-9: _register_fill_watcher cancelt einen schon registrierten Watcher für
+    dasselbe (user,coin) beim Überschreiben."""
+    _reset_engine_state()
+
+    async def _runner():
+        async def _sleep_forever():
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                raise
+        t_old = asyncio.create_task(_sleep_forever())
+        engine._register_fill_watcher(7, "BTC", t_old)
+        t_new = asyncio.create_task(_sleep_forever())
+        engine._register_fill_watcher(7, "BTC", t_new)
+        await asyncio.sleep(0)   # cancel propagieren lassen
+        old_cancelled = t_old.cancelled() or t_old.cancelling() > 0 if hasattr(t_old, "cancelling") else t_old.cancelled()
+        t_new.cancel()
+        try:
+            await t_new
+        except asyncio.CancelledError:
+            pass
+        try:
+            await t_old
+        except asyncio.CancelledError:
+            pass
+        return old_cancelled
+    res = asyncio.run(_runner())
+    _reset_engine_state()
+    assert res, "alter Watcher muss beim Überschreiben gecancelt werden"
+    print("m9_register_watcher_cancels_old: OK")
+
+
+def test_m24_stopout_cooldown_blocks_new():
+    """M-24: ein jüngster realisierter Loss-Fill auf dem Coin blockt ein NEW_TRADE
+    während des Cooldowns (über _recent_stopout_cooldown gemockt)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+    stub = StubTrader(pos=0.0)
+    orig_cd = engine._recent_stopout_cooldown
+    engine._recent_stopout_cooldown = lambda addr, coin: (True, 600.0)
+    try:
+        asyncio.run(engine._open_new(stub, _sns_user(), _new_sig()))
+    finally:
+        engine._recent_stopout_cooldown = orig_cd
+    assert all(c[0] != "place_entry" for c in stub.calls), stub.calls
+    assert any("cooldown" in t for t in _activities(1, "skip"))
+    print("m24_stopout_cooldown_blocks_new: OK")
+
+
+def test_m3_peak_reset_on_withdrawal():
+    """M-3: fällt das Balance unter den Drawdown-Threshold, aber die realisierten
+    Verluste erklären den Drop NICHT (Auszahlung), wird der peak zurückgesetzt
+    statt den Bot zu pausieren (kein place_entry-Block durch Drawdown)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1); db.close()
+    # peak 10k, balance 5k (50% drop), aber 0 realisierte Verluste ⇒ Withdrawal.
+    u = _sns_user(max_drawdown_pct=0.30, peak_account_value=10_000.0)
+
+    class _T(StubTrader):
+        def account_value(self):
+            return 5_000.0
+        def available_margin(self):
+            return 5_000.0
+    stub = _T(pos=0.0)
+    orig_loss = engine._drawdown_from_losses
+    engine._drawdown_from_losses = lambda addr, lookback_s=None: (0.0, True)  # keine Verluste
+    try:
+        asyncio.run(engine._open_new(stub, u, _new_sig()))
+    finally:
+        engine._drawdown_from_losses = orig_loss
+    # peak muss in der DB auf 5000 gesenkt sein, und KEIN Drawdown-Pause-Error.
+    db = SessionLocal(); uu = db.get(User, 1); db.close()
+    assert abs(float(uu.peak_account_value) - 5000.0) < 1.0, \
+        f"peak sollte auf 5000 zurückgesetzt sein, ist {uu.peak_account_value}"
+    assert all("MAX-DRAWDOWN-CAP" not in t for t in _activities(1, "error")), \
+        "Withdrawal darf nicht als Drawdown pausieren"
+    print("m3_peak_reset_on_withdrawal: OK")
+
+
+def test_m3_real_loss_still_pauses():
+    """M-3 (Gegenprobe): erklären die Verluste den Drop, bleibt der Drawdown-Cap
+    aktiv (Bot pausiert) — der Reset entschärft NUR Auszahlungen."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal(); _make_user(db, user_id=1, bot_active=True); db.close()
+    u = _sns_user(max_drawdown_pct=0.30, peak_account_value=10_000.0)
+
+    class _T(StubTrader):
+        def account_value(self):
+            return 5_000.0
+        def available_margin(self):
+            return 5_000.0
+    stub = _T(pos=0.0)
+    orig_loss = engine._drawdown_from_losses
+    engine._drawdown_from_losses = lambda addr, lookback_s=None: (5_000.0, True)  # voller Verlust
+    try:
+        asyncio.run(engine._open_new(stub, u, _new_sig()))
+    finally:
+        engine._drawdown_from_losses = orig_loss
+    assert any("MAX-DRAWDOWN-CAP" in t for t in _activities(1, "error")), \
+        "echter Verlust muss den Drawdown-Cap auslösen"
+    db = SessionLocal(); uu = db.get(User, 1); db.close()
+    assert uu.bot_active is False
+    print("m3_real_loss_still_pauses: OK")
+
+
+def test_m3_open_position_no_reset():
+    """🔴 M-3-FAIL-OPEN-FIX (Verify-Runde): hält der User eine OFFENE Position,
+    enthält balance UNREALISIERTE PnL — ein echter Drawdown würde sonst (0
+    realisierte Verluste) als Auszahlung fehlgedeutet und der Schutz-Cap
+    aufgehoben. Mit offener Position darf der peak NICHT zurückgesetzt werden →
+    der Cap pausiert (sichere Richtung)."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1, bot_active=True)
+    uu0 = db.get(User, 1); uu0.peak_account_value = 10_000.0; db.commit()
+    db.close()
+    u = _sns_user(max_drawdown_pct=0.30, peak_account_value=10_000.0)
+
+    class _T(StubTrader):
+        def account_value(self):
+            return 5_000.0          # 50% Drop — aber unrealisiert (offene Position)
+        def available_margin(self):
+            return 5_000.0
+        def open_positions_count(self):
+            return 1                # NICHT flat → Flat-Guard verhindert den Reset
+    stub = _T(pos=2.0)
+    orig_loss = engine._drawdown_from_losses
+    engine._drawdown_from_losses = lambda addr, lookback_s=None: (0.0, True)  # nichts realisiert
+    try:
+        asyncio.run(engine._open_new(stub, u, _new_sig()))
+    finally:
+        engine._drawdown_from_losses = orig_loss
+    db = SessionLocal(); uu = db.get(User, 1); db.close()
+    assert abs(float(uu.peak_account_value) - 10_000.0) < 1.0, \
+        f"peak darf bei OFFENER Position NICHT resettet werden, ist {uu.peak_account_value}"
+    assert any("MAX-DRAWDOWN-CAP" in t for t in _activities(1, "error")), \
+        "unrealisierter Drawdown bei offener Position muss pausieren (fail-safe)"
+    assert uu.bot_active is False
+    print("m3_open_position_no_reset: OK")
+
+
+def test_m10_hook_post_alert_uses_submit_alert(monkeypatch=None):
+    """HOOK M-10: _post_alert nutzt hl_retry.submit_alert (dedizierter Executor)
+    statt loop.run_in_executor(None, …)."""
+    import app.hl_retry as hl_retry
+    calls = {"n": 0}
+    orig = hl_retry.submit_alert
+    orig_url = engine.config.ALERT_WEBHOOK_URL
+
+    def _fake_submit(fn, *a, **k):
+        calls["n"] += 1
+        return None
+    hl_retry.submit_alert = _fake_submit
+    engine.config.ALERT_WEBHOOK_URL = "https://example.test/webhook"
+
+    async def _runner():
+        engine._post_alert("test alert")
+    try:
+        asyncio.run(_runner())
+    finally:
+        hl_retry.submit_alert = orig
+        engine.config.ALERT_WEBHOOK_URL = orig_url
+    assert calls["n"] == 1, "submit_alert muss vom _post_alert (im Loop) genutzt werden"
+    print("m10_hook_post_alert_uses_submit_alert: OK")
+
+
+def test_m13_open_row_remainder_cancelled():
+    """M-13: eine open-Row mit gesetztem resting_oid (Entry-Remainder) ⇒ Startup-
+    Pass cancelt den Remainder per oid und löscht resting_oid; Row bleibt open."""
+    _reset_db(); _reset_engine_state()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed_full(db, user_id=1, coin="BTC", direction="LONG", entry=70000.0,
+                            stop_loss=68000.0, take_profits="[]", status="open",
+                            resting_oid="444")
+    mt.entry_oid = "444"; mt.bot_filled_sz = 1.0
+    db.add(mt); db.commit(); db.close()
+
+    stub = StubTrader(pos=1.0)
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(stub)
+    try:
+        asyncio.run(engine._cancel_open_row_remainders([1]))
+    finally:
+        engine._build_trader = orig_build
+    assert ("cancel_order_oid", "BTC", "444") in stub.calls, stub.calls
+    db = SessionLocal()
+    mt2 = db.query(ManagedTrade).filter_by(user_id=1, coin="BTC").order_by(ManagedTrade.id.desc()).first()
+    db.close()
+    assert mt2.status == "open", "Position-Row bleibt open"
+    assert mt2.resting_oid is None, "resting_oid muss nach Cancel geleert sein"
+    print("m13_open_row_remainder_cancelled: OK")
+
+
+def test_l10_prune_memory_dicts():
+    """L-10: prune_memory_dicts entfernt alte _alert_throttle/_trade_intervals-
+    Einträge und lässt frische stehen."""
+    import time as _t
+    engine._alert_throttle.clear(); engine._trade_intervals.clear()
+    now = _t.time()
+    engine._alert_throttle[("x", "old")] = now - 10_000_000   # uralt
+    engine._alert_throttle[("x", "fresh")] = now
+    engine._trade_intervals[(1, "OLD")] = now - 10_000_000
+    engine._trade_intervals[(1, "NEW")] = now
+    engine.prune_memory_dicts()
+    assert ("x", "old") not in engine._alert_throttle
+    assert ("x", "fresh") in engine._alert_throttle
+    assert (1, "OLD") not in engine._trade_intervals
+    assert (1, "NEW") in engine._trade_intervals
+    engine._alert_throttle.clear(); engine._trade_intervals.clear()
+    print("l10_prune_memory_dicts: OK")
+
+
 if __name__ == "__main__":
     test_is_bad_key_error()
     test_pause_user_bad_key_idempotent()
@@ -825,4 +1460,28 @@ if __name__ == "__main__":
     test_throttle_exempts_updates_blocks_new()
     test_ratchet_baseline_survives_premature_sync_close()
     test_parser_update_without_entry()
+    # Runde 2
+    test_m1_avail_read_fail_aborts_entry()
+    test_m2_open_count_raise_aborts_entry()
+    test_m4_update_on_resting_modifies_pending()
+    test_m4_modify_pending_ratchet_blocks_loosen()
+    test_m20_update_replay_deduped()
+    test_m15_direction_flip_cancels_remainder()
+    test_m12_tp_reject_emits_error()
+    test_m8_paused_user_aborts_after_lock()
+    test_m23_generic_error_is_generic()
+    test_l1_rate_cap_only_counts_new()
+    test_l2_confidence_gate_exempts_update()
+    test_l6_entry_unauthorized_pauses_user()
+    test_l14_malformed_tp_logged()
+    test_m18_dropped_tps_activity()
+    test_m6_hook_reconciler_passes_side()
+    test_m5_reconciler_skips_coins_without_row()
+    test_m9_register_watcher_cancels_old()
+    test_m24_stopout_cooldown_blocks_new()
+    test_m3_peak_reset_on_withdrawal()
+    test_m3_real_loss_still_pauses()
+    test_m10_hook_post_alert_uses_submit_alert()
+    test_m13_open_row_remainder_cancelled()
+    test_l10_prune_memory_dicts()
     print("\nALLE ENGINE-TESTS BESTANDEN ✅")

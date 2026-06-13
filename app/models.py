@@ -8,6 +8,26 @@ from sqlalchemy.types import TypeDecorator
 from app.db import Base
 
 
+# 2026-06-13 M-21: KONVENTION für ALLE DateTime-Spalten hier = NAIVE UTC.
+# Wir speichern bewusst naiv (kein tz-aware Column), weil:
+#   1) bestehende Live-Rows naiv sind und Vergleiche in WHERE-Clauses
+#      (z.B. main.py-Purge `Activity.ts < utcnow()-delta`, admin.py
+#      `Activity.ts >= cutoff`) gegen naive Cutoffs laufen — ein gemischter
+#      aware/naiv-Bestand würde auf SQLite (String-Vergleich) UND in Python
+#      (TypeError bei aware-vs-naiv) brechen.
+#   2) Der eigentliche Bug (Known-Issue #6: Browser rendert ts als LOKALZEIT)
+#      sitzt in der SERIALISIERUNG, nicht im Storage: `a.ts.isoformat()` ohne
+#      tz-Suffix → das Frontend liest es als lokale Zeit. Fix gehört an die
+#      Serialisierungs-Boundary (main.py/admin.py: `.isoformat()` →
+#      `+ "+00:00"` bzw. tz-aware machen vor isoformat). Siehe interface_changes.
+# utcnow() zentralisiert die Konvention an einer Stelle (statt verstreuter
+# datetime.datetime.utcnow-Defaults) — semantisch identisch, aber benennt die
+# Absicht "naive UTC" explizit.
+def utcnow():
+    """Naive-UTC-Timestamp (Konvention für alle DateTime-Defaults, siehe oben)."""
+    return datetime.datetime.utcnow()
+
+
 # 2026-06-04 Restposten #6: Decimal-präzision für gespeicherte Preise.
 # SQLite mapped Numeric per default auf REAL (float64) → Drift bei wiederholten
 # Reads. Mit TypeDecorator speichern wir als TEXT (verlustfrei) und liefern
@@ -49,7 +69,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)   # M-21: naive UTC, siehe Konvention oben
 
     # Hyperliquid
     hl_account_address = Column(String, default="")    # MASTER-Adresse (öffentlich)
@@ -94,7 +114,9 @@ class Activity(Base):
     # automatisch mit raus. Auf alten SQLite-DBs ohne FK greift die Migration
     # in db.py (recreate-table-with-fk).
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    ts = Column(DateTime, default=datetime.datetime.utcnow)
+    # M-21: naive UTC (siehe Konvention oben). Frontend-Lokalzeit-Bug (#6) wird
+    # bei der Serialisierung in main.py/admin.py behoben (tz-Suffix anhängen).
+    ts = Column(DateTime, default=utcnow)
     kind = Column(String)            # signal | order | update | close | skip | error
     text = Column(Text)
 
@@ -110,7 +132,7 @@ class TokenUsage(Base):
     """
     __tablename__ = "token_usage"
     id = Column(Integer, primary_key=True)
-    ts = Column(DateTime, index=True, default=datetime.datetime.utcnow)
+    ts = Column(DateTime, index=True, default=utcnow)   # M-21: naive UTC
     model = Column(String, index=True)
     prompt = Column(Integer, default=0)
     output = Column(Integer, default=0)
@@ -156,8 +178,8 @@ class ManagedTrade(Base):
     entry_oid = Column(String, nullable=True)
     entry_cloid = Column(String, nullable=True)
     bot_filled_sz = Column(MoneyDecimal, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)                      # M-21: naive UTC
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)     # M-21: naive UTC
 
 
 class ProcessedSignal(Base):
@@ -170,10 +192,29 @@ class ProcessedSignal(Base):
     In-Memory-Throttle weg ist) wird übersprungen statt doppelt eröffnet.
     Nur bei ERFOLGREICHEM Entry geschrieben — geskippte Signale (Margin/Filter)
     bleiben retry-bar.
+
+    2026-06-13 L-15 — DEDUP-SCOPE (bewusst dokumentiert, KONSERVATIV gehalten):
+    Der Schlüssel ist (user_id, signal_id) OHNE Datums-Anteil. Solange Bot 1
+    GLOBAL EINDEUTIGE signal_ids vergibt (eine id pro emittiertem Signal, nie
+    wiederverwendet), ist das korrekt und sicher. RESTRISIKO (Audit "could not
+    verify" #6): WENN Bot 1 ids je über Tage hinweg wiederverwendet (z.B. einen
+    rollierenden Zähler), würde ein späteres, legitimes Signal mit derselben id
+    STILL als "already executed" gedroppt.
+    Faktischer Schutz heute: der Purge-Loop in main.py löscht ProcessedSignal-
+    Rows älter als PROCESSED_SIGNAL_KEEP_DAYS (Default 30 Tage) → das Dedup-
+    Fenster ist effektiv ~30 Tage, eine id-Wiederverwendung NACH 30 Tagen ist
+    also unschädlich. INNERHALB von 30 Tagen würde eine Wiederverwendung noch
+    kollidieren. Sauberere Härtung (NICHT hier umgesetzt, weil sie das Bot-1-
+    Verhalten kennen muss): created_at::date in den Dedup-Key aufnehmen ODER
+    statt signal_id einen Content-Hash (coin+direction+entry+sl) verwenden.
+    Das ist eine ENGINE-Entscheidung (_signal_already_done/_mark_signal_done in
+    engine.py) — siehe interface_changes. Wer das Fenster verkleinern will, kann
+    PROCESSED_SIGNAL_KEEP_DAYS senken (z.B. auf 2), ohne den Replay-Schutz nach
+    Restart zu verlieren (Restarts liegen praktisch immer < 2 Tage zurück).
     """
     __tablename__ = "processed_signal"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True, nullable=False)
     signal_id = Column(String, index=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)   # M-21: naive UTC
     __table_args__ = (UniqueConstraint("user_id", "signal_id", name="uq_processed_user_signal"),)

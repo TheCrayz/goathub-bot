@@ -87,6 +87,125 @@ def test_num_rejects_nonfinite():
     print("num-nonfinite: OK -> nan/inf → None, confidence=NaN trifft das Gate nicht mehr")
 
 
+def test_tp_side_validation():
+    """2026-06-13 M-18: TPs gegen entry+direction validieren. Falsch-seitige TPs
+    (SHORT-TP über Entry / LONG-TP unter Entry) sind in Wahrheit Stops und
+    würden in place_protection still gefiltert → die Position verlöre lautlos
+    ihre Gewinnmitnahme. Der Parser splittet sie jetzt nach dropped_tps, damit
+    die Engine eine klare Skip-Activity bauen kann."""
+    # LONG: TP MUSS über Entry. 110 ist valide, 90 ist falsch-seitig.
+    embed_long = {"title": "LONG BTC/USDT — NEW_TRADE", "description": "Signal `tpl`",
+                  "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                             {"name": "Direction", "value": "LONG"},
+                             {"name": "Entry", "value": "100"},
+                             {"name": "Stop Loss", "value": "95"},
+                             {"name": "Take Profits", "value": "50%@110, 50%@90"}]}
+    s = parse_signal(embed_long)
+    assert s is not None
+    assert len(s.take_profits) == 1 and s.take_profits[0].price == 110, \
+        [(t.percent, t.price) for t in s.take_profits]
+    assert len(s.dropped_tps) == 1 and s.dropped_tps[0].price == 90
+
+    # SHORT: TP MUSS unter Entry. 90 valide, 110 falsch-seitig.
+    embed_short = {"title": "SHORT ETH/USDT — NEW_TRADE", "description": "Signal `tps`",
+                   "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                              {"name": "Direction", "value": "SHORT"},
+                              {"name": "Entry", "value": "100"},
+                              {"name": "Stop Loss", "value": "105"},
+                              {"name": "Take Profits", "value": "50%@90, 50%@110"}]}
+    s = parse_signal(embed_short)
+    assert len(s.take_profits) == 1 and s.take_profits[0].price == 90
+    assert len(s.dropped_tps) == 1 and s.dropped_tps[0].price == 110
+
+    # Alle TPs korrekt → dropped leer
+    embed_ok = {"title": "LONG SOL/USDT — NEW_TRADE", "description": "Signal `tpo`",
+                "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                           {"name": "Direction", "value": "LONG"},
+                           {"name": "Entry", "value": "100"},
+                           {"name": "Stop Loss", "value": "95"},
+                           {"name": "Take Profits", "value": "50%@110, 50%@120"}]}
+    s = parse_signal(embed_ok)
+    assert len(s.take_profits) == 2 and s.dropped_tps == []
+
+    # UPDATE_TRADE ohne Entry-Feld → Seite nicht bestimmbar → konservativ ALLE
+    # durchreichen (nichts droppen).
+    embed_upd = {"title": "ETH update", "description": "Signal `tpu`",
+                 "fields": [{"name": "Action", "value": "UPDATE_TRADE"},
+                            {"name": "Direction", "value": "LONG"},
+                            {"name": "Ticker", "value": "ETH/USDT"},
+                            {"name": "Stop Loss", "value": "95"},
+                            {"name": "Take Profits", "value": "50%@110, 50%@90"}]}
+    s = parse_signal(embed_upd)
+    assert s is not None and len(s.take_profits) == 2 and s.dropped_tps == []
+    print("tp-side-validation: OK -> falsch-seitige TPs landen in dropped_tps")
+
+
+def test_title_fallback_action_strict():
+    """2026-06-13 M-19: Title-Fallback-Action gehärtet. Vorher löste JEDER Titel,
+    dessen letztes '—'-Segment zufällig ein CANCEL-Token war, einen CANCEL mit
+    geratenem Ticker aus. Jetzt: explizites action-Feld bevorzugt; Title-Fallback
+    nur bei striktem 'TICKER — ACTION'-Schema (genau 2 Segmente) + BEKANNTEM
+    Action-Token."""
+    # Freitext-Titel, dessen letztes Segment 'close' ist, OHNE action-Feld →
+    # früher: CANCEL mit geratenem Ticker. Jetzt: nicht parsebar (None), weil
+    # >2 Segmente / kein striktes Schema.
+    bad = {"title": "BTC long zone — watch — close to invalidation",
+           "description": "Signal `x`", "fields": []}
+    assert parse_signal(bad) is None, "mehrdeutiger Freitext darf KEINEN CANCEL raten"
+
+    # Striktes Schema 'TICKER — CANCEL' mit explizitem Direction-Feld → ok.
+    good = {"title": "BTC/USDT — CANCEL", "description": "Signal `y`",
+            "fields": [{"name": "Direction", "value": "LONG"}]}
+    s = parse_signal(good)
+    assert s is not None and s.action == "CANCEL" and s.ticker == "BTC/USDT"
+
+    # Explizites action-Feld gewinnt IMMER über den Titel (hier Titel-Segment
+    # 'CLOSE', Feld 'NEW_TRADE') → es bleibt NEW_TRADE.
+    explicit = {"title": "ETH/USDT — CLOSE", "description": "Signal `z`",
+                "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                           {"name": "Direction", "value": "LONG"},
+                           {"name": "Entry", "value": "100"},
+                           {"name": "Stop Loss", "value": "95"}]}
+    s = parse_signal(explicit)
+    assert s is not None and s.action == "NEW_TRADE"
+
+    # Unbekanntes Schluss-Token im Titel (kein Action-Wort) → keine Action geraten.
+    unknown = {"title": "BTC/USDT — invalidation", "description": "Signal `w`", "fields": []}
+    assert parse_signal(unknown) is None
+    print("title-fallback-action: OK -> nur striktes TICKER—ACTION + bekanntes Token")
+
+
+def test_builder_fee_validation():
+    """2026-06-13 M-22: BUILDER_FEE wird jetzt beim config-Import validiert
+    (Boot-Fail bei Garbage), nicht erst lazy beim ersten Builder-Order. Die
+    Validierungs-Logik (config._validate_builder_fee) spiegelt
+    hyperliquid_exec.fee_to_int."""
+    from app.config import _validate_builder_fee
+    assert _validate_builder_fee("0.05%") == 50
+    assert _validate_builder_fee("0.1%") == 100
+    assert _validate_builder_fee("0") == 0
+    # Garbage → Boot-Fail (RuntimeError, nicht still 0)
+    for bad in ("abc", "", "  ", "x%"):
+        try:
+            _validate_builder_fee(bad)
+            assert False, f"_validate_builder_fee({bad!r}) sollte RuntimeError werfen"
+        except RuntimeError:
+            pass
+    # Zu hoch (häufiger '5%'-Tippfehler, real Perps-Max 0.1%) → Boot-Fail
+    try:
+        _validate_builder_fee("5%")
+        assert False, "5% sollte RuntimeError werfen (über 0.1% Perps-Max)"
+    except RuntimeError:
+        pass
+    # Negativ → Boot-Fail
+    try:
+        _validate_builder_fee("-0.01%")
+        assert False, "negativ sollte RuntimeError werfen"
+    except RuntimeError:
+        pass
+    print("builder-fee-validation: OK -> valide → bps, Garbage/zu-hoch/negativ → RuntimeError")
+
+
 def test_bcrypt_max_length():
     """2026-06-04 Restposten #3: SHA256-pre-hash macht das 72-Byte-Limit
     obsolet. v2-Hashes (mit 'v2:'-Prefix) akzeptieren beliebig lange PWs,
@@ -130,14 +249,16 @@ def test_auto_leverage():
     Formel: safe_lev = 1 / (sl_dist * liq_safety) ; chosen = safe × max(conf_floor, confidence)
     Default liq_safety=2 → SL liegt auf halbem Weg zur Liquidation.
     """
-    # Python's round() uses banker's rounding (round half to even).
-    # SL 2% from entry, confidence 0.90, max 50 → safe=25, *0.90=22.5 → 22 (banker)
+    # 2026-06-13 L-5: auto_leverage FLOORt jetzt (int(chosen)) statt banker's
+    # round — der gewählte Hebel bleibt damit immer ≤ safe_lev×conf (nie +0.49
+    # darüber). Erwartungen unten entsprechend auf floor angepasst.
+    # SL 2% from entry, confidence 0.90, max 50 → safe=25, *0.90=22.5 → 22 (floor)
     lev, reason = auto_leverage(entry=100, stop_loss=98, confidence=0.90, max_cap=50)
     assert lev == 22, f"expected 22x, got {lev} ({reason})"
 
-    # SL 1% from entry, confidence 0.95 → safe=50, *0.95=47.5 → 48 (banker rounds .5 to even)
+    # SL 1% from entry, confidence 0.95 → safe=50, *0.95=47.5 → 47 (floor, war 48 banker)
     lev, _ = auto_leverage(entry=100, stop_loss=99, confidence=0.95, max_cap=50)
-    assert lev == 48, f"expected 48x, got {lev}"
+    assert lev == 47, f"expected 47x (floor), got {lev}"
 
     # Very tight SL 0.4% → safe = 125, capped at 50 (even with full conf)
     lev, _ = auto_leverage(entry=100, stop_loss=99.6, confidence=1.0, max_cap=50)
@@ -147,12 +268,12 @@ def test_auto_leverage():
     lev, _ = auto_leverage(entry=100, stop_loss=90, confidence=0.80, max_cap=50)
     assert lev == 4, f"expected 4x, got {lev}"
 
-    # No confidence → conf_floor (0.5) — SL 2% safe=25 × 0.5 = 12.5 → 12 (banker)
+    # No confidence → conf_floor (0.5) — SL 2% safe=25 × 0.5 = 12.5 → 12 (floor)
     lev, _ = auto_leverage(entry=100, stop_loss=98, confidence=None, max_cap=50)
     assert lev == 12, f"expected 12x (no conf), got {lev}"
 
     # User-cap niedriger als safe — z.B. cap 10x für konservativen User, SL 1%, conf 0.95
-    # safe=50, *0.95=48 → capped at 10
+    # safe=50, *0.95=47.5 → floor 47 → capped at 10
     lev, _ = auto_leverage(entry=100, stop_loss=99, confidence=0.95, max_cap=10)
     assert lev == 10, f"expected 10x (cap), got {lev}"
 
@@ -254,6 +375,9 @@ if __name__ == "__main__":
     test_no_cap_uses_full()
     test_parser()
     test_num_rejects_nonfinite()
+    test_tp_side_validation()
+    test_title_fallback_action_strict()
+    test_builder_fee_validation()
     test_bcrypt_max_length()
     test_auto_leverage()
     test_settings_validation_rejects()

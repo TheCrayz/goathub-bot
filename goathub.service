@@ -32,7 +32,11 @@ WorkingDirectory=/var/www/goathub-bot
 # (TLS-Terminierung). Direkter Internet-Zugriff auf uvicorn umging vorher
 # Caddys X-Forwarded-For → Rate-Limit-Key in main.py wäre spoofbar gewesen
 # (Pair-Fix mit _client_ip in app/main.py).
-ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+# M-7 (2026-06-13): --workers 1 explizit. Der Koordinationslayer (Locks,
+# Fill-Watcher, Strike-Counter, Dedup, Rate-Window) ist prozess-lokal; mehrere
+# Worker => zwei Discord-Listener => Doppel-Trades. flock-Guard im Lifespan ist
+# der Gürtel, --workers 1 die Hosenträger.
+ExecStart=/var/www/goathub-bot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 # 2026-06-13 Review-Fix: zurück auf always. `systemctl stop` restartet bei
 # systemd NIE automatisch (Restart= gilt nur für unrequested exits) — der
 # Operator-Halt war also nie das Problem. on-failure hätte dagegen einen

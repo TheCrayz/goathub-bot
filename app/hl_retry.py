@@ -6,8 +6,38 @@ Wird von hyperliquid_exec.py importiert.
 import logging
 import threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger("goathub.hl_retry")
+
+# M-10 (2026-06-13): DEDIZIERTER Alert-Executor, entkoppelt vom default
+# ThreadPoolExecutor. Problem: blockierende `time.sleep`-Retries (laufen in
+# asyncio.to_thread → default-Executor, ~min(32, cpu+4) bzw. auf einer 2-vCPU-VPS
+# klein) UND die Discord-Alert-Posts teilten sich denselben Pool. Ein Retry-Sturm
+# (HL-429) belegt dann alle default-Worker mit schlafenden Threads → ein
+# gleichzeitiger Alert-Storm hungert aus, und Lock-Holder, die auf einen
+# to_thread-Slot warten, stallen die Engine. Ein eigener kleiner Pool nur für
+# fire-and-forget-Alerts garantiert, dass Alerts immer rausgehen, ohne dem
+# Trading-Pfad Threads zu klauen (und umgekehrt). max_workers klein halten —
+# Alerts sind I/O-leicht und sollen nie viele Slots binden.
+ALERT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hl-alert")
+
+
+def submit_alert(fn, *args, **kwargs):
+    """Fire-and-forget einen Alert-Send auf dem dedizierten Alert-Executor
+    ausführen (M-10). Schluckt Submit-Fehler (Pool-Shutdown beim Teardown), damit
+    ein Alert nie den Caller crasht. Engine._post_alert nutzt das statt
+    loop.run_in_executor(None, …), um den default-Pool nicht mit dem Trading-
+    Pfad zu teilen."""
+    try:
+        return ALERT_EXECUTOR.submit(fn, *args, **kwargs)
+    except Exception as e:  # z.B. RuntimeError nach Shutdown
+        log.warning("submit_alert failed (%s) — running inline", e)
+        try:
+            fn(*args, **kwargs)
+        except Exception as e2:
+            log.warning("inline alert failed: %s", e2)
+        return None
 
 # Patterns die als "transient" gelten und retried werden sollen.
 _TRANSIENT_PATTERNS = (

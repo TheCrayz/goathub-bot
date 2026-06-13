@@ -1,4 +1,7 @@
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+// #6 (2026-06-13): naive-UTC-Timestamps konsistent in LOKALER Zeit rendern
+// (fehlende TZ-Marke = UTC). Spiegelt fmtTs aus dashboard.js.
+function fmtTs(ts){if(!ts)return"";try{var s=String(ts);if(!/[zZ]|[+-]\d\d:?\d\d$/.test(s))s=s.replace(" ","T")+"Z";var d=new Date(s);return isNaN(d.getTime())?String(ts).replace("T"," "):d.toLocaleString();}catch(e){return String(ts).replace("T"," ");}}
 async function api(m,u,b){
   const headers={};
   if(b)headers["Content-Type"]="application/json";
@@ -40,7 +43,7 @@ async function loadHealth(){
     document.getElementById("h-builder").textContent=h.goathub.builder_configured?h.goathub.builder_fee:"off";
     document.getElementById("h-sb").innerHTML=h.signalbot.reachable?'<span class="pill on">reachable</span>':'<span class="pill off">unreachable</span>';
     const c=h.signalbot.last_cycle_summary;
-    document.getElementById("h-cycle").textContent=c?(c.ts+" — "+c.text):(h.signalbot.error||"—");
+    document.getElementById("h-cycle").textContent=c?(fmtTs(c.ts)+" — "+c.text):(h.signalbot.error||"—");
   }catch(e){
     console.error("health:",e);
     // 2026-06-12 Review #47: Fehler sichtbar machen statt nur console
@@ -137,7 +140,7 @@ async function loadActivity(kind){
       const kpill={error:'off',skip:'neutral',order:'on',update:'on',close:'on'}[r.kind]||'neutral';
       tb.insertAdjacentHTML("beforeend",
         `<tr>
-          <td class="mut">${esc((r.ts||"").replace("T"," "))}</td>
+          <td class="mut">${esc(fmtTs(r.ts))}</td>
           <td>${r.user_id||"—"}</td>
           <td><span class="pill ${kpill}">${esc(r.kind)}</span></td>
           <td>${esc(r.text||"")}</td>

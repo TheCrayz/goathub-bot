@@ -264,7 +264,16 @@ async def _reconcile_one_user(user_id: int, address: str):
             open_coins = []
         for mt_id, coin in open_coins:
             mt = db.get(ManagedTrade, mt_id)
-            if mt is None or mt.status == "closed":
+            # L-8 (2026-06-13): NUR eine noch wirklich 'open' Row darf einen
+            # Strike Richtung 'closed' nehmen. Vorher wurde nur status=='closed'
+            # übersprungen — eine Row, die zwischen dem open_coins-Snapshot und
+            # diesem Re-Fetch open→resting wiederverwendet wurde (neues NEW_TRADE
+            # auf demselben Coin), nahm sonst noch einen Strike der ALTEN
+            # Positions-Generation. Bei STRIKES=2 benigne (clear_strikes beim
+            # Öffnen räumt auf), bei STRIKES=1 würde der eine geerbte Strike die
+            # frische resting-Order fälschlich auf 'closed' flippen. Konservativ:
+            # alles außer 'open' überspringen + Counter aufräumen.
+            if mt is None or mt.status != "open":
                 # Counter aufräumen — diese Position interessiert uns nicht mehr.
                 _stale_counter.pop((user_id, coin, mt_id), None)
                 continue

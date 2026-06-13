@@ -114,6 +114,13 @@ async def start_listener():
     had_session = False
 
     while True:
+        # M-11 (2026-06-13): client PRO Iteration neu bauen UND im finally sauber
+        # schließen. Vorher schloss die Reconnect-Schleife den gescheiterten
+        # discord.Client NIE → pro fatalem Retry leckte eine aiohttp-Session inkl.
+        # Socket; über Wochen (5→300s-Backoff × viele Disconnects) summiert sich
+        # das zu File-Descriptor-Erschöpfung. `client` vor dem inneren try binden,
+        # damit das finally es auch sieht, wenn discord.Client(...) selbst wirft.
+        client = None
         try:
             intents = discord.Intents.default()
             intents.message_content = True
@@ -197,3 +204,16 @@ async def start_listener():
             except asyncio.CancelledError:
                 raise
             backoff = min(backoff * 2, 300)  # cap bei 5 Min
+        finally:
+            # M-11: aiohttp-Session/Socket dieser Iteration freigeben — auf JEDEM
+            # Pfad (sauberes Stop, Cancel beim Shutdown, fataler Retry). close()
+            # ist idempotent (auf einem schon geschlossenen Client ein no-op) und
+            # darf die eigentliche Exception NIE überschreiben → eigener Guard,
+            # CancelledError aus close() wird verschluckt (wir sind eh am Aufräumen).
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception as e:
+                    log.warning("client.close() im Reconnect-Cleanup fehlgeschlagen: %s", e)
+                except asyncio.CancelledError:
+                    pass

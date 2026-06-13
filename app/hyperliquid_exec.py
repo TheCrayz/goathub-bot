@@ -39,6 +39,33 @@ class HLOutageError(RuntimeError):
 _info_singletons = {}   # key: is_testnet (bool) -> Info instance
 _info_lock = threading.Lock()
 
+# M-17 (2026-06-13): prozessweiter meta()-Cache pro Netz. meta() macht bei JEDEM
+# Call einen POST (das SDK cached es NICHT, nur die bei __init__ übergebene
+# universe). Vorher rief der HyperliquidTrader-Ctor meta() bei JEDEM
+# _build_trader OHNE Retry → ein HL-Blip dort raiste und sah im Engine aus wie
+# ein User-Key-Fehler (per-User error-Activity, "agent does not exist"-Klasse).
+# Jetzt: meta einmal pro Netz holen (via hl_retry), cachen, teilen. Refresh
+# nur bei Service-Restart — die szDecimals/maxLeverage-Tabelle ändert sich
+# extrem selten (neuer Coin gelistet); zur Not Restart.
+_meta_cache = {}        # key: is_testnet (bool) -> meta-dict
+_meta_lock = threading.Lock()
+
+def get_meta(testnet: bool) -> dict:
+    """Prozessweit gecachtes Perp-meta() für das Netz (M-17). Erstbefüllung via
+    hl_retry über das get_info()-Singleton, danach In-Memory geteilt. Raised nur,
+    wenn der allererste Read auch nach Retries scheitert (dann hat der Caller
+    ohnehin keine szDecimals/maxLeverage und MUSS abbrechen)."""
+    with _meta_lock:
+        meta = _meta_cache.get(testnet)
+        if meta is not None:
+            return meta
+    info = get_info(testnet)
+    meta = hl_retry(lambda: info.meta(), max_attempts=3, label="meta")
+    with _meta_lock:
+        # Doppelte Befüllung durch parallele Erst-Caller ist harmlos (idempotent).
+        _meta_cache[testnet] = meta
+    return meta
+
 def get_info(testnet: bool) -> Info:
     """Returns a process-wide singleton Info() instance for the given network.
 
@@ -74,6 +101,7 @@ from app.hl_retry import (  # noqa: F401
     is_transient_error,
     is_hl_rate_limited,
     note_rate_limit,
+    submit_alert,
 )
 
 
@@ -118,7 +146,11 @@ class HyperliquidTrader:
         self.exchange = Exchange(Account.from_key(secret_key), base,
                                  account_address=account_address, timeout=HL_HTTP_TIMEOUT)
         self.info = Info(base, skip_ws=True, timeout=HL_HTTP_TIMEOUT)
-        meta = self.info.meta()
+        # M-17 (2026-06-13): meta aus dem prozessweiten, retry-gewrappten Cache
+        # statt self.info.meta() bei JEDEM _build_trader (POST ohne Retry → ein
+        # HL-Blip sah aus wie ein User-Key-Fehler). get_meta teilt EINEN Read
+        # pro Netz über alle Trader; ein transienter Blip wird hier abgefangen.
+        meta = get_meta(testnet)
         self._sz = {a["name"]: a.get("szDecimals", 2) for a in meta.get("universe", [])}
         # 2026-06-12 (Review #17): per-Asset maxLeverage aus meta merken. Viele Alts
         # cappen bei 3-10x — auto_leverage darf nie mehr anfragen, sonst rejected HL
@@ -212,11 +244,20 @@ class HyperliquidTrader:
         return max(wd, free_spot)
 
     def open_positions_count(self):
-        try:
-            aps = self.info.user_state(self.address).get("assetPositions", [])
-            return sum(1 for p in aps if abs(_f(p.get("position", {}).get("szi"))) > 0)
-        except Exception:
-            return 0
+        """Anzahl offener Perps-Positionen (|szi|>0).
+
+        M-2 (2026-06-13): vorher gab ein Read-Fehler hier 0 zurück — der
+        max_open-Gate im Engine sah dann "0 Positionen offen" während eines
+        API-Blips und ließ JEDEN Entry durch (fail-OPEN; mit M-1 sind dann
+        BEIDE Portfolio-Caps gleichzeitig aus). Jetzt: via hl_retry (3 Versuche)
+        lesen; nach finalem Fail die Exception DURCHREICHEN. Der Engine-Caller
+        behandelt den Raise fail-closed (Entry abbrechen), statt blind 0 zu
+        nehmen. Read ist nur ein Gate-Zähler, kein risk-reduzierender Pfad —
+        bei Unsicherheit ist Abbruch die sichere Wahl."""
+        state = hl_retry(lambda: self.info.user_state(self.address),
+                         max_attempts=3, label="open_positions_count")
+        aps = (state or {}).get("assetPositions", [])
+        return sum(1 for p in aps if abs(_f(p.get("position", {}).get("szi"))) > 0)
 
     def open_positions(self):
         """H1: offene Perps-Positionen als [{'coin', 'szi'}], szi signiert."""
@@ -231,27 +272,76 @@ class HyperliquidTrader:
             log.warning("open_positions: %s", e)
         return out
 
-    def covered_stop_size(self, coin):
-        """H1/H2 (2026-06-09): Summe der Größen ALLER reduce-only STOP-Orders für
-        `coin` = wie viel der Position durch Stop-Loss(e) abgedeckt ist. Der
-        Reconciler vergleicht das mit der Positionsgröße, um UNTER-gedeckte
-        Positionen zu erkennen (Partial-Fill-Bug: SL deckte nur den ersten Mini-
-        Fill — BTC 2026-06-09: 0.00138 von 0.1151). TP zählt NICHT als Schutz.
-        Fail-SAFE: bei Read-Fehler inf (= 'als gedeckt annehmen', kein
-        fälschliches Nachlegen)."""
+    # M-6 (2026-06-13): Zähler aufeinanderfolgender Read-Fehler PRO Coin für
+    # covered_stop_size. Ab _COVERED_READ_ALERT_AT Fehlern in Folge ist der
+    # Coverage-Check für diesen Coin effektiv blind (return inf maskiert
+    # Unter-Deckung) → wir loggen ERROR (Alert-Webhook im Engine hängt am
+    # error-Log-Pfad). Erfolg setzt den Zähler zurück.
+    _COVERED_READ_ALERT_AT = 3
+
+    def covered_stop_size(self, coin, position_is_long=None):
+        """H1/H2 (2026-06-09): Summe der Größen der reduce-only STOP-Orders für
+        `coin`, die die LIVE-Position decken = wie viel durch Stop-Loss(e)
+        abgedeckt ist. Der Reconciler vergleicht das mit der Positionsgröße, um
+        UNTER-gedeckte Positionen zu erkennen (Partial-Fill-Bug: SL deckte nur den
+        ersten Mini-Fill — BTC 2026-06-09: 0.00138 von 0.1151). TP zählt NICHT als
+        Schutz.
+
+        M-6 (2026-06-13): zwei Härtungen.
+          (1) SIDE-AWARE: `position_is_long` (True=LONG, False=SHORT, None=alt
+              wie bisher). Ein Stop, der eine LONG-Position schützt, ist ein
+              reduce-only SELL (side 'A'); ein SHORT-Schutz ist ein BUY
+              (side 'B'). Vorher zählte JEDER reduce-only Stop des Coins — auch
+              manuelle oder falsch-seitige (z.B. ein Stop aus einer früheren
+              Gegenposition). Das überschätzte die Deckung → echte Unter-Deckung
+              blieb unentdeckt. Caller (reconciler) kennt die Richtung aus szi.
+              Trigger-Side-Sanity zusätzlich: LONG-Schutz triggert UNTER dem
+              Markt (sl), SHORT-Schutz darüber — wir nutzen primär das side-Feld.
+          (2) READ-FAIL-ESCALATION: ein einzelner Read-Fehler bleibt fail-SAFE
+              (return inf = 'als gedeckt annehmen', kein fälschliches Nachlegen),
+              ABER wiederholte Fehler (≥_COVERED_READ_ALERT_AT in Folge) heißt:
+              der Coverage-Check ist BLIND und maskiert evtl. eine nackte
+              Position. Dann ERROR-Log (Alert-Webhook hängt im Engine am
+              error-Pfad) statt still inf.
+        """
         coin = coin_of(coin)
         try:
-            orders = self.info.frontend_open_orders(self.address) or []
+            orders = hl_retry(lambda: self.info.frontend_open_orders(self.address),
+                              max_attempts=3, label=f"covered_stop_size {coin}") or []
         except Exception as e:
-            log.warning("covered_stop_size(%s): %s", coin, e)
+            # Fehlerzähler pro Coin hochzählen; ab Schwelle ESKALIEREN (ERROR).
+            if not hasattr(self, "_covered_read_fails"):
+                self._covered_read_fails = {}
+            n = self._covered_read_fails.get(coin, 0) + 1
+            self._covered_read_fails[coin] = n
+            if n >= self._COVERED_READ_ALERT_AT:
+                log.error("covered_stop_size(%s): open-orders read failed %dx in a row — "
+                          "coverage check BLIND for this coin, under-coverage may be masked: %s",
+                          coin, n, e)
+            else:
+                log.warning("covered_stop_size(%s): %s", coin, e)
             return float("inf")
+        # Erfolg → Fehlerzähler für diesen Coin zurücksetzen.
+        if getattr(self, "_covered_read_fails", None):
+            self._covered_read_fails.pop(coin, None)
+        # Welche close-Side deckt die Position? LONG → reduce-only SELL (side 'A'),
+        # SHORT → reduce-only BUY (side 'B'). None = alte Semantik (jede Side).
+        want_side = None
+        if position_is_long is True:
+            want_side = "A"
+        elif position_is_long is False:
+            want_side = "B"
         total = 0.0
         for o in orders:
             if coin_of(o.get("coin")) != coin:
                 continue
             ot = str(o.get("orderType", "")).lower()
-            if o.get("reduceOnly") and "stop" in ot:
-                total += _f(o.get("sz"))
+            if not (o.get("reduceOnly") and "stop" in ot):
+                continue
+            if want_side is not None and str(o.get("side", "")).upper() != want_side:
+                # falsch-seitiger / manueller Stop → deckt diese Position nicht
+                continue
+            total += _f(o.get("sz"))
         return total
 
     def position_size(self, coin):
@@ -310,6 +400,12 @@ class HyperliquidTrader:
         px = _f(px)
         if px <= 0:
             return px
+        # L-4 (2026-06-13): über 100k sind ganzzahlige Preise legal — HLs
+        # 5-sig-fig-Regel erzwingt sonst eine Rundung auf den 10er (z.B. BTC-SL
+        # 104_237 → 104_240), die den SL bis zu ±5 verschiebt. Bei px≥1e5 also
+        # auf Integer runden (max-Dezimalstellen sind dort ohnehin 0).
+        if px >= 1e5:
+            return float(round(px))
         max_dec = max(0, 6 - self._sz.get(coin_of(coin), 3))
         return round(float(f"{px:.5g}"), max_dec)
 
@@ -523,8 +619,36 @@ class HyperliquidTrader:
         def _do():
             try:
                 return self.exchange.order(coin, is_buy, sz, px, otype, **kwargs)
-            except TypeError:
-                return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only, cloid=cloid)
+            except TypeError as te:
+                # L-7 (2026-06-13): NUR der echte kwarg-Probe-Fall fällt zurück —
+                # eine alte SDK-Version, die builder=/cloid= NICHT als kwarg kennt
+                # ("unexpected keyword argument 'builder'"). Vorher fing das JEDEN
+                # TypeError (auch einen aus dem Inneren von order()/bulk_orders())
+                # und re-sendete OHNE den builder → jede solche Order droppte still
+                # die Builder-Fee (Michaels Umsatz) UND maskierte echte Bugs.
+                # Jetzt: nur bei "unexpected keyword argument" zurückfallen, sonst
+                # re-raisen (hl_retry klassifiziert/loggt). Der Fallback BEHÄLT den
+                # builder, falls die SDK ihn als POSITIONAL annimmt.
+                msg = str(te)
+                if "unexpected keyword argument" not in msg:
+                    raise
+                # Fallback BEHÄLT den builder (Revenue-kritisch) und lässt nur das
+                # neuere/optionale cloid weg — eine SDK, die den probe-kwarg nicht
+                # kennt, ist alt genug, dass cloid der wahrscheinliche Übeltäter
+                # ist; die Builder-Fee darf nie still wegfallen.
+                fb_kwargs = {"reduce_only": reduce_only}
+                if self.builder:
+                    fb_kwargs["builder"] = self.builder
+                try:
+                    return self.exchange.order(coin, is_buy, sz, px, otype, **fb_kwargs)
+                except TypeError as te2:
+                    # Auch builder= unbekannt → minimaler Call, aber dann ist die
+                    # Builder-Fee in dieser SDK nicht setzbar: WARN, nicht still.
+                    if "unexpected keyword argument" not in str(te2):
+                        raise
+                    log.warning("order(%s): SDK rejects builder kwarg — "
+                                "placing WITHOUT builder fee (lost revenue!)", coin)
+                    return self.exchange.order(coin, is_buy, sz, px, otype, reduce_only=reduce_only)
         return hl_retry(_do, max_attempts=max_attempts, label=label)
 
     def place_entry(self, coin, is_buy, sz, px):

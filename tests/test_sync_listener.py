@@ -137,12 +137,34 @@ def test_parser_cancel_via_action_field():
 
 
 def test_parser_cancel_via_title_fallback():
-    """Kein Action-Feld → Action + Ticker aus dem Titel 'TICKER — ACTION'."""
-    sig = parser.parse_signal(_embed_dict(title="BTC/USDT — CANCEL"))
+    """M-19 (2026-06-13): Kein Action-Feld → Action AUS DEM TITEL 'TICKER — ACTION'
+    ist jetzt strikt. Ein geratener Ticker AUS demselben mehrdeutigen Titel, aus
+    dem auch die Action geraten wurde, ist für einen CANCEL (schließt eine offene
+    Position!) zu unsicher → der Parser verlangt einen expliziten Bestätiger:
+    entweder ein Ticker-Feld ODER ein Direction-Feld, das das Schema absichert.
+
+    Hier: ein Direction-Feld bestätigt das Schema → Title-Fallback-CANCEL greift,
+    Ticker kommt aus dem Titel."""
+    sig = parser.parse_signal(_embed_dict(
+        title="BTC/USDT — CANCEL",
+        fields=[{"name": "Direction", "value": "LONG"}]))
     assert sig is not None
     assert sig.action == "CANCEL"
     assert sig.ticker == "BTC/USDT"
+    assert sig.direction == "LONG"
     assert sig.entry is None and sig.stop_loss is None
+
+
+def test_parser_title_fallback_cancel_without_confirmation_is_none():
+    """M-19 (2026-06-13): ein BLOSSER 'TICKER — ACTION'-Titel OHNE expliziten
+    Ticker- oder Direction-Feld-Bestätiger liefert KEINE Action mehr. Ticker UND
+    Action aus demselben mehrdeutigen Titel zu raten ist für einen CANCEL zu
+    riskant → fail-closed (None). Vorher löste jedes letzte '—'-Segment, das
+    zufällig ein CANCEL-Token war, einen CANCEL mit geratenem Ticker aus."""
+    assert parser.parse_signal(_embed_dict(title="BTC/USDT — CANCEL")) is None
+    # Auch ein freier Titel mit mehreren '—' liefert keine Action (kein 2-Segment-Schema).
+    assert parser.parse_signal(_embed_dict(
+        title="BTC long zone — wait — close to invalidation")) is None
 
 
 def test_parser_missing_fields_return_none():
@@ -386,6 +408,97 @@ def test_h14_alert_swallows_post_errors(monkeypatch):
     dl._alert("anything")   # darf nicht raisen
 
 
+# ── Listener: M-11 client.close() pro Reconnect-Iteration ───────────────────
+class _FakeDiscordClient:
+    """discord.Client-Fake: start() wirft einmal (fataler Connect-Fehler),
+    close() wird gezählt. Trackt, dass die Reconnect-Schleife den gescheiterten
+    Client wirklich schließt (sonst aiohttp-Session-Leak, M-11)."""
+    closed = 0
+
+    def __init__(self, intents=None):
+        self.events = {}
+
+    def event(self, fn):
+        self.events[fn.__name__] = fn
+        return fn
+
+    async def start(self, token):
+        raise RuntimeError("gateway connect failed")
+
+    async def close(self):
+        type(self).closed += 1
+
+
+def _fake_discord_module():
+    """Minimaler discord-Stub für den lazy `import discord` in start_listener."""
+    mod = types.SimpleNamespace()
+
+    class _Intents:
+        def __init__(self):
+            self.message_content = False
+
+        @staticmethod
+        def default():
+            return _Intents()
+
+    mod.Intents = _Intents
+    mod.Client = _FakeDiscordClient
+    mod.Object = lambda id: types.SimpleNamespace(id=id)
+    return mod
+
+
+def test_m11_listener_closes_client_each_iteration(monkeypatch):
+    """M-11: die Reconnect-Schleife muss den gescheiterten discord.Client pro
+    Iteration schließen (try/finally await client.close()). Vorher leckte pro
+    fatalem Retry eine aiohttp-Session/Socket."""
+    import sys
+    _FakeDiscordClient.closed = 0
+    monkeypatch.setitem(sys.modules, "discord", _fake_discord_module())
+
+    # asyncio.sleep im Backoff: nach 2 Iterationen abbrechen (CancelledError).
+    iterations = {"n": 0}
+
+    async def _fake_sleep(seconds, *a, **k):
+        iterations["n"] += 1
+        if iterations["n"] >= 2:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(dl.asyncio, "sleep", _fake_sleep)
+    # config-Token muss existieren, damit start() überhaupt aufgerufen wird.
+    monkeypatch.setattr(dl.config, "DISCORD_BOT_TOKEN", "x", raising=False)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(dl.start_listener())
+
+    # Pro durchlaufener Iteration (start() raised → finally → close()) genau ein
+    # close(); 2 Iterationen bis zum Cancel → >=2 closes, nie 0 (= der Leak).
+    assert _FakeDiscordClient.closed >= 2
+
+
+def test_m11_close_failure_is_swallowed(monkeypatch):
+    """M-11: ein Fehler in client.close() darf die eigentliche Exception NICHT
+    überschreiben und den Loop nicht crashen (best-effort-Cleanup)."""
+    import sys
+
+    class _CloseBoom(_FakeDiscordClient):
+        async def close(self):
+            raise RuntimeError("close kaputt")
+
+    mod = _fake_discord_module()
+    mod.Client = _CloseBoom
+    monkeypatch.setitem(sys.modules, "discord", mod)
+
+    async def _fake_sleep(seconds, *a, **k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(dl.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(dl.config, "DISCORD_BOT_TOKEN", "x", raising=False)
+
+    # Trotz close()-Fehler propagiert sauber die CancelledError (kein RuntimeError).
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(dl.start_listener())
+
+
 # ── Sync: Strike-Logik (B-#5) + LOW-5-Hook ──────────────────────────────────
 class _FakeInfo:
     """HL-Info-Fake: user_state liefert die konfigurierten assetPositions."""
@@ -484,6 +597,55 @@ def test_strike_resets_when_position_reappears(monkeypatch):
     assert (1, "BTC", mt_id) not in sync._stale_counter
     db = SessionLocal()
     assert db.get(ManagedTrade, mt_id).status == "open"
+    db.close()
+
+
+def test_l8_reused_resting_row_does_not_take_strike(monkeypatch):
+    """L-8 (2026-06-13): eine Row, die zwischen dem open_coins-Snapshot und dem
+    Strike-Re-Fetch open→resting wiederverwendet wird (neues NEW_TRADE auf
+    demselben Coin), darf KEINEN Strike der alten Positions-Generation nehmen.
+    Vorher übersprang der Re-Fetch nur status=='closed' → die jetzt-resting Row
+    bekam noch einen Strike; bei STRIKES=1 hätte der eine geerbte Strike die
+    frische Limit-Order fälschlich auf 'closed' geflippt.
+
+    Reproduktion: _FakeInfo flippt die Row beim user_state-Read (das läuft NACH
+    dem open_coins-Snapshot, aber VOR der Strike-Schleife) auf 'resting'. Der
+    Re-Fetch in der Strike-Schleife sieht dann status!='open' → kein Strike."""
+    _reset_db()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed(db, user_id=1, coin="BTC", status="open")
+    mt_id = mt.id
+    db.close()
+
+    async def _noop_cancel(user_id, coin):
+        pass
+
+    monkeypatch.setattr(sync, "_cancel_leftover_orders", _noop_cancel)
+
+    class _FlippingInfo:
+        """user_state meldet leer (kein HL-Coin) UND flippt als Seiteneffekt die
+        Row auf 'resting' — simuliert ein NEW_TRADE, das den Coin mitten im
+        Sync-Read wiederverwendet."""
+        def user_state(self, address):
+            db = SessionLocal()
+            try:
+                row = db.get(ManagedTrade, mt_id)
+                if row is not None and row.status == "open":
+                    row.status = "resting"
+                    db.commit()
+            finally:
+                db.close()
+            return {"assetPositions": []}
+
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FlippingInfo())
+
+    asyncio.run(sync._reconcile_one_user(1, "0x12E3"))
+
+    # Kein Strike für die jetzt-resting Row, Status bleibt 'resting' (NICHT closed).
+    assert (1, "BTC", mt_id) not in sync._stale_counter
+    db = SessionLocal()
+    assert db.get(ManagedTrade, mt_id).status == "resting"
     db.close()
 
 

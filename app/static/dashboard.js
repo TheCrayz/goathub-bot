@@ -19,6 +19,11 @@ const T=()=>localStorage.getItem("ght");  // legacy bearer fallback
 // (exchange errors, parser output, Discord embeds) and could contain <script> etc.
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
 function show(el,t,cls){el.textContent=t;el.className="msg "+(cls||"")}
+// #6 (2026-06-13): Backend liefert naive-UTC-Timestamps (Activity.ts) — frueher
+// roh als "T→Space" gerendert => der Browser zeigte sie als ob lokal, was nicht
+// zur (lokalen) Fill-History passte. fmtTs behandelt fehlende TZ-Marke als UTC
+// und rendert konsistent in LOKALER Zeit (eine Zeitzone ueberall).
+function fmtTs(ts){if(!ts)return"";try{var s=String(ts);if(!/[zZ]|[+-]\d\d:?\d\d$/.test(s))s=s.replace(" ","T")+"Z";var d=new Date(s);return isNaN(d.getTime())?String(ts).replace("T"," "):d.toLocaleString();}catch(e){return String(ts).replace("T"," ");}}
 async function api(m,u,b){
   // Cookie kommt automatisch via credentials:'include'. Bearer NUR senden,
   // falls noch alter localStorage-Token da ist (transition).
@@ -901,7 +906,7 @@ function render(d){
   // sich langsam; das 15s-Dashboard-Polling soll ihn nicht mitreißen.
   if(Date.now()-PC_LAST>300000){PC_LAST=Date.now();loadPerCoinStatus();}
   const ab=document.querySelector("#acttbl tbody");ab.innerHTML="";
-  d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${esc((a.ts||"").replace("T"," "))}</td><td>${esc(a.kind)}</td><td>${esc(a.text)}</td></tr>`)});
+  d.activity.forEach(a=>{ab.insertAdjacentHTML("beforeend",`<tr><td class="mut">${esc(fmtTs(a.ts))}</td><td>${esc(a.kind)}</td><td>${esc(a.text)}</td></tr>`)});
   actempty.style.display=d.activity.length?"none":"block";
   ACCOUNT=d.account||null; STATS=d.stats||null; renderStats();
 }

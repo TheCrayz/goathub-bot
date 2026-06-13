@@ -436,3 +436,158 @@ def test_set_referrer_without_wallet_is_clean(client):
     body = rr.json()
     assert body["ok"] is False
     assert "wallet" in body["detail"].lower()
+
+
+# ── M-7: Single-Trader-Guard (exklusiver flock) ─────────────────────────────
+def test_m7_trader_lock_acquire_and_release():
+    """M-7: erster Acquire hält den Lock (True). Hält ein ANDERER fd denselben
+    Pfad exklusiv, liefert ein frischer Acquire False (= API-only, kein
+    Doppel-Trading). Release ist sauber + idempotent."""
+    fcntl = pytest.importorskip("fcntl")  # POSIX-only; prod ist Linux
+    # Sauberer Startzustand.
+    main._release_trader_lock()
+    assert main._trader_lock_fd is None
+
+    # 1) Wir nehmen den Lock — muss True liefern und den fd offen halten.
+    assert main._acquire_trader_lock() is True
+    assert main._trader_lock_fd is not None
+    path = main._trader_lock_path()
+
+    # 2) Solange WIR ihn halten, simuliert ein zweiter Prozess: derselbe Pfad,
+    #    eigener fd. flock(LOCK_EX|LOCK_NB) auf denselben fd-Owner ist re-entrant,
+    #    daher echten zweiten fd öffnen und prüfen, dass er NICHT exklusiv geht.
+    with open(path, "w") as other:
+        with pytest.raises(OSError):
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # 3) Release gibt den Lock frei; ein zweiter fd kann ihn danach nehmen.
+    main._release_trader_lock()
+    assert main._trader_lock_fd is None
+    with open(path, "w") as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # darf nicht raisen
+        fcntl.flock(other.fileno(), fcntl.LOCK_UN)
+
+    # 4) Doppelter Release ist ein no-op (kein Crash).
+    main._release_trader_lock()
+
+
+def test_m7_second_acquire_is_false_when_held(monkeypatch, tmp_path):
+    """M-7 (Kern): hält ein FREMDER Prozess (anderer fd) den Lock exklusiv, liefert
+    _acquire_trader_lock False → der Prozess startet Listener/Sync NICHT."""
+    fcntl = pytest.importorskip("fcntl")
+    main._release_trader_lock()
+
+    lockfile = str(tmp_path / "goathub.lock")
+    monkeypatch.setattr(main, "_trader_lock_path", lambda: lockfile)
+
+    # Ein "fremder" Prozess hält den Lock.
+    holder = open(lockfile, "w")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        # Unser Acquire muss scheitern (False), ohne zu crashen, und KEINEN fd
+        # auf dem Modul-Global zurücklassen.
+        assert main._acquire_trader_lock() is False
+        assert main._trader_lock_fd is None
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+        main._release_trader_lock()
+
+
+# ── L-16 + M-21: Dashboard-Observability ────────────────────────────────────
+class _FakeInfoSpotFail:
+    """Info-Fake: user_state ok, aber spot_user_state wirft → L-16-Pfad."""
+    def __init__(self, spot_fails=True):
+        self._spot_fails = spot_fails
+
+    def user_state(self, address):
+        return {"marginSummary": {"accountValue": "1000.0"}, "assetPositions": []}
+
+    def spot_user_state(self, address):
+        if self._spot_fails:
+            raise RuntimeError("spot read down")
+        return {"balances": [{"coin": "USDC", "total": "200", "hold": "0"}]}
+
+    def user_fills(self, address):
+        return []
+
+
+def _wallet_for(client, email):
+    """User registrieren + Wallet verbinden, headers zurückgeben."""
+    from eth_account import Account
+    r = _register(client, email, "dashpw12345")
+    assert r.status_code == 200
+    hdrs = _auth_headers(r)
+    agent = Account.create()
+    agent_key = agent.key.hex()
+    if not agent_key.startswith("0x"):
+        agent_key = "0x" + agent_key
+    addr = "0x" + "44" * 20
+    r = client.post("/api/wallet", json={"hl_account_address": addr,
+                                         "hl_api_secret": agent_key}, headers=hdrs)
+    assert r.status_code == 200, r.text[:200]
+    return hdrs
+
+
+def test_l16_dashboard_marks_incomplete_balance_on_spot_fail(client, monkeypatch):
+    """L-16: schlägt der Spot-USDC-Read fehl, ist die Balance unvollständig
+    (nur Perps-Equity). Vorher wurde der Fehler still geschluckt; jetzt markiert
+    der Snapshot account.spot_balance_ok=False, damit das Frontend das kennzeichnet."""
+    import app.hyperliquid_exec as hl_exec
+    import app.main as m
+    m._snapshot_cache.clear()
+    monkeypatch.setattr(m.config, "DEMO_MODE", False, raising=False)
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfoSpotFail(spot_fails=True))
+
+    hdrs = _wallet_for(client, "dash-spotfail@test.local")
+    r = client.get("/api/dashboard", headers=hdrs)
+    assert r.status_code == 200, r.text[:200]
+    acct = r.json()["account"]
+    assert acct["spot_balance_ok"] is False
+    # Balance ist trotzdem da (Perps-Equity), nur als unvollständig markiert.
+    assert acct["balance"] == 1000.0
+
+
+def test_l16_dashboard_spot_ok_when_read_succeeds(client, monkeypatch):
+    """L-16: erfolgreicher Spot-Read → spot_balance_ok=True, Balance = Perps + Spot."""
+    import app.hyperliquid_exec as hl_exec
+    import app.main as m
+    m._snapshot_cache.clear()
+    monkeypatch.setattr(m.config, "DEMO_MODE", False, raising=False)
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfoSpotFail(spot_fails=False))
+
+    hdrs = _wallet_for(client, "dash-spotok@test.local")
+    r = client.get("/api/dashboard", headers=hdrs)
+    assert r.status_code == 200, r.text[:200]
+    acct = r.json()["account"]
+    assert acct["spot_balance_ok"] is True
+    assert acct["balance"] == 1200.0   # 1000 Perps + (200 total − 0 hold) Spot
+
+
+def test_m21_activity_ts_is_utc_marked(client, monkeypatch):
+    """M-21 (Hook #6): Activity-Timestamps werden mit 'Z' (UTC) serialisiert,
+    damit der Browser sie NICHT als Lokalzeit liest. Naive-UTC in der DB →
+    isoformat()+'Z' an der UI-Grenze."""
+    import app.hyperliquid_exec as hl_exec
+    import app.main as m
+    m._snapshot_cache.clear()
+    monkeypatch.setattr(m.config, "DEMO_MODE", False, raising=False)
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfoSpotFail(spot_fails=False))
+
+    hdrs = _wallet_for(client, "dash-ts@test.local")
+    # Eine Activity-Zeile für diesen User anlegen.
+    db = SessionLocal()
+    try:
+        u = db.query(User).filter(User.email == "dash-ts@test.local").first()
+        db.add(Activity(user_id=u.id, kind="order", text="opened BTC"))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.get("/api/dashboard", headers=hdrs)
+    assert r.status_code == 200, r.text[:200]
+    activity = r.json()["activity"]
+    assert activity, "expected at least one activity row"
+    assert activity[0]["ts"].endswith("Z"), activity[0]["ts"]
+    # Form: ISO-8601 mit UTC-Marker (z.B. 2026-06-13T09:00:00Z)
+    assert "T" in activity[0]["ts"]

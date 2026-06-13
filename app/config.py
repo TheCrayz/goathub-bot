@@ -124,6 +124,42 @@ _net_logging.getLogger("goathub.config").warning(
 BUILDER_ADDRESS = _g("BUILDER_ADDRESS")      # deine HL-Adresse (braucht >=100 USDC perps)
 BUILDER_FEE = _g("BUILDER_FEE", "0.05%")     # f bis 0.1% (perps max)
 
+# 2026-06-13 M-22: BUILDER_FEE schon beim Import validieren — spiegelbildlich
+# zum JWT_SECRET-/Fernet-Hard-Fail oben. Vorher wurde fee_to_int(BUILDER_FEE)
+# erst LAZY beim ERSTEN Builder-Order aufgerufen — ein Garbage-Wert (z.B.
+# BUILDER_FEE="abc" → 0, oder "5%" → ValueError mitten im Trade) fiel damit
+# erst zur Trade-Zeit auf, für genau einen User, als kryptische Activity. Jetzt:
+# Boot-Fail bei unparsebarem/zu-hohem Wert, und der aufgelöste bps-Wert wird
+# beim Start sichtbar geloggt. Die Logik ist eine eigenständige Kopie von
+# hyperliquid_exec.fee_to_int (dortiger Import würde beim config-Import das
+# schwere HL-SDK + eth_account mitziehen und einen Circular-Import riskieren).
+def _validate_builder_fee(fee_str):
+    """'0.05%' -> 50 bps (10 == 1 bp). Perps-Max 0.1% == 100 bps.
+    RuntimeError bei unparsebarem ODER zu hohem Wert."""
+    try:
+        pct = float(str(fee_str).replace("%", "").strip())
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"BUILDER_FEE={fee_str!r} ist keine gültige Prozent-Angabe. "
+            f"Erlaubt ist z.B. '0.05%' oder '0.1%' (Perps-Max 0.1%).")
+    if pct < 0:
+        raise RuntimeError(
+            f"BUILDER_FEE={fee_str!r} ist negativ — erlaubt sind 0 bis 0.1%.")
+    if pct > 0.1:
+        raise RuntimeError(
+            f"BUILDER_FEE={fee_str!r}: Perps-Builder-Fee ist auf 0.1% (=100 bps) "
+            f"hard-capped. Setze 0.05% oder 0.1%, nicht {pct}%.")
+    return int(round(pct * 1000))
+
+
+# Nur validieren/loggen, wenn überhaupt eine Builder-Adresse konfiguriert ist
+# (ohne Adresse wird nie eine Builder-Order gebaut → fee ist dann irrelevant).
+BUILDER_FEE_BPS = _validate_builder_fee(BUILDER_FEE) if BUILDER_ADDRESS else None
+if BUILDER_ADDRESS:
+    import logging as _fee_logging
+    _fee_logging.getLogger("goathub.config").info(
+        "BUILDER_FEE=%s → %d bps (builder=%s)", BUILDER_FEE, BUILDER_FEE_BPS, BUILDER_ADDRESS)
+
 # Hyperliquid-Referral: User verknüpfen ihren HL-Account über Michaels Code.
 REFERRAL_CODE = _g("REFERRAL_CODE", "TRETAGHUNBERG")
 REFERRAL_LINK = _g("REFERRAL_LINK", "https://app.hyperliquid.xyz/join/TRETAGHUNBERG")
@@ -157,6 +193,10 @@ MIN_NOTIONAL_USDC = _f("MIN_NOTIONAL_USDC", 10)
 # Size-Berechnung, die unabhängig von Risk-%/Leverage eine riesige Order
 # aufmachen würde. 0 = aus (kein Cap). engine.H-16 erzwingt das beim Sizing.
 MAX_NOTIONAL_PER_TRADE = _f("MAX_NOTIONAL_PER_TRADE", 50000)
+# M-24 (2026-06-13): Cooldown nach einem Stop-Out (realisierter Verlust) pro
+# (user,coin) — verhindert Whipsaw-Re-Entry/Fee-Bleed direkt nach einem SL-Hit.
+# Sekunden; 900 = 15 Min. 0 = aus (sofortiger Re-Entry erlaubt).
+POST_STOPOUT_COOLDOWN_S = _f("POST_STOPOUT_COOLDOWN_S", 900)
 MIN_CONFIDENCE = _f("MIN_CONFIDENCE", 0.75)
 ENTRY_FILL_TIMEOUT_S = _i("ENTRY_FILL_TIMEOUT_S", 300)   # 5 min (Phase 2 von 15→5 Min)
 ENTRY_POLL_S = _i("ENTRY_POLL_S", 4)                     # alle 4s pollen (war 6)
@@ -229,11 +269,26 @@ else:
     if os.path.isdir(_halt_dir) and os.access(_halt_dir, os.W_OK):
         EMERGENCY_HALT_FLAG_PATH = os.path.join(_halt_dir, "emergency-halt")
     else:
+        # 2026-06-13 L-13: Fallback-Warnung gehärtet. Auf macOS (lokales Dev)
+        # ist das erwartbar → WARNING reicht. Auf einem echten Linux-Host ist
+        # ein nicht beschreibbares /var/lib/goathub ein MISKONFIGURIERTER
+        # Server: der Halt-Flag landet dann auf world-writable /tmp, wo JEDER
+        # lokale User ihn setzen (DoS) ODER einen vom Admin gesetzten Halt
+        # LÖSCHEN kann (Sicherheitsrisiko) — das ist ERROR-würdig.
         import logging as _logging
-        _logging.getLogger("goathub.config").warning(
+        import sys as _sys
+        _halt_log = _logging.getLogger("goathub.config")
+        _msg = (
             "EMERGENCY_HALT_FLAG_PATH: /var/lib/goathub nicht beschreibbar — "
-            "Fallback auf world-writable /tmp/goathub-emergency-halt. Auf dem "
-            "Server: mkdir -p /var/lib/goathub && chown goathub:goathub /var/lib/goathub")
+            "Fallback auf WORLD-WRITABLE /tmp/goathub-emergency-halt. Jeder "
+            "lokale User kann den Bot damit lahmlegen ODER einen Admin-Halt "
+            "löschen. Auf dem Server beheben: mkdir -p /var/lib/goathub && "
+            "chown goathub:goathub /var/lib/goathub (oder EMERGENCY_HALT_FLAG_PATH "
+            "explizit auf ein nur-goathub-schreibbares Verzeichnis setzen).")
+        if _sys.platform == "darwin":
+            _halt_log.warning("[lokales Dev/macOS] %s", _msg)
+        else:
+            _halt_log.error(_msg)
         EMERGENCY_HALT_FLAG_PATH = "/tmp/goathub-emergency-halt"
 
 # 2026-06-12 #54: Token-Usage-Scraper nur noch per Opt-in. Vorher lief der

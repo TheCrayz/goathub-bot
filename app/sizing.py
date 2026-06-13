@@ -78,7 +78,12 @@ def auto_leverage(*, entry: float, stop_loss: float, confidence=None,
     safe_lev = 1.0 / (sl_dist * liq_safety)
     conf = max(conf_floor, float(confidence)) if confidence is not None else conf_floor
     chosen = safe_lev * conf
-    lev = max(1, min(int(max_cap), int(round(chosen))))
+    # L-5 (2026-06-13): FLOOR statt round-half-even. int(round()) konnte den
+    # gewählten Hebel um bis zu +0.49 über die safe_lev×conf-Schranke heben (z.B.
+    # chosen 24.6 → 25x) — der Hebel wäre dann minimal aggressiver als die
+    # Liquidations-Sicherheit erlaubt. int() (floor, chosen ist immer ≥0) hält
+    # die Schranke konservativ ein; das max(1, …) sichert den Mindesthebel.
+    lev = max(1, min(int(max_cap), int(chosen)))
     sl_pct = sl_dist * 100
     reason = (f"auto-lev: SL={sl_pct:.2f}% × safety {liq_safety}× = safe {safe_lev:.1f}x, "
               f"conf {conf:.2f} → {lev}x (cap {int(max_cap)}x)")

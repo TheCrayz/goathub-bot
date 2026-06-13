@@ -400,5 +400,239 @@ def test_retry_after_parsing():
     assert hl_retry._retry_after_from_exc(RuntimeError("no header")) is None
 
 
+# ---------------------------------------------------------------------------
+# M-2 — open_positions_count RAISES on read fail (fail-closed), nicht 0
+# ---------------------------------------------------------------------------
+class _CountInfo:
+    """Info-Fake für open_positions_count: liefert N offene Positionen oder
+    raised (non-transient) bei raises=…."""
+    def __init__(self, positions=None, raises=None):
+        self._positions = positions or []
+        self._raises = raises
+        self.calls = 0
+
+    def user_state(self, address):
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return {"assetPositions": [{"position": {"coin": c, "szi": str(s)}}
+                                   for c, s in self._positions]}
+
+
+def test_open_positions_count_counts_nonzero():
+    t = make_trader(info=_CountInfo(positions=[("BTC", 0.1), ("DOGE", 0.0), ("SOL", -3)]))
+    # DOGE szi==0 zählt nicht → 2
+    assert t.open_positions_count() == 2
+
+
+def test_open_positions_count_raises_on_read_fail():
+    """M-2 Kern: ein Read-Fehler darf NICHT 0 liefern (max-open-Gate fail-OPEN),
+    sondern muss durchreichen → Engine bricht den Entry fail-closed ab."""
+    info = _CountInfo(raises=RuntimeError("info down non-transient"))
+    t = make_trader(info=info)
+    with pytest.raises(RuntimeError):
+        t.open_positions_count()
+    assert info.calls == 1  # non-transient → kein Retry-Sturm
+
+
+# ---------------------------------------------------------------------------
+# M-6 — covered_stop_size side-aware + read-fail-Eskalation
+# ---------------------------------------------------------------------------
+class _OrdersInfo:
+    """Info-Fake mit frontend_open_orders (+ optional raises für Read-Fail)."""
+    def __init__(self, orders=None, raises=None):
+        self._orders = orders
+        self._raises = raises
+        self.calls = 0
+
+    def frontend_open_orders(self, address):
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return self._orders
+
+
+def _stop(side, sz, coin="DOGE", reduce_only=True, otype="Stop Market"):
+    return {"coin": coin, "side": side, "sz": str(sz),
+            "reduceOnly": reduce_only, "orderType": otype}
+
+
+def test_covered_stop_size_side_aware_long():
+    """LONG-Position (position_is_long=True) wird nur von reduce-only SELL-Stops
+    (side 'A') gedeckt; ein falsch-seitiger BUY-Stop (side 'B') zählt NICHT."""
+    orders = [_stop("A", 5), _stop("B", 7)]  # 5 deckt LONG, 7 ist wrong-side
+    t = make_trader(info=_OrdersInfo(orders=orders))
+    assert t.covered_stop_size("DOGE", position_is_long=True) == 5.0
+    # SHORT würde umgekehrt nur die 7 zählen
+    assert t.covered_stop_size("DOGE", position_is_long=False) == 7.0
+    # None = alte Semantik: beide Seiten zählen
+    assert t.covered_stop_size("DOGE") == 12.0
+
+
+def test_covered_stop_size_ignores_non_stop_and_non_reduceonly():
+    orders = [
+        _stop("A", 5),
+        _stop("A", 9, reduce_only=False),       # kein reduce-only
+        _stop("A", 4, otype="Take Profit Market"),  # TP, kein stop
+        {"coin": "BTC", "side": "A", "sz": "99", "reduceOnly": True, "orderType": "Stop Market"},  # anderer coin
+    ]
+    t = make_trader(info=_OrdersInfo(orders=orders))
+    assert t.covered_stop_size("DOGE", position_is_long=True) == 5.0
+
+
+def test_covered_stop_size_read_fail_returns_inf_and_escalates():
+    """M-6: einzelner Read-Fehler → inf (fail-safe). Ab _COVERED_READ_ALERT_AT
+    Fehlern in Folge ESKALIERT der Wrapper (ERROR-Log)."""
+    info = _OrdersInfo(raises=RuntimeError("boom non-transient"))
+    t = make_trader(info=info)
+    import math
+    # 2x fail unter der Schwelle → noch WARNING, aber immer inf
+    assert math.isinf(t.covered_stop_size("DOGE", position_is_long=True))
+    assert math.isinf(t.covered_stop_size("DOGE", position_is_long=True))
+    assert t._covered_read_fails["DOGE"] == 2
+    # 3. fail → Schwelle erreicht (ERROR), weiterhin inf
+    assert math.isinf(t.covered_stop_size("DOGE", position_is_long=True))
+    assert t._covered_read_fails["DOGE"] == 3
+
+
+def test_covered_stop_size_success_resets_fail_counter():
+    """Nach einem erfolgreichen Read ist der Fehlerzähler für den Coin weg."""
+    info = _OrdersInfo(raises=RuntimeError("boom non-transient"))
+    t = make_trader(info=info)
+    t.covered_stop_size("DOGE", position_is_long=True)
+    assert t._covered_read_fails.get("DOGE") == 1
+    # jetzt liefert der Read Orders → Zähler reset
+    t.info = _OrdersInfo(orders=[_stop("A", 5)])
+    assert t.covered_stop_size("DOGE", position_is_long=True) == 5.0
+    assert "DOGE" not in t._covered_read_fails
+
+
+# ---------------------------------------------------------------------------
+# L-4 — _round_px: über 100k Integer-Preise erlauben
+# ---------------------------------------------------------------------------
+def test_round_px_above_100k_is_integer():
+    """BTC-SL bei 104237 darf NICHT auf den 10er gerundet werden (±5 Shift)."""
+    t = make_trader(sz={"BTC": 2})
+    assert t._round_px("BTC", 104237) == 104237.0
+    assert t._round_px("BTC", 104237.6) == 104238.0
+
+
+def test_round_px_below_100k_keeps_5sigfig_path():
+    """Unter 100k bleibt die 5-sig-fig + max-Dezimal-Regel aktiv (kein Regress)."""
+    t = make_trader(sz={"ADA": 3})
+    # 5 sig figs, max 3 dezimal: 0.34567 → 0.34567 →5g→ 0.34567 → round(,3)=0.346
+    assert t._round_px("ADA", 0.34567) == 0.346
+
+
+# ---------------------------------------------------------------------------
+# L-5 — auto_leverage: FLOOR statt round (nie über die safe-Schranke)
+# ---------------------------------------------------------------------------
+def test_auto_leverage_floors_not_rounds_up():
+    from app.sizing import auto_leverage
+    # safe_lev = 1/(sl_dist*liq_safety). Wähle Werte, die chosen=24.6 ergeben:
+    # sl_dist = 1/(safe*liq_safety). Mit liq_safety=2, conf=1.0 → chosen=safe.
+    # entry=100, stop_loss so dass sl_dist*1 = 1/safe → safe=24.6 → sl_dist=0.0203252
+    entry = 100.0
+    sl_dist = 1.0 / (24.6 * 2.0)      # → safe_lev 24.6 bei liq_safety=2
+    stop = entry * (1 - sl_dist)
+    lev, _ = auto_leverage(entry=entry, stop_loss=stop, confidence=1.0,
+                           liq_safety=2.0, max_cap=50)
+    # round(24.6)=25 (zu aggressiv) — floor muss 24 liefern
+    assert lev == 24
+
+
+def test_auto_leverage_min_one():
+    from app.sizing import auto_leverage
+    # Sehr weiter SL → safe_lev < 1 → floor 0, aber max(1,…) garantiert ≥1
+    lev, _ = auto_leverage(entry=100.0, stop_loss=50.0, confidence=1.0, liq_safety=2.0)
+    assert lev >= 1
+
+
+# ---------------------------------------------------------------------------
+# L-7 — _order: TypeError-Fallback droppt den builder NICHT mehr für
+#       beliebige TypeErrors (nur echter kwarg-Probe-Fall)
+# ---------------------------------------------------------------------------
+class _BuilderExchange:
+    """Exchange-Fake, das order()-kwargs aufzeichnet + steuerbare TypeErrors wirft.
+
+    reject_kwargs: Menge von kwarg-Namen, deren Anwesenheit einen
+    'unexpected keyword argument'-TypeError auslöst (simuliert eine alte SDK).
+    raise_internal: ein TypeError TIEF aus order() (KEIN kwarg-Problem)."""
+    def __init__(self, *, reject_kwargs=None, raise_internal=False):
+        self.reject_kwargs = set(reject_kwargs or [])
+        self.raise_internal = raise_internal
+        self.calls = []  # Liste der kwargs-dicts pro order()-Aufruf
+
+    def order(self, coin, is_buy, sz, px, otype, **kwargs):
+        self.calls.append(kwargs)
+        if self.raise_internal:
+            raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+        for k in self.reject_kwargs:
+            if k in kwargs:
+                raise TypeError(f"order() got an unexpected keyword argument '{k}'")
+        return _ok([{"resting": {"oid": 1}}])
+
+
+def test_order_internal_typeerror_does_not_drop_builder():
+    """L-7 Kern: ein NICHT-kwarg TypeError aus order() muss durchschlagen (raise),
+    NICHT still ohne builder neu senden."""
+    ex = _BuilderExchange(raise_internal=True)
+    t = make_trader(exchange=ex)
+    t.builder = {"b": "0x" + "a" * 40, "f": 50}
+    with pytest.raises(TypeError):
+        t._order("DOGE", True, 10, 0.1, {"limit": {"tif": "Gtc"}})
+    # nur EIN Versuch, KEIN builder-loser Re-Send
+    assert len(ex.calls) == 1
+
+
+def test_order_kwarg_probe_fallback_keeps_builder():
+    """Echter kwarg-Probe-Fall: SDK kennt cloid= nicht, builder= aber schon →
+    Fallback, und der builder bleibt erhalten (wird im Fallback wieder mitgegeben)."""
+    ex = _BuilderExchange(reject_kwargs={"cloid"})
+    t = make_trader(exchange=ex)
+    t.builder = {"b": "0x" + "a" * 40, "f": 50}
+    from app.hyperliquid_exec import Cloid
+    res = t._order("DOGE", True, 10, 0.1, {"limit": {"tif": "Gtc"}},
+                   cloid=Cloid.from_str("0x" + "1" * 32))
+    assert t._status_ok(res)
+    # 1. Call hatte cloid (warf), 2. Call (Fallback) MUSS builder weiterhin haben
+    assert "builder" in ex.calls[-1]
+    assert "cloid" not in ex.calls[-1]
+
+
+def test_order_old_sdk_without_builder_kwarg_falls_back_minimal():
+    """Ganz alte SDK ohne builder= UND ohne cloid=kwarg → minimaler Call ohne
+    builder (Fee in dieser SDK nicht setzbar), aber Order geht raus (kein Crash)."""
+    ex = _BuilderExchange(reject_kwargs={"builder", "cloid"})
+    t = make_trader(exchange=ex)
+    t.builder = {"b": "0x" + "a" * 40, "f": 50}
+    res = t._order("DOGE", True, 10, 0.1, {"limit": {"tif": "Gtc"}})
+    assert t._status_ok(res)
+    assert "builder" not in ex.calls[-1]
+
+
+# ---------------------------------------------------------------------------
+# M-17 — get_meta: prozessweiter Cache + Retry (nur EIN Read pro Netz)
+# ---------------------------------------------------------------------------
+def test_get_meta_caches_per_net(monkeypatch):
+    import app.hyperliquid_exec as hx
+
+    calls = {"n": 0}
+
+    class _FakeInfoMeta:
+        def meta(self):
+            calls["n"] += 1
+            return {"universe": [{"name": "BTC", "szDecimals": 2, "maxLeverage": 50}]}
+
+    # Cache + Singleton leeren, get_info auf den Fake umbiegen
+    hx._meta_cache.clear()
+    monkeypatch.setattr(hx, "get_info", lambda testnet: _FakeInfoMeta())
+    m1 = hx.get_meta(True)
+    m2 = hx.get_meta(True)
+    assert m1 is m2                 # gecacht (gleiches Objekt)
+    assert calls["n"] == 1          # nur EIN meta()-Read trotz 2 Aufrufen
+    hx._meta_cache.clear()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
