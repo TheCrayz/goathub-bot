@@ -1,0 +1,60 @@
+name: 💳 Payment-System Deploy + Member-Backfill
+
+# Manuell auslösbar (workflow_dispatch). Deployt das payment-system-Backend aus
+# dem (öffentlichen) GoatHubTest-Repo auf DENSELBEN Server wie der Bot und führt
+# einmalig den Member-Rollen-Backfill aus. Nutzt die vorhandenen Bot-Deploy-
+# Secrets (GOATHUB_DEPLOY_KEY/HOST) — der GitHub-Runner erreicht den Server per
+# SSH (anders als das lokale Netz). Berührt den Trading-Bot NICHT.
+on:
+  workflow_dispatch:
+    inputs:
+      run_backfill:
+        description: "Member-Rollen-Backfill nach dem Deploy ausführen?"
+        type: boolean
+        default: true
+
+jobs:
+  deploy-payments:
+    name: 🚀 Deploy payment-system + backfill
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 SSH — deploy + backfill
+        # gleiche gepinnte Action wie der Bot-Deploy (appleboy/ssh-action v1.0.3)
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
+        with:
+          host: ${{ vars.GOATHUB_HOST }}
+          username: root
+          key: ${{ secrets.GOATHUB_DEPLOY_KEY }}
+          command_timeout: 10m
+          script: |
+            set -eo pipefail
+            APP=/srv/goathub-payments
+
+            echo "📥 Cloning payment code (GoatHubTest ist public)..."
+            rm -rf /tmp/ghpay-src
+            git clone --depth 1 https://github.com/TheCrayz/GoatHubTest.git /tmp/ghpay-src
+
+            echo "📦 Updating $APP/backend (nur backend/ — .env/.venv/DB bleiben unangetastet)..."
+            cp -r /tmp/ghpay-src/payment-system/backend/* "$APP/backend/"
+            chown -R www-data:www-data "$APP/backend"
+
+            echo "🔑 Rollen-Konfig (ohne Werte zu zeigen):"
+            for k in DISCORD_ROLE_MEMBER DISCORD_ROLE_SUPPORTER; do
+              v=$(grep -E "^$k=" "$APP/.env" | cut -d= -f2- || true)
+              if [ -n "$v" ]; then echo "  $k: gesetzt"; else echo "  $k: LEER ⚠️"; fi
+            done
+
+            echo "🔄 Restart goathub-pay-api..."
+            systemctl restart goathub-pay-api
+            sleep 3
+            systemctl is-active goathub-pay-api
+
+            if [ "${{ inputs.run_backfill }}" = "true" ]; then
+              echo "⭐ Member-Rollen-Backfill (einmalig, idempotent)..."
+              cd "$APP"
+              sudo -u www-data "$APP/.venv/bin/python" -m backend.backfill_member_role
+            else
+              echo "↩︎ Backfill übersprungen (run_backfill=false)."
+            fi
+
+            echo "✅ Fertig."

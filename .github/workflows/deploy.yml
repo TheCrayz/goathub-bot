@@ -3,6 +3,11 @@ name: 🐐 Auto-Deploy GoatHub Bot
 on:
   push:
     branches: [main]
+    # Reine Workflow-/Doku-Änderungen lösen KEINEN Bot-Redeploy aus (kein
+    # unnötiger Restart eines live tradenden Bots).
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
   workflow_dispatch:
 
 jobs:
