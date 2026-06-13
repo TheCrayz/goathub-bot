@@ -639,6 +639,40 @@ def discord_login():
     return response
 
 
+def _resolve_discord_user(db, discord_id: str, username: str, avatar: str):
+    """Find-or-create the User row for a Discord identity and return the
+    primitives needed to mint a JWT: (uid, token_version, identity).
+
+    2026-06-13 fastapi-patterns #1: läuft KOMPLETT off-loop (Aufruf via
+    asyncio.to_thread im async discord_callback). Vorher liefen db.query/
+    commit/refresh direkt im async-Handler → blockierten den Event-Loop
+    (das Sync-DB-in-async-Route-Anti-Pattern). ALLE DB-Reads (auch die nach
+    dem commit() durch expire_on_commit=True ausgelösten Lazy-Loads von u.id/
+    Identity) passieren hier im Thread, deshalb geben wir nur fertige
+    Primitives zurück — der Caller fasst die Session danach nicht mehr an."""
+    u = db.query(User).filter(User.discord_id == discord_id).first()
+    if not u:
+        u = User(
+            email=f"discord_{discord_id}@goathub.internal",
+            password_hash="",
+            discord_id=discord_id,
+            discord_username=username,
+            discord_avatar=avatar,
+            risk_pct=config.DEFAULT_RISK_PCT,
+            leverage=config.DEFAULT_LEVERAGE,
+            max_open_positions=config.DEFAULT_MAX_OPEN,
+        )
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    else:
+        # Update discord info
+        u.discord_username = username
+        u.discord_avatar = avatar
+        db.commit()
+    return u.id, int(getattr(u, "token_version", 0) or 0), _user_identity(u)
+
+
 @app.get("/auth/callback")
 async def discord_callback(request: Request, code: str = None, state: str = None, error: str = None, db: Session = Depends(get_db)):
     """Handle Discord OAuth callback — mit CSRF-state-Check (Phase 1)."""
@@ -684,29 +718,11 @@ async def discord_callback(request: Request, code: str = None, state: str = None
                 discord_id, username,
             )
 
-        # Find or create user by discord_id
-        u = db.query(User).filter(User.discord_id == discord_id).first()
-        if not u:
-            u = User(
-                email=f"discord_{discord_id}@goathub.internal",
-                password_hash="",
-                discord_id=discord_id,
-                discord_username=username,
-                discord_avatar=avatar,
-                risk_pct=config.DEFAULT_RISK_PCT,
-                leverage=config.DEFAULT_LEVERAGE,
-                max_open_positions=config.DEFAULT_MAX_OPEN,
-            )
-            db.add(u)
-            db.commit()
-            db.refresh(u)
-        else:
-            # Update discord info
-            u.discord_username = username
-            u.discord_avatar = avatar
-            db.commit()
+        # Find or create user by discord_id — off-loop (sync DB in async route).
+        uid, token_version, identity = await asyncio.to_thread(
+            _resolve_discord_user, db, discord_id, username, avatar)
 
-        jwt_token = make_token(u.id, getattr(u, "token_version", 0), _user_identity(u))
+        jwt_token = make_token(uid, token_version, identity)
         # Phase 2 #18 (2026-06-02): Session-Cookie (httpOnly) ist DER Auth-Weg.
         # 2026-06-12 #20/#31: das Legacy-URL-Fragment (/#token=…) ist raus.
         # Das Dashboard-JS verwirft das Fragment seit Phase 2 ohnehin — übrig
