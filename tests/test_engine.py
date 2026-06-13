@@ -459,8 +459,18 @@ class StubTrader:
         return {"sl_ok": True, "sl": {"status": "ok"}, "tp": [], "skip_reason": None}
 
     def close_position(self, coin):
+        # 2026-06-13 Audit C-1/C-4: neue Return-Form inkl. still_open.
         self.calls.append(("close_position", coin))
-        return {"ok": True, "closed": abs(self.pos)}
+        return {"ok": True, "closed": abs(self.pos), "still_open": 0.0}
+
+    # 2026-06-13 Audit C-4/H-1: Agent-A-Schnittstellen, die der Watcher/Engine nutzt.
+    def order_status(self, oid=None, cloid=None):
+        # Default: die ganze (Stub-)Position gilt als von DIESEM Entry gefüllt.
+        return {"status": "filled", "filled_sz": abs(self.pos), "raw": {}}
+
+    def cancel_order_oid(self, coin, oid):
+        self.calls.append(("cancel_order_oid", coin, oid))
+        return {"ok": True, "already_filled": False, "raw": {}}
 
     def account_value(self):
         return 10_000.0
@@ -476,6 +486,9 @@ class StubTrader:
 
     def covered_stop_size(self, coin):
         return float("inf")
+
+    def _round_sz(self, coin, sz):
+        return sz
 
 
 def _async_return(value):
@@ -570,7 +583,7 @@ def test_startup_rearm_resting_watcher():
     stub = StubTrader(pos=0.0)   # Order hat während der Downtime NICHT gefüllt
     spawned = []
 
-    def fake_watcher(trader, user_id, sig, is_buy, tps, resting_oid=None):
+    def fake_watcher(trader, user_id, sig, is_buy, tps, resting_oid=None, entry_cloid=None):
         spawned.append({"user_id": user_id, "sl": sig.stop_loss, "is_buy": is_buy,
                         "tps": tps, "resting_oid": resting_oid})
         async def _noop():
@@ -655,7 +668,10 @@ def test_sl_only_update_preserves_tps():
 
     stub = StubTrader(pos=1.0)
     orig_mark = engine._get_mark
-    engine._get_mark = lambda coin: 0.0   # Preflight neutralisieren (kein HL-Call)
+    # 2026-06-13 Audit H-13: mark==0 ist jetzt ein "refuse" (Read-Fail), kein
+    # "Preflight skippen". Gültiger Mark, der den would-trigger-Check besteht
+    # (LONG braucht SL < mark: 1850 < 1950).
+    engine._get_mark = lambda coin: 1950.0
     try:
         sig = Signal(signal_id="s2", ticker="ETH/USDT", action="UPDATE_TRADE", direction="LONG",
                      entry=None, stop_loss=1850.0, take_profits=[])
@@ -713,7 +729,10 @@ def test_throttle_exempts_updates_blocks_new():
     engine._record_trade_ts(1, "ETH")
 
     orig_build, orig_mark = engine._build_trader, engine._get_mark
-    engine._get_mark = lambda coin: 0.0
+    # 2026-06-13 Audit H-13: gültiger Mark (LONG SL 1850 < mark 1950) statt 0
+    # (0 ist jetzt "refuse"). Der NEW_TRADE-Teil unten wird vor dem Mark-Read
+    # gedrosselt, ihn berührt der Mark nicht.
+    engine._get_mark = lambda coin: 1950.0
     try:
         # a) UPDATE_TRADE im Intervall → MUSS durchgehen
         stub_u = StubTrader(pos=2.0)

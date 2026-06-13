@@ -39,6 +39,35 @@ def _backfill_enabled():
     return str(os.getenv("SIGNAL_BACKFILL", "true")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _alert(text):
+    """H-14 (2026-06-13): Discord-Alert über engine._post_alert (Webhook).
+    Lazy-Import, damit das Listener-Modul ohne die volle Engine/HL-Kette
+    importierbar bleibt (gleiche Praxis wie sync.py). Best-effort: jeder Fehler
+    im Alert-Pfad darf den Listener NIE umbringen."""
+    try:
+        from app.engine import _post_alert
+        _post_alert(text)
+    except Exception as e:
+        log.warning("alert dispatch failed: %s", e)
+
+
+async def _resolve_signals_channel(client):
+    """H-14: Den #signals-Channel auflösen — erst get_channel (Cache), dann
+    fetch_channel (REST). Returnt das Channel-Objekt oder None, wenn BEIDE
+    fehlschlagen. Fehler werden geschluckt; None ist das Signal für 'tot'."""
+    try:
+        ch = client.get_channel(config.SIGNALS_CHANNEL_ID)
+        if ch is not None:
+            return ch
+    except Exception as e:
+        log.warning("get_channel(%s) fehlgeschlagen: %s", config.SIGNALS_CHANNEL_ID, e)
+    try:
+        return await client.fetch_channel(config.SIGNALS_CHANNEL_ID)
+    except Exception as e:
+        log.warning("fetch_channel(%s) fehlgeschlagen: %s", config.SIGNALS_CHANNEL_ID, e)
+        return None
+
+
 def _embed_to_dict(embed):
     return {"title": embed.title or "",
             "description": embed.description or "",
@@ -100,14 +129,32 @@ async def start_listener():
                 backoff = _INITIAL_BACKOFF_S
                 is_reconnect = had_session
                 had_session = True
+                # H-14 (2026-06-13): den #signals-Channel SCHON beim ERSTEN Connect
+                # auflösen. Ein toter/falscher SIGNALS_CHANNEL_ID lässt get_channel
+                # (und fetch_channel) None liefern: on_message matcht dann NIE
+                # (filtert nach channel.id) → der Listener hängt "grün" am Gateway
+                # und empfängt SCHWEIGEND null Signale = stiller Totalausfall. Hier
+                # einmal pro Connect prüfen und bei beidseitigem Fehlschlag laut
+                # alerten (vorher wurde der Channel nur im Reconnect-Backfill-Zweig
+                # angefasst — ein Erst-Connect auf einen toten Channel blieb stumm).
+                channel = await _resolve_signals_channel(client)
+                if channel is None:
+                    msg = (f"Discord signals channel {config.SIGNALS_CHANNEL_ID} could not be "
+                           f"resolved (get_channel and fetch_channel both failed): bot is "
+                           f"connected but will receive NO signals — silent trading outage. "
+                           f"Check SIGNALS_CHANNEL_ID, bot guild membership and channel "
+                           f"permissions.")
+                    log.error(msg)
+                    _alert(f"🚨 {msg}")
+                    return
                 # M-7: ohne gesehene Message die letzte Channel-Message als
                 # Anker nehmen (cached im READY-Payload, kein API-Call) — sonst
                 # hätte ein Reconnect nach stiller Erst-Session keinen Anker.
+                # H-14: Channel ist oben schon aufgelöst — wiederverwenden.
                 if last_seen_id is None:
                     try:
-                        ch = client.get_channel(config.SIGNALS_CHANNEL_ID)
-                        if ch is not None and getattr(ch, "last_message_id", None):
-                            last_seen_id = ch.last_message_id
+                        if getattr(channel, "last_message_id", None):
+                            last_seen_id = channel.last_message_id
                     except Exception as e:
                         log.warning("Backfill-Anker-Init fehlgeschlagen: %s", e)
                 # M-7: Reconnect (inkl. discord.py-internem Re-Identify) →
@@ -115,9 +162,6 @@ async def start_listener():
                 if not (is_reconnect and _backfill_enabled() and last_seen_id is not None):
                     return
                 try:
-                    channel = client.get_channel(config.SIGNALS_CHANNEL_ID)
-                    if channel is None:
-                        channel = await client.fetch_channel(config.SIGNALS_CHANNEL_ID)
                     n, newest = await _backfill_missed(channel, discord.Object(id=last_seen_id))
                     if newest is not None:
                         last_seen_id = max(last_seen_id, newest)

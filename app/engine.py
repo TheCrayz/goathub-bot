@@ -28,6 +28,14 @@ _percoin_cache: dict = {}
 
 log = logging.getLogger("goathub.engine")
 
+
+def _f(x, d=0.0):
+    """Float-Coercion am Boundary (HL-Responses, Decimal-Spalten). None/Garbage → d."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return d
+
 # 2026-06-08 Mainnet-Hardening A1/A2: Rate-Counter + Alert-Throttle.
 # In-Memory (lost on restart, OK — counters reset = fail-open, safer than
 # false-block; emergency-halt-flag persistent in file).
@@ -165,6 +173,40 @@ def _spawn(coro):
     t.add_done_callback(_on_done)
     return t
 
+
+async def drain_tasks(timeout: float = 10.0):
+    """H-4 (2026-06-13): alle laufenden Trade-Tasks + Fill-Watcher beim Shutdown
+    sauber cancellen UND awaiten. Agent D ruft das im lifespan-Teardown VOR dem
+    Prozess-Exit (nachdem der Halt-Flag gesetzt + der Listener gestoppt ist),
+    damit ein Deploy keinen Trade-Task mitten im Fenster zwischen Entry-Ack und
+    _save_managed killt (row-less naked-Order-Klasse).
+
+    Vorgehen: erst die Watcher canceln (sie schlafen meist im Poll), dann alle
+    _tasks; danach mit Timeout auf Beendigung warten. Best-effort — ein nicht
+    fertig werdender Task blockiert den Shutdown nur bis `timeout`.
+
+    Returns: Anzahl der Tasks, auf die gewartet wurde.
+    """
+    # Watcher-Tasks zuerst gezielt canceln (gehören auch zu _tasks, doppelt
+    # cancel ist harmlos).
+    for t in list(_fill_watchers.values()):
+        if not t.done():
+            t.cancel()
+    pending = [t for t in list(_tasks) if not t.done()]
+    for t in pending:
+        t.cancel()
+    if not pending:
+        return 0
+    try:
+        await asyncio.wait(pending, timeout=timeout)
+    except Exception as e:
+        log.warning("drain_tasks wait failed: %s", e)
+    still = [t for t in pending if not t.done()]
+    if still:
+        log.warning("drain_tasks: %d task(s) did not finish within %.1fs", len(still), timeout)
+    return len(pending)
+
+
 # Ein Lock pro (user_id, coin) -> verhindert Doppel-Position bei schnellen/doppelten Signalen
 _locks = {}
 
@@ -277,7 +319,12 @@ def _log_activity(user_id, kind, text):
         _post_alert(f"🚨 [user {user_id}] {text}", key=throttle_key)
 
 
-def _save_managed(user_id, coin, sig, status, resting_oid=None):
+def _save_managed(user_id, coin, sig, status, resting_oid=None,
+                  entry_oid=None, entry_cloid=None, bot_filled_sz=None):
+    # 2026-06-13 Audit C-4: entry_oid/entry_cloid/bot_filled_sz mitspeichern
+    # (Ownership-Attribution). Alle drei sind None-tolerant: None = "diesen Wert
+    # NICHT anfassen" (bestehende Spalte bleibt), damit z.B. ein SL-Update nicht
+    # die beim Entry gespeicherte bot_filled_sz auf 0 zurücksetzt.
     db = SessionLocal()
     try:
         mt = (db.query(ManagedTrade)
@@ -302,6 +349,13 @@ def _save_managed(user_id, coin, sig, status, resting_oid=None):
         mt.status = status
         if resting_oid is not None:
             mt.resting_oid = str(resting_oid)
+        # 2026-06-13 Audit C-4: Bot-Ownership-Felder.
+        if entry_oid is not None:
+            mt.entry_oid = str(entry_oid)
+        if entry_cloid is not None:
+            mt.entry_cloid = str(entry_cloid)
+        if bot_filled_sz is not None:
+            mt.bot_filled_sz = bot_filled_sz
         if sig.signal_id:
             mt.signal_id = sig.signal_id
         db.commit()
@@ -323,6 +377,34 @@ def _close_managed(user_id, coin):
         log.warning("close managed: %s", e)
     finally:
         db.close()
+
+
+def _close_superseded_resting(user_id, coin):
+    """H-3 (2026-06-13): eine durch ein neues NEW_TRADE überholte, noch
+    'resting' Row (deren Bot-Entry-Order gerade gecancelt wurde) sauber
+    schließen UND ihren Dedup-Mark freigeben — sonst bliebe eine Zombie-Row
+    (tote oid, kein Watcher) liegen, die der sync-Loop später auf 'open' flippt
+    (H-2). Nur 'resting'-Rows; eine 'open'-Row (live Position) NICHT anfassen."""
+    db = SessionLocal()
+    old_signal_ids = []
+    try:
+        rows = (db.query(ManagedTrade)
+                .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                        ManagedTrade.status == "resting").all())
+        for mt in rows:
+            if mt.signal_id:
+                old_signal_ids.append(mt.signal_id)
+            mt.status = "closed"
+        db.commit()
+    except Exception as e:
+        log.warning("close superseded resting failed user=%s coin=%s: %s", user_id, coin, e)
+        db.rollback()
+    finally:
+        db.close()
+    # Dedup der alten Generation freigeben (außerhalb der obigen Session, eigener
+    # commit) — ein Re-Emit des ALTEN signal_id bleibt dann handelbar.
+    for sid in old_signal_ids:
+        _unmark_signal_done(user_id, sid)
 
 
 def _signal_already_done(user_id, signal_id):
@@ -402,6 +484,139 @@ def _load_protection_params(user_id, coin):
         return (sl, tps)
     finally:
         db.close()
+
+
+def _load_bot_ownership(user_id, coin):
+    """2026-06-13 Audit C-4: liest die Bot-Attribution des letzten offenen
+    managed_trade für (user, coin).
+
+    Returns dict {entry_oid, entry_cloid, bot_filled_sz, known}:
+      - entry_oid/entry_cloid: str|None — die vom Bot platzierte Entry-Order.
+      - bot_filled_sz: float — vom Bot gefüllte Größe (>=0).
+      - known: bool — True nur wenn die Row die NEUEN Ownership-Spalten gesetzt
+        hat (bot_filled_sz IS NOT NULL). False = Pre-Ownership-Row (vor dieser
+        Änderung angelegt) ODER keine Row → Caller MUSS konservativ fallback'en
+        (nie fremde Orders/Größe zerstören).
+    """
+    db = SessionLocal()
+    try:
+        mt = (db.query(ManagedTrade)
+              .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                      ManagedTrade.status != "closed")
+              .order_by(ManagedTrade.id.desc()).first())
+        if mt is None:
+            return {"entry_oid": None, "entry_cloid": None, "bot_filled_sz": 0.0, "known": False}
+        bfs = getattr(mt, "bot_filled_sz", None)
+        known = bfs is not None
+        try:
+            bot_sz = float(bfs) if bfs is not None else 0.0
+        except (TypeError, ValueError):
+            bot_sz = 0.0
+        return {
+            "entry_oid": mt.entry_oid or mt.resting_oid,   # entry_oid bevorzugt, sonst alte resting_oid
+            "entry_cloid": getattr(mt, "entry_cloid", None),
+            "bot_filled_sz": bot_sz,
+            "known": known,
+        }
+    except Exception as e:
+        # Konservativ: bei DB-Fehler "unbekannt" → Caller fällt auf den
+        # sicheren Alt-Pfad (nichts Fremdes anfassen).
+        log.warning("load bot ownership failed user=%s coin=%s: %s", user_id, coin, e)
+        return {"entry_oid": None, "entry_cloid": None, "bot_filled_sz": 0.0, "known": False}
+    finally:
+        db.close()
+
+
+def _has_open_bot_row(user_id, coin):
+    """2026-06-13 Audit C-4/L-3: existiert eine nicht-geschlossene managed_trade-
+    Row für (user, coin)? Dient als Gate für den Legacy-cancel_orders-Sweep —
+    ohne Bot-Row gibt es nichts von uns zu canceln, also keine fremden Orders
+    anfassen."""
+    db = SessionLocal()
+    try:
+        return (db.query(ManagedTrade)
+                .filter(ManagedTrade.user_id == user_id, ManagedTrade.coin == coin,
+                        ManagedTrade.status != "closed").first() is not None)
+    except Exception as e:
+        log.warning("has open bot row check failed user=%s coin=%s: %s", user_id, coin, e)
+        return False
+    finally:
+        db.close()
+
+
+def _close_succeeded(close_res):
+    """2026-06-13 Audit C-1/C-4: close_position liefert nach C-1 jetzt
+    {"ok":bool, "closed":float, "still_open":float, ...}. Erfolg = ok==True UND
+    (still_open fehlt ODER ≈0). Vorher reichte top-level ok — ein IoC-Close, der
+    in einem gappenden Markt NICHT matchte, meldete ok aber ließ die Position
+    offen. still_open ist die autoritative Prüfung.
+
+    Rückwärtskompatibel: hat das dict (noch) kein still_open (alte close_position-
+    Version / Agent A noch nicht gemerged), zählt ok allein."""
+    if not isinstance(close_res, dict):
+        return False
+    if not close_res.get("ok"):
+        return False
+    still = close_res.get("still_open")
+    if still is None:
+        return True   # alte Form ohne still_open → ok allein
+    try:
+        return abs(float(still)) < 1e-12 or abs(float(still)) <= 1e-9
+    except (TypeError, ValueError):
+        return True
+
+
+def _close_fail_detail(close_res):
+    """Kurzer Fehlertext aus einem close_position-Resultat für Alerts/Activity."""
+    if not isinstance(close_res, dict):
+        return str(close_res)[:120]
+    still = close_res.get("still_open")
+    base = str(close_res.get("error") or close_res.get("raw") or "")[:120]
+    if still is not None:
+        try:
+            if abs(float(still)) > 1e-9:
+                return f"still_open={still} (close did not fully fill); {base}"[:160]
+        except (TypeError, ValueError):
+            pass
+    return base
+
+
+async def _cancel_bot_entry(trader, coin, entry_oid):
+    """2026-06-13 Audit C-4 / L-3: NUR die Bot-Entry-Order (per oid) canceln,
+    nie pauschal alle Orders des Coins (das löschte manuelle User-Orders).
+    Kennen wir keine oid (Pre-Ownership-Row ohne resting_oid, oder sofort-fill
+    ohne Rest-Order), passiert NICHTS — fail-safe, kein Sweep. cancel_order_oid
+    (Agent A) schluckt 'already filled' selbst."""
+    if not entry_oid:
+        return
+    try:
+        # Agent A: cancel_order_oid(coin, oid) -> {"ok", "already_filled", "raw"}
+        await asyncio.to_thread(trader.cancel_order_oid, coin, entry_oid)
+    except AttributeError:
+        # Fallback falls cancel_order_oid (Agent A) noch nicht gemerged ist:
+        # cancel_order(coin, oid) existiert bereits und ist ebenfalls oid-gezielt.
+        try:
+            await asyncio.to_thread(trader.cancel_order, coin, entry_oid)
+        except Exception as e:
+            log.warning("cancel_bot_entry fallback failed coin=%s oid=%s: %s", coin, entry_oid, e)
+    except Exception as e:
+        log.warning("cancel_bot_entry failed coin=%s oid=%s: %s", coin, entry_oid, e)
+
+
+def _bot_managed_size(pos, ownership):
+    """2026-06-13 Audit C-4: wie viel der LIVE-Position (abs(pos)) der Bot
+    managen/market-closen darf.
+
+    - Row kennt Ownership (known=True): min(bot_filled_sz, abs(pos)). Liegt die
+      Live-Position ÜBER bot_filled_sz, gehört der Überschuss dem User (manuell
+      dazu-getradet) → in Ruhe lassen.
+    - Pre-Ownership-Row (known=False): konservativer Fallback = abs(pos) (alte
+      Logik), ABER der Caller cancelt Orders nur gezielt per oid, nie pauschal.
+    """
+    live = abs(float(pos or 0))
+    if ownership.get("known"):
+        return max(0.0, min(float(ownership.get("bot_filled_sz") or 0.0), live))
+    return live
 
 
 def _builder():
@@ -729,11 +944,34 @@ async def _open_or_update(user_id, sig, action_type="NEW_TRADE"):
                     _log_activity(user_id, "skip",
                                   f"{coin}: trade-interval throttle active (min {config.MIN_TRADE_INTERVAL_S}s), skip.")
                     return
-                # 2026-06-12 (Review #6): alten Fill-Watcher VOR cancel_orders beenden,
+                # 2026-06-12 (Review #6): alten Fill-Watcher VOR dem Cancel beenden,
                 # sonst hält er den Fill des NEUEN Entries für seinen und setzt
                 # SL/TP des alten Signals.
                 _cancel_fill_watcher(user_id, coin)
-                await asyncio.to_thread(trader.cancel_orders, coin)   # evtl. alte Ruhe-Order weg
+                # 2026-06-13 Audit C-4 / H-3 / L-3: NUR die alte Bot-Entry-Order
+                # (per oid) canceln statt cancel_orders(coin) — letzteres löschte
+                # auch manuelle ruhende Orders des Users.
+                #   - tracked oid vorhanden  → gezielt diese eine Order canceln.
+                #   - keine oid, aber eine bestehende (Pre-Ownership-)Bot-Row für
+                #     den Coin → Fallback auf den alten Sweep (Legacy-Verhalten,
+                #     reiner Bot-Account angenommen).
+                #   - GAR keine Bot-Row → NICHTS canceln (fail-safe: keine
+                #     manuellen Orders anfassen, es gibt nichts von uns).
+                _old_own = _load_bot_ownership(user_id, coin)
+                _old_oid = _old_own.get("entry_oid")
+                if _old_oid:
+                    await _cancel_bot_entry(trader, coin, _old_oid)
+                elif _has_open_bot_row(user_id, coin):
+                    await asyncio.to_thread(trader.cancel_orders, coin)
+                # H-3 (2026-06-13): die superseded resting-Row JETZT sauber schließen
+                # (ihre Order ist gerade gecancelt). Vorher cancelte dieser Pfad die
+                # alte Order, lief dann in _open_new — skippte dort ein Gate
+                # (per-coin-Filter/Margin/min-notional/set_leverage), kam die Row als
+                # ZOMBIE 'resting' (tote oid, kein Watcher) zurück und der sync-Loop
+                # flippte sie später fälschlich auf 'open' (H-2). Schließen + Dedup
+                # der ALTEN Generation freigeben; _open_new legt bei Erfolg eine
+                # frische Row an.
+                _close_superseded_resting(user_id, coin)
                 await _open_new(trader, u, sig)           # NEW_TRADE: frisch eröffnen
         except InvalidToken:
             # Audit M-4 (2026-06-12): falscher ENCRYPTION_KEY / korrupter
@@ -935,6 +1173,47 @@ async def _open_new(trader, u, sig):
         _log_activity(u.id, "skip", f"{coin}: notional {plan.notional:.2f} < {config.MIN_NOTIONAL_USDC}")
         return
 
+    # H-16 (2026-06-13): absoluter Notional-Cap pro Trade. risk%×eff und
+    # eff×leverage bounden NUR die aggregierte/relative Exposure; ein
+    # tight-SL + high-confidence Signal kann trotzdem nahe Asset-Max hebeln
+    # und EINE Position = balance×asset_max aufmachen. Cap aus config
+    # (Agent D legt MAX_NOTIONAL_PER_TRADE an); 0/None = aus. Über dem Cap:
+    # SKIPPEN (sicherer als kürzen — gekürzt würde die Risk-Mathe/SL-Distanz
+    # nicht mehr zur Größe passen) + Activity.
+    cap_notional = getattr(config, "MAX_NOTIONAL_PER_TRADE", 50000)
+    try:
+        cap_notional = float(cap_notional or 0)
+    except (TypeError, ValueError):
+        cap_notional = 0.0
+    if cap_notional > 0 and plan.notional > cap_notional:
+        _log_activity(
+            u.id, "skip",
+            f"{coin}: position notional ${plan.notional:.0f} exceeds per-trade cap "
+            f"${cap_notional:.0f} (MAX_NOTIONAL_PER_TRADE) — NEW_TRADE skipped (not trimmed).")
+        return
+
+    # H-9 (2026-06-13): min-Notional wurde bisher NUR auf plan.notional (vor dem
+    # Rounding) geprüft. place_entry rundet die Menge per _round_sz (Agent A
+    # floor't auf szDecimals) — eine ab-gerundete Menge kann unter den HL-Min-
+    # Notional fallen (oder auf 0 runden) → HL-Reject als generischer
+    # "Entry-Fehler". Hier die GE-rundete Menge bestimmen und Notional/Menge
+    # erneut prüfen, bevor wir set_leverage/place_entry feuern.
+    try:
+        rounded_qty = float(trader._round_sz(coin, plan.qty))
+    except Exception:
+        rounded_qty = float(plan.qty)
+    if rounded_qty <= 0:
+        _log_activity(u.id, "skip",
+                      f"{coin}: qty rounds to 0 at this price (size step) — NEW_TRADE skipped.")
+        return
+    rounded_notional = rounded_qty * float(sig.entry)
+    if rounded_notional < config.MIN_NOTIONAL_USDC:
+        _log_activity(
+            u.id, "skip",
+            f"{coin}: notional after size-rounding {rounded_notional:.2f} "
+            f"< {config.MIN_NOTIONAL_USDC} — NEW_TRADE skipped clean.")
+        return
+
     is_buy = (direction == "LONG")
     tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
     # 2026-06-12 (Review #17): set_leverage-Resultat prüfen. hyperliquid_exec
@@ -953,23 +1232,45 @@ async def _open_new(trader, u, sig):
         _log_activity(u.id, "error", f"Entry error {coin}: {entry.get('error')}")
         return
 
-    # C3 (2026-06-09): Order ist platziert (filled ODER resting) → signal_id als
-    # ausgeführt markieren, damit ein Replay (z.B. nach Restart) nicht doppelt
-    # öffnet. Geskippte Signale (Margin/Filter, oben) bleiben retry-bar.
-    _mark_signal_done(u.id, sig.signal_id)
-    # Audit M-5 (2026-06-12): Trade-Interval-Fenster erst JETZT starten — der
-    # Entry ist wirklich platziert. Skips/Fails oben verbrauchen das Fenster
-    # nicht mehr (ein korrigiertes Re-Emit bleibt handelbar).
-    _record_trade_ts(u.id, coin)
-    # H-6 (2026-06-12): Stale-Sync-Strikes für diesen Coin löschen — die neue
-    # Position kann die managed_trade-Row wiederverwenden; ein getragener Strike
-    # der alten Generation darf die neue Live-Position nicht auf 'closed' flippen.
+    # 2026-06-13 Audit C-4: Bot-Ownership der gerade platzierten Entry-Order.
+    # entry_oid = ruhende oid (resting) ODER bei sofort-fill None (keine Rest-
+    # order); entry_cloid = client-id (Agent A gibt sie optional im Result
+    # zurück; fehlt sie, bleibt None → Watcher pollt per oid). Wird in JEDEN
+    # _save_managed-Aufruf unten gereicht.
+    entry_oid = entry.get("resting_oid")
+    entry_cloid = entry.get("entry_cloid") or entry.get("cloid")
+
+    # H-4 (2026-06-13): Reihenfolge GEHÄRTET gegen Crash zwischen Entry-Ack und
+    # Row-Save. Vorher wurde _mark_signal_done VOR dem _save_managed gesetzt —
+    # ein Crash dazwischen ließ die Order ohne Row zurück (naked-fill-Klasse,
+    # Reconciler findet keine SL-Params) UND verbrannte das signal_id dauerhaft
+    # (Re-Emit blockiert). Jetzt: ERST die Row schreiben (status + entry_oid/
+    # cloid), DANN markieren/stempeln. clear_strikes (H-6) ebenfalls erst nach
+    # dem Save, damit eine evtl. wiederverwendete Row konsistent ist.
     from app.sync import clear_strikes
-    clear_strikes(u.id, coin)
 
     if entry["filled"]:
+        # 2026-06-13 Audit C-4 + H-1: bot_filled_sz aus der Entry-Antwort (was
+        # DIESE Order füllte) — NICHT aus position_size (enthält manuelle Pos).
         sz = entry["filled_sz"] or plan.qty
-        prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, sz, sig.stop_loss, tps)
+        # H-4: Row + Ownership SCHREIBEN, bevor wir protecten — bei Crash in
+        # place_protection existiert dann eine open-Row mit SL-Params, die der
+        # Coverage-Reconciler aufgreifen kann (statt naked-ohne-Row).
+        _save_managed(u.id, coin, sig, status="open",
+                      entry_oid=entry_oid, entry_cloid=entry_cloid, bot_filled_sz=sz)
+        _mark_signal_done(u.id, sig.signal_id)
+        _record_trade_ts(u.id, coin)
+        clear_strikes(u.id, coin)
+        # H-5 (2026-06-13): place_protection in try/except. hl_retry kann nach
+        # erschöpften/nicht-transienten Versuchen RAISEN statt sl_ok=False zu
+        # liefern — das umging bisher JEDEN Notfallpfad (nur der sl_ok=False-
+        # Return war behandelt). Eine Exception wird hier in DENSELBEN Fail-Pfad
+        # geroutet wie sl_ok=False (prot = synthetisches sl_ok-False-dict).
+        try:
+            prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, sz, sig.stop_loss, tps)
+        except Exception as e:
+            log.error("place_protection raised (new) user=%s coin=%s: %s", u.id, coin, e)
+            prot = {"sl_ok": False, "sl": f"exception: {str(e)[:200]}", "skip_reason": None}
         if not prot.get("sl_ok"):
             # SL konnte NICHT gesetzt werden -> keine ungeschützte Position riskieren -> sofort schließen
             # 2026-06-05 diag: log die ECHTE HL-Antwort
@@ -984,33 +1285,49 @@ async def _open_new(trader, u, sig):
             # 2026-06-12 (Review #4): close_position-Resultat prüfen. Vorher wurde
             # bei fehlgeschlagenem Market-Close trotzdem "Position geschlossen"
             # geloggt — niemand hat die offene, UNGESCHÜTZTE Position untersucht.
+            # 2026-06-13 Audit C-4 + C-1: close_position liefert jetzt
+            # {ok, closed, still_open, ...}. _close_ok prüft ok UND still_open≈0.
             close_res = await asyncio.to_thread(trader.close_position, coin)
-            if not close_res.get("ok"):
+            if not _close_succeeded(close_res):
                 # Row mit SL-Params offen halten, damit der Coverage-Reconciler
                 # (sync-Loop) den Schutz nachlegen kann.
                 _save_managed(u.id, coin, sig, status="open")
                 msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
                        f"{coin}: SL after entry failed AND market-close failed "
-                       f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
+                       f"({_close_fail_detail(close_res)}). "
                        f"Check manually immediately. HL (SL): {err_detail[:120]}")
                 # Audit H-A (2026-06-12): UNGETHROTTLEDER Alert (key=None) — dieser
                 # Fall darf NIE im (user,coin)-Throttle untergehen.
                 _post_alert(f"🚨 [user {u.id}] {msg}", key=None)
                 _log_activity(u.id, "error", msg)
                 return
-            await asyncio.to_thread(trader.cancel_orders, coin)
+            # 2026-06-13 Audit C-4 / L-3: nur die Bot-Entry-Order gezielt
+            # wegräumen statt pauschal cancel_orders (das löschte manuelle Orders
+            # des Users). Nach erfolgreichem close ist die Position flat — ein evtl.
+            # ruhender Bot-Entry-Rest wird per oid gecancelt; manuelle Orders bleiben.
+            await _cancel_bot_entry(trader, coin, entry_oid)
+            _close_managed(u.id, coin)
             _log_activity(u.id, "error",
                           f"{coin}: SL after entry failed — position closed. "
                           f"HL response: {err_detail[:180]}")
             return
         _log_activity(u.id, "order", f"{sig.direction} {coin} opened (qty {sz:.6g}), SL+TP set")
-        _save_managed(u.id, coin, sig, status="open")
+        # bot_filled_sz erneut sichern (idempotent — der Wert ist bereits gesetzt).
+        _save_managed(u.id, coin, sig, status="open",
+                      entry_oid=entry_oid, entry_cloid=entry_cloid, bot_filled_sz=sz)
     else:
+        # H-4: resting-Row inkl. entry_oid/cloid SCHREIBEN, bot_filled_sz=0
+        # (noch nichts gefüllt). Erst danach markieren/Watcher.
+        _save_managed(u.id, coin, sig, status="resting", resting_oid=entry_oid,
+                      entry_oid=entry_oid, entry_cloid=entry_cloid, bot_filled_sz=0)
+        _mark_signal_done(u.id, sig.signal_id)
+        _record_trade_ts(u.id, coin)
+        clear_strikes(u.id, coin)
         _log_activity(u.id, "order", f"{sig.direction} {coin}: limit resting @ {sig.entry}, waiting for fill")
-        _save_managed(u.id, coin, sig, status="resting", resting_oid=entry.get("resting_oid"))
         # 2026-06-12 (Review #6): Watcher registrieren, damit ein späteres Signal/
         # CANCEL ihn gezielt beenden kann (genau einer pro user+coin).
-        t = _spawn(_protect_when_filled(trader, u.id, sig, is_buy, tps, entry.get("resting_oid")))
+        t = _spawn(_protect_when_filled(trader, u.id, sig, is_buy, tps, entry_oid,
+                                        entry_cloid=entry_cloid))
         _register_fill_watcher(u.id, coin, t)
 
 
@@ -1091,30 +1408,90 @@ async def _adjust(trader, u, sig, pos):
     # blockierender requests-HTTP-Call; direkt auf dem Event-Loop fror er bei
     # HL-Hängern die GESAMTE Engine (alle User, Dashboard, Sync) ein.
     mark = await asyncio.to_thread(_get_mark, coin)
-    if mark > 0:
-        sl_invalid = (is_buy and sig.stop_loss >= mark) or ((not is_buy) and sig.stop_loss <= mark)
-        if sl_invalid:
-            side = "LONG" if is_buy else "SHORT"
+    # H-13 (2026-06-13): mark==0 = all_mids-Read fehlgeschlagen. Vorher wurde der
+    # would-trigger-Preflight dann STILL übersprungen (`if mark > 0`) und der
+    # Adjust cancelte trotzdem den alten SL, um blind neu zu platzieren — ohne
+    # den einen Client-Check, der instant-triggernde Stops verhindert. Jetzt:
+    # bei mark==0 NICHT canceln/neu-setzen, alter Schutz bleibt aktiv + Alert.
+    if mark <= 0:
+        _log_activity(
+            u.id, "error",
+            f"{coin}: SL-update {sig.stop_loss} skipped — mark price unreadable "
+            f"(all_mids failed); refusing to cancel & re-place protection blindly. "
+            f"Existing protection kept.")
+        return
+    sl_invalid = (is_buy and sig.stop_loss >= mark) or ((not is_buy) and sig.stop_loss <= mark)
+    if sl_invalid:
+        side = "LONG" if is_buy else "SHORT"
+        _log_activity(
+            u.id, "update",
+            f"{coin}: SL-update {sig.stop_loss} skipped (would trigger immediately — "
+            f"{side} mark={mark}, rule: {'LONG SL<mark' if is_buy else 'SHORT SL>mark'}). "
+            f"Existing protection unchanged."
+        )
+        return  # alter SL bleibt aktiv, kein cancel, keine Position-Close
+
+    # 2026-06-13 Audit C-4: Ownership-Gate. _adjust cancelt unten ALLE Orders
+    # des Coins und re-protectet/market-closet die VOLLE Live-Größe. Auf einem
+    # Multi-User-Account kann der User aber selbst auf demselben Coin traden —
+    # dann enthielte abs(pos) seine manuelle Position UND cancel_orders löschte
+    # seinen manuellen SL. Deshalb:
+    #   - Live-Position ≈ Bot-Anteil (known ownership): wie bisher voll managen.
+    #   - Live-Position > Bot-Anteil (manuell dazu) ODER unbekannte Ownership
+    #     bei >0 Bot-Anteil-Zweifel: NICHT destruktiv anfassen → skip + ERROR.
+    ownership = _load_bot_ownership(u.id, coin)
+    live_sz = abs(float(pos or 0))
+    managed_sz = _bot_managed_size(pos, ownership)
+    if ownership.get("known"):
+        # Toleranz: 0.1% — Rundungen/Mini-Drift sind kein "manuell dazu".
+        manual_extra = live_sz - managed_sz
+        if managed_sz <= 0:
+            # Bot hält (laut Attribution) nichts mehr hier, HL zeigt aber eine
+            # Position → die ist manuell. Finger weg.
             _log_activity(
-                u.id, "update",
-                f"{coin}: SL-update {sig.stop_loss} skipped (would trigger immediately — "
-                f"{side} mark={mark}, rule: {'LONG SL<mark' if is_buy else 'SHORT SL>mark'}). "
-                f"Existing protection unchanged."
-            )
-            return  # alter SL bleibt aktiv, kein cancel, keine Position-Close
+                u.id, "skip",
+                f"{coin}: open position ({live_sz:.6g}) is not bot-attributed "
+                f"(bot size 0) — UPDATE not applied, manual position left untouched.")
+            return
+        if manual_extra > managed_sz * 0.001 and manual_extra > 0:
+            # Position ist GRÖSSER als der Bot-Anteil → User hat manuell dazu-
+            # getradet. Ein cancel_orders + reprotect der vollen Größe würde
+            # seinen manuellen SL canceln und seine Größe mit-managen. Fail-safe:
+            # nichts zerstören, nur alerten (Bot-Anteil behält seinen Schutz).
+            _log_activity(
+                u.id, "error",
+                f"{coin}: live position {live_sz:.6g} exceeds bot-attributed "
+                f"{managed_sz:.6g} (manual position mixed in) — SL-update NOT applied "
+                f"(won't touch your manual orders/size). Adjust manually if needed.")
+            return
 
     # 2026-06-12 (Review #6): evtl. noch laufenden Fill-Watcher beenden — nach dem
     # cancel_orders gleich darunter existiert keine Rest-Entry-Order mehr, der
     # Watcher könnte nur noch Doppel-Schutz auf die frische Voll-Abdeckung stapeln.
     _cancel_fill_watcher(u.id, coin)
+    # 2026-06-13 Audit C-4: protect_sz = der Bot-Anteil (managed_sz), nicht
+    # blind abs(pos). Bei known ownership ist managed_sz == live_sz (oben
+    # abgesichert); bei Pre-Ownership-Rows (known=False) Fallback auf live_sz
+    # (alte Logik) — dort tracken wir keinen Bot-Anteil, gehen also vom reinen
+    # Bot-Account aus wie vor dieser Änderung.
+    protect_sz = managed_sz if ownership.get("known") else live_sz
+    # 2026-06-13 Audit C-4 (Residual L-3): cancel_orders(coin) räumt hier die
+    # ALTEN SL/TP des Bots weg, um sie mit dem neuen SL/TP zu ersetzen. Da oben
+    # für known ownership ausgeschlossen ist, dass die Live-Position eine manuelle
+    # POSITION enthält (sonst Skip), ist die zu cancelnde Protection bot-eigen.
+    # Verbleibendes Restrisiko: hat der User parallel eine manuelle RUHENDE Order
+    # (Limit) auf demselben Coin, während die Bot-Position offen ist, würde der
+    # Sweep auch die treffen — gezieltes Canceln nur der Bot-Protection bräuchte
+    # persistierte Protection-oids (haben wir nicht). Bewusst akzeptiert: ein
+    # stehengelassener alter Bot-SL (Alternative) ist gefährlicher.
     await asyncio.to_thread(trader.cancel_orders, coin)            # alte SL/TP weg
-    prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sig.stop_loss, tps)
+    prot = await asyncio.to_thread(trader.place_protection, coin, is_buy, protect_sz, sig.stop_loss, tps)
     if not prot.get("sl_ok"):
         # Falls noch ein anderer Grund fail (tickSize/etc) — log + close-Net.
         sl_resp = prot.get("sl"); skip_reason = prot.get("skip_reason")
         err_detail = skip_reason or (str(sl_resp)[:300] if sl_resp else "no response")
         log.error("place_protection sl fail user=%s coin=%s sl=%s sz=%s is_buy=%s resp=%s",
-                  u.id, coin, sig.stop_loss, abs(pos), is_buy, err_detail)
+                  u.id, coin, sig.stop_loss, protect_sz, is_buy, err_detail)
         # 2026-06-06: Wenn HL "User or API Wallet does not exist" returnt → Agent
         # ist nicht autorisiert. close_position würde mit gleichem Fehler scheitern
         # (gleicher Agent). Auto-pause statt im Kreis weiter trying.
@@ -1129,7 +1506,15 @@ async def _adjust(trader, u, sig, pos):
         if skip_reason and "would_trigger" in skip_reason:
             sl_old, tps_old = _load_protection_params(u.id, coin)
             if sl_old is not None:
-                reprot = await asyncio.to_thread(trader.place_protection, coin, is_buy, abs(pos), sl_old, tps_old)
+                # 2026-06-13 Audit H-5: place_protection im Restore-Pfad in
+                # try/except — ein Raise hier (statt sl_ok=False) hätte sonst den
+                # generischen Handler getroffen (nur Error-Log) und die Position
+                # ungeschützt mit weggecanceltem alten SL zurückgelassen.
+                try:
+                    reprot = await asyncio.to_thread(trader.place_protection, coin, is_buy, protect_sz, sl_old, tps_old)
+                except Exception as e:
+                    log.error("restore place_protection raised user=%s coin=%s: %s", u.id, coin, e)
+                    reprot = {"sl_ok": False}
                 if reprot.get("sl_ok"):
                     _log_activity(u.id, "update",
                                   f"{coin}: SL-update {sig.stop_loss} would trigger immediately (mark race) → "
@@ -1142,23 +1527,29 @@ async def _adjust(trader, u, sig, pos):
         # 2026-06-12 (Review #4): close_position-Resultat prüfen statt blind
         # "geschlossen" zu loggen — bei Fail ist die Position OFFEN und der alte
         # Schutz schon weggecancelt.
+        # 2026-06-13 Audit C-4: NIE mehr als den Bot-Anteil schließen. Oben ist
+        # für known ownership bereits sichergestellt, dass live_sz == bot-Anteil
+        # (sonst hätten wir geskippt), close_position ist also bot-only. Bei
+        # Pre-Ownership-Rows bleibt es beim alten Verhalten (reiner Bot-Account).
         close_res = await asyncio.to_thread(trader.close_position, coin)
-        if not close_res.get("ok"):
+        if not _close_succeeded(close_res):
             # Audit H-A (2026-06-12): Row mit SL-Params OFFEN lassen (sync-Loop +
             # Coverage-Reconciler beobachten weiter) + ungethrottleder Alert.
             _save_managed(u.id, coin, sig, status="open")
             msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
                    f"{coin}: SL-update failed AND market-close failed "
-                   f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
+                   f"({_close_fail_detail(close_res)}). "
                    f"Check manually immediately. HL (SL): {err_detail[:120]}")
             _post_alert(f"🚨 [user {u.id}] {msg}", key=None)
             _log_activity(u.id, "error", msg)
             return
-        await asyncio.to_thread(trader.cancel_orders, coin)
+        # 2026-06-13 Audit C-4 / L-3: nur die Bot-Entry-Order gezielt wegräumen.
+        await _cancel_bot_entry(trader, coin, ownership.get("entry_oid"))
+        _close_managed(u.id, coin)
         _log_activity(u.id, "error",
                       f"{coin}: SL-update failed → position closed. HL response: {err_detail[:180]}")
         return
-    _log_activity(u.id, "update", f"{coin}: thesis adjusted — SL {sig.stop_loss}, TP trailed (qty {abs(pos):.6g})")
+    _log_activity(u.id, "update", f"{coin}: thesis adjusted — SL {sig.stop_loss}, TP trailed (qty {protect_sz:.6g})")
     _save_managed(u.id, coin, sig, status="open")
 
 
@@ -1205,9 +1596,21 @@ async def _cancel(user_id, sig):
             # Position FLAT -> evtl. ruhende Limit-Entry-Order canceln.
             # 2026-06-12 (Review #6): zugehörigen Fill-Watcher zuerst beenden.
             _cancel_fill_watcher(user_id, coin)
-            n = await asyncio.to_thread(trader.cancel_orders, coin)
-            if n > 0:
-                _log_activity(user_id, "close", f"{coin}: pre-entry limit cancelled (n={n}) — thesis invalidated")
+            # 2026-06-13 Audit C-4 / L-3: NUR die Bot-Entry-Order (per oid)
+            # canceln, nicht pauschal cancel_orders(coin) — letzteres löschte
+            # auch manuelle ruhende Orders des Users. Kennen wir keine oid
+            # (Pre-Ownership-Row), passiert nichts (fail-safe, kein Sweep) und
+            # wir räumen nur den DB-State auf.
+            ownership = _load_bot_ownership(user_id, coin)
+            entry_oid = ownership.get("entry_oid")
+            if entry_oid:
+                await _cancel_bot_entry(trader, coin, entry_oid)
+                _log_activity(user_id, "close",
+                              f"{coin}: pre-entry limit cancelled (bot order {entry_oid}) — thesis invalidated")
+            else:
+                _log_activity(user_id, "close",
+                              f"{coin}: CANCEL — no bot entry order tracked, nothing cancelled "
+                              f"(manual orders left untouched).")
             _close_managed(user_id, coin)
         except InvalidToken:
             # Audit M-4: siehe _open_or_update — undecryptbarer Key pausiert
@@ -1227,26 +1630,86 @@ async def _cancel(user_id, sig):
 
 
 # ── Fill-Watch für ruhende Limit-Orders ──────────────────────────────────────
-async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=None):
+def _entry_filled_sz(trader, coin, resting_oid, entry_cloid):
+    """2026-06-13 Audit H-1/C-4: wie viel DIESE Bot-Entry-Order gefüllt hat —
+    via order_status(oid/cloid), NICHT via position_size (das enthielte auch
+    manuelle Positionen des Users, die der Watcher dann fälschlich seinem Entry
+    zuschriebe). Returnt (filled_sz: float, done: bool, ok: bool):
+      - filled_sz: kumulativ von dieser Order gefüllte Menge (>=0).
+      - done: True wenn die Order endgültig ist (filled|canceled) — kein Rest
+        mehr zu erwarten.
+      - ok: False wenn der Status nicht gelesen werden konnte (unknown/Exception)
+        → Caller überspringt diesen Poll (NIE als 0/flat interpretieren).
+    Fallback: hat der Trader (Agent A) noch kein order_status, lesen wir
+    position_size (alte Semantik) — degradiert, aber nie crashend."""
+    try:
+        st = trader.order_status(oid=resting_oid, cloid=entry_cloid)
+    except AttributeError:
+        # Agent A's order_status noch nicht gemerged → alte Semantik.
+        try:
+            return abs(_f(trader.position_size(coin))), False, True
+        except Exception:
+            return 0.0, False, False
+    except Exception as e:
+        log.warning("order_status failed coin=%s oid=%s: %s", coin, resting_oid, e)
+        return 0.0, False, False
+    status = (st or {}).get("status", "unknown")
+    filled = _f((st or {}).get("filled_sz"), 0.0)
+    if status == "unknown":
+        return filled, False, False
+    done = status in ("filled", "canceled")
+    return abs(filled), done, True
+
+
+async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=None,
+                               entry_cloid=None):
     """H2-Fix (2026-06-09): Schutz NACH JEDEM neuen Fill nachlegen (Delta-Add),
     statt nur den ersten Teil-Fill zu schützen und sofort zu returnen.
+
+    2026-06-13 Audit H-1/C-4: der Watcher pollt jetzt order_status(oid/cloid)
+    DIESES Entries und schützt NUR die von DIESEM Entry gefüllte Menge — nicht
+    mehr jedes Wachstum von position_size (das attribuierte ein manuelles
+    Dazu-Kaufen des Users dem Bot-Entry und market-closte es im Fail-Pfad).
 
     Bug-Historie: ein ruhender Limit-Entry kann in mehreren Partial-Fills über
     Sekunden füllen. Der alte Watcher feuerte beim ERSTEN Mini-Fill und sicherte
     nur diese Menge ab → der Rest blieb NACKT (BTC 2026-06-09: SL deckte 0.00138
-    von 0.1151 BTC). Jetzt: wächst die Position über die bereits abgedeckte
-    Größe, legen wir Schutz für die DELTA-Menge nach. reduce-only Stops/TPs
-    stacken bei gleichem Trigger → die Summe deckt die volle Position; KEIN
-    cancel → die ruhende Rest-Entry-Order bleibt unangetastet.
+    von 0.1151 BTC). reduce-only Stops/TPs stacken bei gleichem Trigger → die
+    Summe deckt die volle Position; KEIN cancel → die ruhende Rest-Entry-Order
+    bleibt unangetastet.
     """
     coin = coin_of(sig.ticker)
     deadline = time.monotonic() + config.ENTRY_FILL_TIMEOUT_S
-    protected = 0.0   # bereits mit Schutz-Orders abgedeckte Positionsgröße
+    protected = 0.0   # bereits mit Schutz-Orders abgedeckte (Bot-)Fill-Größe
     stable = 0        # Anzahl Polls ohne neuen Fill (→ Order fertig gefüllt)
+    entry_px = _f(sig.entry, 0.0)
+    min_notional = float(getattr(config, "MIN_NOTIONAL_USDC", 10) or 10)
 
-    def _protect_delta(psz):
-        """Schutz für (psz - protected) nachlegen. Returnt (ok, fatal)."""
-        delta = psz - protected
+    def _delta_below_min(delta):
+        """H-8: Delta-Notional < HL-Min? Dann KEINEN frischen Stop forcieren
+        (HL lehnt sub-$10-Trigger ab) und vor allem NIE force-closen — die
+        Mini-Menge dem Coverage-Reconciler / dem nächsten größeren Fill
+        überlassen."""
+        if entry_px <= 0 or delta <= 0:
+            return False
+        return (delta * entry_px) < min_notional
+
+    def _protect_delta(target):
+        """Schutz für (target - protected) nachlegen. Returnt (ok, fatal).
+
+        2026-06-13 Audit H-8: ist das Delta sub-min, geben wir (False, False)
+        zurück — KEIN frischer Stop, KEIN force-close. protected bleibt
+        unverändert, der nächste Poll versucht es mit dem dann größeren
+        kumulativen Fill erneut; bleibt es dauerhaft klein, deckt der
+        Coverage-Reconciler den Rest (oder vergrößert den bestehenden Stop)."""
+        delta = target - protected
+        if delta <= 0:
+            return True, False
+        if _delta_below_min(delta):
+            log.info("watcher %s/%s: delta %.6g (notional ~$%.2f) < min $%.0f — "
+                     "kein frischer Stop, Reconciler übernimmt (H-8)",
+                     user_id, coin, delta, delta * entry_px, min_notional)
+            return False, False
         prot = trader.place_protection(coin, is_buy, delta, sig.stop_loss, tps)
         if prot.get("sl_ok"):
             return True, False
@@ -1256,34 +1719,65 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
         if _is_unauthorized_agent_response(err):
             _pause_user_bad_key(user_id, err, reason="not_authorized")
             return False, True
-        # SL fehlgeschlagen → keine ungeschützte Position riskieren → schließen
+        # 2026-06-13 Audit H-8 (Sicherheitsnetz): scheitert das Protect, OBWOHL
+        # das Delta sub-min ist (Race), trotzdem NICHT force-closen — der bereits
+        # geschützte gesunde Teil bliebe sonst mit-geschlossen. Reconciler-Pfad.
+        if _delta_below_min(delta):
+            log.warning("watcher %s/%s: sub-min delta protect rejected — kein force-close (H-8)",
+                        user_id, coin)
+            return False, False
+        # SL fehlgeschlagen (echte Größe) → keine ungeschützte Position riskieren → schließen
         # 2026-06-12 (Review #4): Close-Resultat prüfen. Bei Fail Row OFFEN lassen
-        # (SL-Params drin) damit der Coverage-Reconciler den Schutz nachlegen kann,
-        # und NICHT "geschlossen" behaupten.
+        # (SL-Params drin) damit der Coverage-Reconciler den Schutz nachlegen kann.
+        # 2026-06-13 Audit C-4/C-1: _close_succeeded prüft still_open; nur die
+        # Bot-Entry-Order gezielt canceln (kein cancel_orders-Sweep).
         close_res = trader.close_position(coin)
-        if not close_res.get("ok"):
+        if not _close_succeeded(close_res):
             _save_managed(user_id, coin, sig, status="open")
             msg = (f"EMERGENCY: emergency-close failed — position open & unprotected! "
                    f"{coin}: SL after fill failed AND market-close failed "
-                   f"({str(close_res.get('error') or close_res.get('raw'))[:120]}). "
+                   f"({_close_fail_detail(close_res)}). "
                    f"Check manually immediately. HL (SL): {err[:120]}")
             # Audit H-A: ungethrottleder Alert (key=None) — darf nie untergehen.
             _post_alert(f"🚨 [user {user_id}] {msg}", key=None)
             _log_activity(user_id, "error", msg)
             return False, True
-        trader.cancel_orders(coin)
+        if resting_oid:
+            trader_cancel = getattr(trader, "cancel_order_oid", None) or trader.cancel_order
+            try:
+                trader_cancel(coin, resting_oid)
+            except Exception as e:
+                log.warning("watcher cancel bot entry failed coin=%s oid=%s: %s", coin, resting_oid, e)
         _log_activity(user_id, "error", f"{coin}: SL after fill failed — position closed. HL: {err[:180]}")
         _close_managed(user_id, coin)
         return False, True
+
+    async def _cancel_own_entry():
+        """2026-06-13 Audit C-4/L-3: NUR die eigene Bot-Entry-Order (per oid)
+        canceln — nie cancel_orders(coin) (würde manuelle Orders + die gerade
+        gesetzten Schutz-Orders zerstören)."""
+        if resting_oid:
+            await _cancel_bot_entry(trader, coin, resting_oid)
 
     async def _exit_stale():
         """2026-06-12 (Review #6): Row gehört nicht mehr diesem Watcher (neueres
         Signal/CANCEL hat übernommen). Eigene Rest-Entry-Order best-effort canceln
         — eine herrenlose ruhende Order würde sonst später NACKT füllen — und
         beenden, ohne fremde Orders anzufassen."""
-        if resting_oid:
-            await asyncio.to_thread(trader.cancel_order, coin, resting_oid)
+        await _cancel_own_entry()
         log.info("fill-watcher %s/%s: von neuerem Signal überholt — beendet", user_id, coin)
+
+    async def _try_protect(target):
+        """H-11 (2026-06-13): _protect_delta in try/except — ein Raise (hl_retry
+        re-raise) hätte sonst den GANZEN Watcher-Task gekillt und die ruhende
+        Rest-Entry-Order verwaist gelassen. Bei Exception: weiter pollen
+        (return (False, False)), nicht den Watcher sterben lassen."""
+        try:
+            return await asyncio.to_thread(_protect_delta, target)
+        except Exception as e:
+            log.error("watcher _protect_delta raised user=%s coin=%s: %s — weiter pollen (H-11)",
+                      user_id, coin, e)
+            return False, False
 
     while time.monotonic() < deadline:
         await asyncio.sleep(config.ENTRY_POLL_S)
@@ -1296,61 +1790,77 @@ async def _protect_when_filled(trader, user_id, sig, is_buy, tps, resting_oid=No
             if not _watcher_row_current(user_id, coin, resting_oid, sig.signal_id):
                 await _exit_stale()
                 return
-            try:
-                psz = abs(await asyncio.to_thread(trader.position_size, coin))
-            except Exception:
-                # Review #0: Status unbekannt ≠ flat — diesen Poll überspringen.
+            # H-1/C-4: NUR den Fill DIESER Entry-Order pollen (order_status).
+            filled, order_done, ok_read = await asyncio.to_thread(
+                _entry_filled_sz, trader, coin, resting_oid, entry_cloid)
+            if not ok_read:
+                # Status unbekannt ≠ flat — diesen Poll überspringen.
                 continue
-            if psz > protected * 1.001:
-                ok, fatal = await asyncio.to_thread(_protect_delta, psz)
+            if filled > protected * 1.001:
+                ok, fatal = await _try_protect(filled)
                 if fatal:
                     return
                 if ok:
-                    protected = psz
+                    protected = filled
                     stable = 0
-                    _save_managed(user_id, coin, sig, status="open")
-                    _log_activity(user_id, "order", f"{coin} filled (qty {psz:.6g}) — SL+TP fully covered")
-            elif protected > 0:
+                    # C-4: bot_filled_sz mitschreiben (die vom Bot geschützte Menge).
+                    _save_managed(user_id, coin, sig, status="open", bot_filled_sz=protected)
+                    _log_activity(user_id, "order", f"{coin} filled (qty {filled:.6g}) — SL+TP covered")
+                # ok==False + fatal==False = sub-min Delta (H-8): protected NICHT
+                # erhöhen, nächster Poll versucht es mit größerem kumulativem Fill.
+            elif order_done or protected > 0:
                 stable += 1
-                if stable >= 2:   # 2 Polls keine neuen Fills → Order fertig gefüllt
-                    # H-1 (2026-06-12): evtl. noch ruhenden Entry-Rest (Teil-Fill, Rest
-                    # unbefüllt) canceln, damit er nicht SPÄTER nackt füllt. Nur die
-                    # Entry-oid — Schutz-Orders bleiben.
-                    if resting_oid:
-                        await asyncio.to_thread(trader.cancel_order, coin, resting_oid)
+                # H-7 (2026-06-13): die Order ist endgültig (filled|canceled) ODER
+                # 2 Polls ohne neuen Fill → fertig. Vor dem Beenden ein FINALER
+                # order_status-Read + Delta-Protect, falls in der Lücke zwischen
+                # vorletztem Poll und Cancel doch noch gefüllt wurde.
+                if order_done or stable >= 2:
+                    f2, _d2, ok2 = await asyncio.to_thread(
+                        _entry_filled_sz, trader, coin, resting_oid, entry_cloid)
+                    if ok2 and f2 > protected * 1.001:
+                        ok, fatal = await _try_protect(f2)
+                        if not fatal and ok:
+                            protected = f2
+                            _save_managed(user_id, coin, sig, status="open", bot_filled_sz=protected)
+                            _log_activity(user_id, "order",
+                                          f"{coin}: final fill before close (qty {f2:.6g}) — SL+TP placed")
+                        if fatal:
+                            return
+                    # H-1: evtl. noch ruhenden Entry-Rest canceln (Teil-Fill, Rest
+                    # unbefüllt), damit er nicht SPÄTER nackt füllt. Nur die
+                    # Entry-oid (cancel_order_oid) — Schutz-/manuelle Orders bleiben.
+                    await _cancel_own_entry()
                     return
     # Timeout: letzter Delta-Check (last-second fill in der allerletzten Iteration).
     async with _lock_for(user_id, coin):
         if not _watcher_row_current(user_id, coin, resting_oid, sig.signal_id):
             await _exit_stale()
             return
-        try:
-            psz_final = abs(await asyncio.to_thread(trader.position_size, coin))
-        except Exception as e:
-            # 2026-06-12 (Review #0): vorher wurde ein Read-Fehler hier als
-            # psz_final=0 ("nie gefüllt") behandelt → cancel_orders + Row closed,
-            # während ein echter Fill ungeschützt liegen konnte. Jetzt: nichts
-            # anfassen, Row offen lassen — Startup-/Coverage-Reconciler übernimmt.
+        f_final, _df, ok_final = await asyncio.to_thread(
+            _entry_filled_sz, trader, coin, resting_oid, entry_cloid)
+        if not ok_final:
+            # 2026-06-12 (Review #0): Read-Fehler ≠ "nie gefüllt" — nichts
+            # anfassen, Row offen lassen → Startup-/Coverage-Reconciler übernimmt.
             _log_activity(user_id, "error",
-                          f"{coin}: fill-watcher timeout, position status unreadable "
-                          f"({str(e)[:120]}) — nothing cancelled, reconciler takes over.")
+                          f"{coin}: fill-watcher timeout, entry status unreadable "
+                          f"— nothing cancelled, reconciler takes over.")
             return
-        if psz_final > protected * 1.001:
-            ok, fatal = await asyncio.to_thread(_protect_delta, psz_final)
+        if f_final > protected * 1.001:
+            ok, fatal = await _try_protect(f_final)
             if fatal:
                 return
             if ok:
-                protected = psz_final
-                _save_managed(user_id, coin, sig, status="open")
-                _log_activity(user_id, "order", f"{coin}: last-second fill (qty {psz_final:.6g}) — SL+TP placed")
+                protected = f_final
+                _save_managed(user_id, coin, sig, status="open", bot_filled_sz=protected)
+                _log_activity(user_id, "order", f"{coin}: last-second fill (qty {f_final:.6g}) — SL+TP placed")
         if protected > 0:
-            # H-1 (2026-06-12): Watcher endet (Teil-/Voll-Fill) → ruhenden Entry-Rest
-            # canceln, sonst füllt der Rest später NACKT (sync.py prüft keine Coverage).
-            if resting_oid:
-                await asyncio.to_thread(trader.cancel_order, coin, resting_oid)
+            # H-1: Watcher endet (Teil-/Voll-Fill) → ruhenden Entry-Rest canceln
+            # (nur die Bot-oid), sonst füllt der Rest später NACKT.
+            await _cancel_own_entry()
             return
-        # Nie gefüllt → ruhende Order canceln.
-        await asyncio.to_thread(trader.cancel_orders, coin)
+        # Nie gefüllt → NUR die eigene ruhende Bot-Order canceln (C-4/L-3:
+        # kein cancel_orders-Sweep, der manuelle Orders zerstören würde).
+        await _cancel_own_entry()
         _log_activity(user_id, "skip", f"{coin} not filled — no trade")
         _close_managed(user_id, coin)
         # Audit LOW-1: es wurde NIE getradet → Dedup-Marke freigeben, damit ein
@@ -1415,6 +1925,11 @@ async def _rearm_resting_watchers(user_ids):
             "stop_loss": float(mt.stop_loss) if mt.stop_loss is not None else None,
             "take_profits": mt.take_profits or "",
             "resting_oid": mt.resting_oid,
+            # 2026-06-13 Audit C-4: Ownership-Felder mit re-armen, damit der
+            # re-armierte Watcher per order_status(cloid/oid) pollt (H-1) und
+            # nur den Bot-Anteil managt.
+            "entry_oid": getattr(mt, "entry_oid", None) or mt.resting_oid,
+            "entry_cloid": getattr(mt, "entry_cloid", None),
             "signal_id": mt.signal_id or "",
         } for mt in rows]
     finally:
@@ -1469,19 +1984,30 @@ async def _rearm_resting_watchers(user_ids):
             if abs(pos) > 0:
                 # Gefüllt während down: Row auf 'open' (Sync übernimmt sie), Entry-Rest
                 # canceln; der Coverage-Pass direkt im Anschluss legt fehlenden Schutz nach.
-                _save_managed(user_id, coin, sig, status="open", resting_oid=r["resting_oid"])
-                if r["resting_oid"]:
-                    await asyncio.to_thread(trader.cancel_order, coin, r["resting_oid"])
+                # 2026-06-13 Audit C-4: bot_filled_sz aus order_status der Bot-Entry-
+                # Order (was DIESE Order füllte), nicht blind aus position_size
+                # (könnte manuelle Position enthalten). Fallback: pos.
+                bot_fill = abs(pos)
+                ofill, _od, ofok = await asyncio.to_thread(
+                    _entry_filled_sz, trader, coin, r["resting_oid"], r["entry_cloid"])
+                if ofok and ofill > 0:
+                    bot_fill = min(ofill, abs(pos))
+                _save_managed(user_id, coin, sig, status="open", resting_oid=r["resting_oid"],
+                              entry_oid=r["entry_oid"], entry_cloid=r["entry_cloid"],
+                              bot_filled_sz=bot_fill)
+                await _cancel_bot_entry(trader, coin, r["entry_oid"] or r["resting_oid"])
                 _log_activity(user_id, "update",
                               f"{coin}: resting entry filled during the restart "
-                              f"(qty {abs(pos):.6g}) — row set to 'open', coverage-reconciler checks protection.")
+                              f"(bot qty {bot_fill:.6g}) — row set to 'open', coverage-reconciler checks protection.")
                 continue
             is_buy = r["direction"] == "LONG"
             tps = [(tp.price, tp.percent / 100.0) for tp in sig.take_profits]
             # Row anfassen → updated_at refresht (Grace-Timer der sync-Fill-Detection
             # startet neu, kein Race gegen den frisch re-armierten Watcher).
-            _save_managed(user_id, coin, sig, status="resting", resting_oid=r["resting_oid"])
-            t = _spawn(_protect_when_filled(trader, user_id, sig, is_buy, tps, r["resting_oid"]))
+            _save_managed(user_id, coin, sig, status="resting", resting_oid=r["resting_oid"],
+                          entry_oid=r["entry_oid"], entry_cloid=r["entry_cloid"], bot_filled_sz=0)
+            t = _spawn(_protect_when_filled(trader, user_id, sig, is_buy, tps, r["resting_oid"],
+                                            entry_cloid=r["entry_cloid"]))
             _register_fill_watcher(user_id, coin, t)
             _log_activity(user_id, "update",
                           f"{coin}: fill-watcher re-armed after restart "
@@ -1530,15 +2056,36 @@ async def reconcile_stop_coverage(user_ids=None):
                 # nachlegen oder gegen einen gerade laufenden Cancel rennen.
                 async with _lock_for(user_id, coin):
                     sz = abs(szi)
+                    # 2026-06-13 Audit C-4: NUR den Bot-Anteil absichern. Auf einem
+                    # Multi-User-Account kann |szi| eine manuelle Position (oder
+                    # manuellen Aufschlag) enthalten — der Reconciler hätte sonst
+                    # den SL/TP DES BOT-SIGNALS auf die manuelle Größe geklebt
+                    # (H-2-Klasse). target = min(|szi|, bot_filled_sz) wenn die Row
+                    # Ownership kennt; sonst (Pre-Ownership-Row) Fallback auf |szi|
+                    # wie bisher (Legacy = reiner Bot-Account angenommen).
+                    ownership = _load_bot_ownership(user_id, coin)
+                    if ownership.get("known"):
+                        target = min(sz, float(ownership.get("bot_filled_sz") or 0.0))
+                        if target <= 0:
+                            # Bot hält hier nichts → die Position ist manuell.
+                            # NICHT anfassen (kein Schutz aufzwingen, kein Alert-Spam:
+                            # M-5 adressiert den manuellen-Position-Alert separat).
+                            log.info("reconcile %s/%s: position not bot-attributed (bot sz 0) — skip (C-4)",
+                                     user_id, coin)
+                            continue
+                    else:
+                        target = sz
                     covered = await asyncio.to_thread(trader.covered_stop_size, coin)
-                    if covered >= sz * 0.999:
-                        continue  # voll per SL gedeckt — nichts zu tun
-                    uncovered = sz - covered
+                    if covered >= target * 0.999:
+                        continue  # Bot-Anteil voll per SL gedeckt — nichts zu tun
+                    uncovered = target - covered
+                    if uncovered <= 0:
+                        continue
                     sl, tps = _load_protection_params(user_id, coin)
                     if sl is None:
                         _log_activity(
                             user_id, "error",
-                            f"{coin}: position qty {sz:.6g} only covered {covered:.6g} by SL, NO "
+                            f"{coin}: bot position qty {target:.6g} only covered {covered:.6g} by SL, NO "
                             f"SL price known in managed_trade — please secure/close manually.")
                         continue
                     is_buy = szi > 0
@@ -1549,11 +2096,11 @@ async def reconcile_stop_coverage(user_ids=None):
                         _log_activity(
                             user_id, "update",
                             f"{coin}: reconciler fixed under-coverage — added SL/TP for missing "
-                            f"{uncovered:.6g} (was {covered:.6g}/{sz:.6g}, SL {sl}).")
+                            f"{uncovered:.6g} (was {covered:.6g}/{target:.6g}, SL {sl}).")
                     else:
                         _log_activity(
                             user_id, "error",
-                            f"{coin}: under-coverage ({covered:.6g}/{sz:.6g}) — adding protection "
+                            f"{coin}: under-coverage ({covered:.6g}/{target:.6g}) — adding protection "
                             f"FAILED ({str(prot.get('sl'))[:120]}). Secure manually!")
             except Exception as e:
                 log.warning("reconcile: protect failed user %s coin %s: %s", user_id, coin, e)

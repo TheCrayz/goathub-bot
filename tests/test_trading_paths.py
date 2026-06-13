@@ -65,14 +65,25 @@ class FakeTrader:
     """Zeichnet alle mutierenden HL-Calls auf; Verhalten per Konstruktor steuerbar."""
 
     def __init__(self, *, pos=0.0, entry_filled=True, resting_oid="777",
-                 sl_ok=True, close_ok=True, lev_ok=True, balance=10_000.0):
+                 sl_ok=True, close_ok=True, lev_ok=True, balance=10_000.0,
+                 entry_cloid="cl-777", order_filled_sz=None, order_status="filled",
+                 close_still_open=0.0, round_sz=None):
         self.pos = pos
         self.entry_filled = entry_filled
         self.resting_oid = resting_oid
+        self.entry_cloid = entry_cloid
         self.sl_ok = sl_ok
         self.close_ok = close_ok
         self.lev_ok = lev_ok
         self.balance = balance
+        # 2026-06-13 Audit C-4/H-1: order_status-Steuerung. order_filled_sz =
+        # was DIESE Entry-Order gefüllt hat (None → folgt self.pos). order_status
+        # = "filled"|"open"|"partial"|"canceled"|"unknown". close_still_open =
+        # was nach close_position offen bleibt (C-1).
+        self._order_filled_sz = order_filled_sz
+        self._order_status = order_status
+        self.close_still_open = close_still_open
+        self._round_sz_fn = round_sz   # optional: callable(coin, sz) → gerundet
         self.calls = []               # [(name, args...)] mutierende Calls
         self.protection_calls = []    # place_protection-Argumente
 
@@ -104,11 +115,12 @@ class FakeTrader:
 
     def place_entry(self, coin, is_buy, sz, px):
         self.calls.append(("place_entry", coin, is_buy, sz, px))
+        # C-2: place_entry liefert jetzt auch cloid zurück.
         if self.entry_filled:
             return {"ok": True, "filled": True, "filled_sz": sz,
-                    "resting_oid": None, "error": None}
+                    "resting_oid": None, "cloid": self.entry_cloid, "error": None}
         return {"ok": True, "filled": False, "filled_sz": 0.0,
-                "resting_oid": self.resting_oid, "error": None}
+                "resting_oid": self.resting_oid, "cloid": self.entry_cloid, "error": None}
 
     def place_protection(self, coin, is_buy, sz, sl, tps):
         self.protection_calls.append(
@@ -119,10 +131,12 @@ class FakeTrader:
                 "tp": [], "skip_reason": None}
 
     def close_position(self, coin):
+        # 2026-06-13 Audit C-1/C-4: neue Return-Form inkl. still_open.
         self.calls.append(("close_position", coin))
         if self.close_ok:
-            return {"ok": True, "closed": abs(self.pos)}
-        return {"ok": False, "closed": 0.0, "error": "market_close final fail (Stub)"}
+            return {"ok": True, "closed": abs(self.pos), "still_open": self.close_still_open}
+        return {"ok": False, "closed": 0.0, "still_open": abs(self.pos),
+                "error": "market_close final fail (Stub)"}
 
     def cancel_orders(self, coin):
         self.calls.append(("cancel_orders", coin))
@@ -132,8 +146,31 @@ class FakeTrader:
         self.calls.append(("cancel_order", coin, oid))
         return True
 
+    # 2026-06-13 Audit C-4/H-1: Agent-A-Schnittstellen.
+    def order_status(self, oid=None, cloid=None):
+        fsz = self._order_filled_sz
+        if fsz is None:
+            fsz = abs(self.pos)
+        return {"status": self._order_status, "filled_sz": fsz, "raw": {}}
+
+    def cancel_order_oid(self, coin, oid):
+        self.calls.append(("cancel_order_oid", coin, oid))
+        return {"ok": True, "already_filled": False, "raw": {}}
+
+    def _round_sz(self, coin, sz):
+        if self._round_sz_fn is not None:
+            return self._round_sz_fn(coin, sz)
+        return sz
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+def _async_return(value):
+    """async-Wrapper, der `value` zurückgibt (für _build_trader-Monkeypatch)."""
+    async def _f(*a, **k):
+        return value
+    return _f
+
+
 def _fake_user(user_id=1):
     """Leichtgewichtiger User-Ersatz für _open_new (kein ORM-Detach-Theater)."""
     return types.SimpleNamespace(
@@ -341,8 +378,12 @@ def test_watcher_aborts_on_generation_change():
     assert ("cancel_orders", "ETH") not in trader.calls, \
         "stale Watcher darf nicht pauschal canceln (würde Schutz des neuen Trades zerstören)"
     assert ("close_position", "ETH") not in trader.calls
-    # Erlaubt ist NUR das Wegräumen der eigenen Rest-Entry-Order:
-    assert trader.calls in ([("cancel_order", "ETH", "111")], []), trader.calls
+    # Erlaubt ist NUR das Wegräumen der EIGENEN Rest-Entry-Order (per oid).
+    # 2026-06-13 Audit C-4: _cancel_bot_entry nutzt cancel_order_oid (Agent A).
+    assert trader.calls in (
+        [("cancel_order_oid", "ETH", "111")],
+        [("cancel_order", "ETH", "111")],
+        []), trader.calls
 
     mt = _managed(1, "ETH")
     assert mt.status == "resting" and mt.signal_id == "sig-NEW", \
@@ -480,6 +521,319 @@ def test_set_referrer_ok_and_failsafe():
     print("set_referrer_ok_and_failsafe: OK")
 
 
+# ── (8) C-4: ownership — _open_new persistiert entry_oid/cloid/bot_filled_sz ─
+def test_open_new_persists_bot_ownership():
+    """C-4: nach einem filled Entry trägt die managed_trade-Row die Bot-
+    Ownership (entry_cloid + bot_filled_sz = vom Bot gefüllte Menge)."""
+    _reset_all()
+    trader = FakeTrader(entry_filled=True)
+    sig = _sig(signal_id="own-1")
+    with _NoCoinFilter():
+        asyncio.run(engine._open_new(trader, _fake_user(1), sig))
+    mt = _managed(1, "ETH")
+    assert mt is not None and mt.status == "open"
+    assert mt.entry_cloid == "cl-777", f"entry_cloid muss persistiert sein: {mt.entry_cloid}"
+    assert mt.bot_filled_sz is not None and abs(float(mt.bot_filled_sz) - 2.0) < 1e-9, \
+        f"bot_filled_sz muss die gefüllte Bot-Menge sein: {mt.bot_filled_sz}"
+    print("open_new_persists_bot_ownership: OK")
+
+
+# ── (9) C-4: _adjust lässt manuelle Position in Ruhe ─────────────────────────
+def test_adjust_skips_when_position_exceeds_bot_size():
+    """C-4: Live-Position (5.0) > bot_filled_sz (2.0) → User hat manuell dazu-
+    getradet. _adjust darf NICHT cancel_orders/place_protection/close_position
+    aufrufen (würde manuellen SL canceln + manuelle Größe mit-managen)."""
+    _reset_all()
+    db = SessionLocal()
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="open",
+                        entry_oid="e1", entry_cloid="cl-1", bot_filled_sz=2.0))
+    db.commit()
+    db.close()
+
+    trader = FakeTrader(pos=5.0)   # HL zeigt 5.0 → 3.0 davon manuell
+    orig_mark = engine._get_mark
+    engine._get_mark = lambda coin: 2100.0   # LONG SL 1900 < mark → kein would-trigger
+    try:
+        sig = _sig(action="UPDATE_TRADE", signal_id="adj-1", entry=None, stop_loss=1950.0)
+        u = types.SimpleNamespace(id=1)
+        asyncio.run(engine._adjust(trader, u, sig, 5.0))
+    finally:
+        engine._get_mark = orig_mark
+
+    assert trader.protection_calls == [], \
+        f"darf KEINE Protection auf die manuell-vergrößerte Position setzen: {trader.protection_calls}"
+    assert all(c[0] not in ("cancel_orders", "close_position") for c in trader.calls), \
+        f"darf nichts canceln/closen wenn manuelle Größe dabei ist: {trader.calls}"
+    errs = _activities(1, "error")
+    assert any("exceeds bot-attributed" in t for t in errs), errs
+    print("adjust_skips_when_position_exceeds_bot_size: OK")
+
+
+def test_adjust_manages_only_bot_size():
+    """C-4: Live-Position == bot_filled_sz → _adjust managt normal, aber
+    place_protection bekommt den BOT-Anteil (nicht mehr)."""
+    _reset_all()
+    db = SessionLocal()
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="open",
+                        entry_oid="e1", entry_cloid="cl-1", bot_filled_sz=3.0))
+    db.commit()
+    db.close()
+
+    trader = FakeTrader(pos=3.0)
+    orig_mark = engine._get_mark
+    engine._get_mark = lambda coin: 2100.0
+    try:
+        sig = _sig(action="UPDATE_TRADE", signal_id="adj-2", entry=None, stop_loss=1950.0)
+        u = types.SimpleNamespace(id=1)
+        asyncio.run(engine._adjust(trader, u, sig, 3.0))
+    finally:
+        engine._get_mark = orig_mark
+
+    assert len(trader.protection_calls) == 1, trader.protection_calls
+    assert abs(trader.protection_calls[0]["sz"] - 3.0) < 1e-9, \
+        f"Protection nur auf den Bot-Anteil: {trader.protection_calls[0]['sz']}"
+    print("adjust_manages_only_bot_size: OK")
+
+
+# ── (10) H-1: Watcher schützt nur den Fill SEINER Order ──────────────────────
+def test_watcher_protects_only_order_fill():
+    """H-1: User kauft manuell dazu, während der Bot-Limit ruht. position_size
+    zeigt die SUMME, aber order_status DIESES Entries nur den Bot-Fill — der
+    Watcher darf NUR den Bot-Fill schützen."""
+    _reset_all()
+    db = SessionLocal()
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="resting",
+                        resting_oid="111", entry_oid="111", entry_cloid="cl-x",
+                        signal_id="w-1", bot_filled_sz=0))
+    db.commit()
+    db.close()
+
+    # pos=10 (Bot 1.5 + manuell 8.5), aber order_status meldet nur 1.5 gefüllt.
+    trader = FakeTrader(pos=10.0, order_filled_sz=1.5, order_status="filled")
+    sig = _sig(signal_id="w-1", coin="ETH", entry=2000.0, stop_loss=1900.0)
+    orig_poll, orig_to = engine.config.ENTRY_POLL_S, engine.config.ENTRY_FILL_TIMEOUT_S
+    engine.config.ENTRY_POLL_S = 0
+    engine.config.ENTRY_FILL_TIMEOUT_S = 1
+    try:
+        asyncio.run(engine._protect_when_filled(trader, 1, sig, True, [],
+                                                resting_oid="111", entry_cloid="cl-x"))
+    finally:
+        engine.config.ENTRY_POLL_S = orig_poll
+        engine.config.ENTRY_FILL_TIMEOUT_S = orig_to
+
+    assert len(trader.protection_calls) >= 1, trader.protection_calls
+    total_protected = sum(pc["sz"] for pc in trader.protection_calls)
+    assert abs(total_protected - 1.5) < 1e-9, \
+        f"Watcher darf NUR den Bot-Fill (1.5) schützen, nicht die 10.0 Gesamt-Pos: {total_protected}"
+    print("watcher_protects_only_order_fill: OK")
+
+
+# ── (11) H-3: kein Zombie-resting-Row bei Gate-Skip ──────────────────────────
+def test_no_zombie_resting_row_on_skip():
+    """H-3: ein neues NEW_TRADE überholt einen ruhenden Entry, wird dann aber in
+    _open_new geskippt (per-coin-Filter). Die alte resting-Row darf KEIN Zombie
+    bleiben — sie wird sauber geschlossen (kein sync-Flip auf 'open' später)."""
+    _reset_all()
+    db = SessionLocal()
+    _make_user_pt(1)
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="resting",
+                        resting_oid="old-9", entry_oid="old-9", entry_cloid="cl-old",
+                        signal_id="old-sig", bot_filled_sz=0))
+    db.commit()
+    db.close()
+
+    trader = FakeTrader(pos=0.0)   # flat → NEW-Pfad
+    sig = _sig(action="NEW_TRADE", signal_id="new-sig", coin="ETH",
+               entry=2000.0, stop_loss=1900.0)
+    # per-coin-Filter blockt das neue NEW_TRADE in _open_new; _build_trader
+    # liefert unseren FakeTrader (kein Netzwerk).
+    orig_blk = engine._per_coin_blocked
+    orig_build = engine._build_trader
+    engine._build_trader = _async_return(trader)
+
+    def _blocked_sync(addr, coin):
+        # _open_new ruft _per_coin_blocked via to_thread → sync-Funktion.
+        return True, {"win_rate": 0.1, "trades": 20}
+    engine._per_coin_blocked = _blocked_sync
+    try:
+        asyncio.run(engine._open_or_update(1, sig, "NEW_TRADE"))
+    finally:
+        engine._per_coin_blocked = orig_blk
+        engine._build_trader = orig_build
+
+    # Die alte Bot-Entry-Order wurde gezielt gecancelt (per oid), kein Sweep.
+    assert ("cancel_order_oid", "ETH", "old-9") in trader.calls, trader.calls
+    # KEINE 'resting'-Row darf zurückbleiben (Zombie).
+    db = SessionLocal()
+    try:
+        resting = (db.query(ManagedTrade)
+                   .filter(ManagedTrade.user_id == 1, ManagedTrade.coin == "ETH",
+                           ManagedTrade.status == "resting").all())
+    finally:
+        db.close()
+    assert resting == [], f"keine Zombie-resting-Row erlaubt, hab {[(m.id, m.status) for m in resting]}"
+    # place_entry wurde nicht aufgerufen (Gate hat geskippt).
+    assert all(c[0] != "place_entry" for c in trader.calls), trader.calls
+    print("no_zombie_resting_row_on_skip: OK")
+
+
+# ── (12) H-5: place_protection RAISED → Fail-Pfad, kein Crash ────────────────
+def test_protection_raise_routes_to_fail_path():
+    """H-5: place_protection wirft eine Exception (statt sl_ok=False) → _open_new
+    routet in DENSELBEN Notfallpfad (close_position) statt zu crashen."""
+    _reset_all()
+    trader = FakeTrader(entry_filled=True, close_ok=True)
+
+    def _raise(*a, **k):
+        raise RuntimeError("HL non-transient reject")
+    trader.place_protection = _raise
+
+    sig = _sig(signal_id="h5-1", coin="BTC", entry=70000.0, stop_loss=68000.0)
+    with _NoCoinFilter(), _AlertRecorder():
+        # Darf NICHT raisen.
+        asyncio.run(engine._open_new(trader, _fake_user(1), sig))
+
+    assert ("close_position", "BTC") in trader.calls, \
+        f"protection-raise muss in den close-Notfallpfad führen: {trader.calls}"
+    errs = _activities(1, "error")
+    assert any("SL after entry failed" in t or "EMERGENCY" in t for t in errs), errs
+    print("protection_raise_routes_to_fail_path: OK")
+
+
+# ── (13) H-8: sub-min Delta → KEIN force-close ──────────────────────────────
+def test_sub_min_delta_no_force_close():
+    """H-8: ein winziger Fill (Delta-Notional < MIN_NOTIONAL) → der Watcher
+    forciert KEINEN frischen Stop und schließt vor allem NICHT die Position."""
+    _reset_all()
+    db = SessionLocal()
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="resting",
+                        resting_oid="222", entry_oid="222", entry_cloid="cl-y",
+                        signal_id="h8-1", bot_filled_sz=0))
+    db.commit()
+    db.close()
+
+    # entry=2000, Fill 0.001 → Notional $2 < $10 MIN → sub-min.
+    trader = FakeTrader(pos=0.001, order_filled_sz=0.001, order_status="partial",
+                        sl_ok=False)   # selbst wenn protect failen würde: kein close
+    engine.config.MIN_NOTIONAL_USDC = 10
+    sig = _sig(signal_id="h8-1", coin="ETH", entry=2000.0, stop_loss=1900.0)
+    orig_poll, orig_to = engine.config.ENTRY_POLL_S, engine.config.ENTRY_FILL_TIMEOUT_S
+    engine.config.ENTRY_POLL_S = 0
+    engine.config.ENTRY_FILL_TIMEOUT_S = 1
+    try:
+        asyncio.run(engine._protect_when_filled(trader, 1, sig, True, [],
+                                                resting_oid="222", entry_cloid="cl-y"))
+    finally:
+        engine.config.ENTRY_POLL_S = orig_poll
+        engine.config.ENTRY_FILL_TIMEOUT_S = orig_to
+
+    assert ("close_position", "ETH") not in trader.calls, \
+        f"sub-min Delta darf NIE force-closen: {trader.calls}"
+    print("sub_min_delta_no_force_close: OK")
+
+
+# ── (14) H-13: mark==0 → refuse (kein blindes cancel+replace) ───────────────
+def test_adjust_refuses_on_unreadable_mark():
+    """H-13: all_mids-Fail (mark=0) → _adjust cancelt/re-protectet NICHT blind,
+    der alte Schutz bleibt aktiv + error-Activity."""
+    _reset_all()
+    db = SessionLocal()
+    db.add(ManagedTrade(user_id=1, coin="ETH", direction="LONG", entry=2000.0,
+                        stop_loss=1900.0, take_profits="[]", status="open",
+                        entry_oid="e1", entry_cloid="cl-1", bot_filled_sz=2.0))
+    db.commit()
+    db.close()
+
+    trader = FakeTrader(pos=2.0)
+    orig_mark = engine._get_mark
+    engine._get_mark = lambda coin: 0.0   # Read-Fail
+    try:
+        sig = _sig(action="UPDATE_TRADE", signal_id="h13-1", entry=None, stop_loss=1950.0)
+        u = types.SimpleNamespace(id=1)
+        asyncio.run(engine._adjust(trader, u, sig, 2.0))
+    finally:
+        engine._get_mark = orig_mark
+
+    assert trader.protection_calls == [], "kein blindes place_protection bei mark=0"
+    assert all(c[0] != "cancel_orders" for c in trader.calls), \
+        f"kein cancel des alten Schutzes bei mark=0: {trader.calls}"
+    errs = _activities(1, "error")
+    assert any("mark price unreadable" in t for t in errs), errs
+    print("adjust_refuses_on_unreadable_mark: OK")
+
+
+# ── (15) H-16: absoluter Notional-Cap greift ────────────────────────────────
+def test_notional_cap_blocks_oversized_trade():
+    """H-16: Position-Notional > MAX_NOTIONAL_PER_TRADE → NEW_TRADE wird
+    geskippt (nicht gekürzt)."""
+    _reset_all()
+    trader = FakeTrader(entry_filled=True)
+    # risk 2% × $10k = $200 / $100 SL-Dist = 2.0 qty × $2000 = $4000 Notional.
+    sig = _sig(signal_id="cap-1", coin="ETH", entry=2000.0, stop_loss=1900.0)
+    orig = getattr(engine.config, "MAX_NOTIONAL_PER_TRADE", None)
+    engine.config.MAX_NOTIONAL_PER_TRADE = 1000   # 1000 < 4000 → blocken
+    try:
+        with _NoCoinFilter():
+            asyncio.run(engine._open_new(trader, _fake_user(1), sig))
+    finally:
+        if orig is None:
+            try:
+                delattr(engine.config, "MAX_NOTIONAL_PER_TRADE")
+            except AttributeError:
+                pass
+        else:
+            engine.config.MAX_NOTIONAL_PER_TRADE = orig
+
+    assert all(c[0] != "place_entry" for c in trader.calls), \
+        f"über dem Notional-Cap darf NICHT geöffnet werden: {trader.calls}"
+    skips = _activities(1, "skip")
+    assert any("per-trade cap" in t for t in skips), skips
+    print("notional_cap_blocks_oversized_trade: OK")
+
+
+def test_notional_cap_zero_disables():
+    """H-16: MAX_NOTIONAL_PER_TRADE=0 → Cap aus, Trade läuft."""
+    _reset_all()
+    trader = FakeTrader(entry_filled=True)
+    sig = _sig(signal_id="cap-2", coin="ETH", entry=2000.0, stop_loss=1900.0)
+    orig = getattr(engine.config, "MAX_NOTIONAL_PER_TRADE", None)
+    engine.config.MAX_NOTIONAL_PER_TRADE = 0
+    try:
+        with _NoCoinFilter():
+            asyncio.run(engine._open_new(trader, _fake_user(1), sig))
+    finally:
+        if orig is None:
+            try:
+                delattr(engine.config, "MAX_NOTIONAL_PER_TRADE")
+            except AttributeError:
+                pass
+        else:
+            engine.config.MAX_NOTIONAL_PER_TRADE = orig
+    assert any(c[0] == "place_entry" for c in trader.calls), \
+        f"Cap=0 muss den Trade durchlassen: {trader.calls}"
+    print("notional_cap_zero_disables: OK")
+
+
+# Helper: User für die H-3-Multi-User-Pfad-Tests (FakeTrader umgeht _build_trader
+# nicht in _open_or_update — der baut über _build_trader; wir patchen ihn).
+def _make_user_pt(user_id=1):
+    db = SessionLocal()
+    try:
+        u = User(id=user_id, email=f"pt{user_id}@test.local", password_hash="x",
+                 hl_account_address="0xABC", hl_api_secret_enc="enc", bot_active=True,
+                 risk_pct=0.02, leverage=10, max_open_positions=10, capital_cap_usdc=0,
+                 max_drawdown_pct=0, peak_account_value=0)
+        db.add(u)
+        db.commit()
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     test_open_new_happy_path()
     test_sl_fail_and_emergency_close_fail()
@@ -489,4 +843,14 @@ if __name__ == "__main__":
     test_round_px_hl_rules()
     test_referral_state_parses_referred_by()
     test_set_referrer_ok_and_failsafe()
+    test_open_new_persists_bot_ownership()
+    test_adjust_skips_when_position_exceeds_bot_size()
+    test_adjust_manages_only_bot_size()
+    test_watcher_protects_only_order_fill()
+    test_no_zombie_resting_row_on_skip()
+    test_protection_raise_routes_to_fail_path()
+    test_sub_min_delta_no_force_close()
+    test_adjust_refuses_on_unreadable_mark()
+    test_notional_cap_blocks_oversized_trade()
+    test_notional_cap_zero_disables()
     print("\nALLE TRADING-PATH-TESTS BESTANDEN ✅")

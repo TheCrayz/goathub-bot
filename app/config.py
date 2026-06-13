@@ -86,7 +86,39 @@ for _idx, _key in enumerate(ENCRYPTION_KEYS):
 ENCRYPTION_KEY = ENCRYPTION_KEYS[0]
 
 # Hyperliquid
-HL_TESTNET = _b("HL_TESTNET", "true")
+# 2026-06-13 H-17: HL_TESTNET STRIKT parsen (fail-closed). Vorher machte _b()
+# aus JEDEM nicht erkannten Wert False → ein Tippfehler wie HL_TESTNET="ture"
+# oder "True " landete STILL auf MAINNET (= echtes Geld, gefährliche Richtung).
+# Jetzt: nur explizit erkannte true/false-Werte sind erlaubt; ein gesetzter,
+# aber unparsebarer Wert lässt den Import hart fehlschlagen (wie der
+# JWT_SECRET-/Fernet-Hard-Fail oben). Ein FEHLENDES HL_TESTNET nimmt weiter
+# sauber den Default (testnet=true).
+_TRUE_VALS = ("1", "true", "yes", "on")
+_FALSE_VALS = ("0", "false", "no", "off")
+
+
+def _strict_bool(n, d):
+    raw = _g(n)
+    if raw is None:
+        return d          # nicht gesetzt → Default (kein Hard-Fail)
+    s = str(raw).strip().lower()
+    if s in _TRUE_VALS:
+        return True
+    if s in _FALSE_VALS:
+        return False
+    raise RuntimeError(
+        f"{n}={raw!r} ist kein gültiger Boolean. Erlaubt sind "
+        f"{_TRUE_VALS + _FALSE_VALS}. Ein Tippfehler hier (z.B. 'ture') würde "
+        f"sonst STILL auf Mainnet schalten — der Service startet deshalb nicht.")
+
+
+HL_TESTNET = _strict_bool("HL_TESTNET", True)
+
+# Beim Import gut sichtbar loggen, auf welchem Netz wir laufen — eine
+# Fehl-Konfiguration soll im Boot-Log sofort ins Auge springen.
+import logging as _net_logging
+_net_logging.getLogger("goathub.config").warning(
+    "NET=%s (HL_TESTNET=%s)", "TESTNET" if HL_TESTNET else "MAINNET", HL_TESTNET)
 
 # Referral / Builder-Code (Michaels Gebühren-Anteil)
 BUILDER_ADDRESS = _g("BUILDER_ADDRESS")      # deine HL-Adresse (braucht >=100 USDC perps)
@@ -120,6 +152,11 @@ DEFAULT_RISK_PCT = _f("DEFAULT_RISK_PCT", 0.005)   # 0.5% statt 1% — half so a
 DEFAULT_LEVERAGE = _f("DEFAULT_LEVERAGE", 20)     # Max-Cap 20 für neue User (war 50). Auto-Lev passt sich an SL+conf an.
 DEFAULT_MAX_OPEN = _i("DEFAULT_MAX_OPEN", 5)      # max 5 concurrent positions statt 10
 MIN_NOTIONAL_USDC = _f("MIN_NOTIONAL_USDC", 10)
+# 2026-06-13 H-16 (Agent B): absoluter USD-Cap für die NOTIONAL (size × price)
+# EINER einzelnen Position. Hard-Limit gegen eine fehlerhafte/feindliche
+# Size-Berechnung, die unabhängig von Risk-%/Leverage eine riesige Order
+# aufmachen würde. 0 = aus (kein Cap). engine.H-16 erzwingt das beim Sizing.
+MAX_NOTIONAL_PER_TRADE = _f("MAX_NOTIONAL_PER_TRADE", 50000)
 MIN_CONFIDENCE = _f("MIN_CONFIDENCE", 0.75)
 ENTRY_FILL_TIMEOUT_S = _i("ENTRY_FILL_TIMEOUT_S", 300)   # 5 min (Phase 2 von 15→5 Min)
 ENTRY_POLL_S = _i("ENTRY_POLL_S", 4)                     # alle 4s pollen (war 6)

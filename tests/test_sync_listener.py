@@ -84,13 +84,20 @@ def _make_user(db, *, user_id=1, bot_active=True, hl_account_address="0x12E3",
 
 
 def _make_managed(db, *, user_id=1, coin="BTC", direction="LONG", entry=70000.0,
-                  stop_loss=68000.0, status="open"):
+                  stop_loss=68000.0, status="open", resting_oid=None,
+                  entry_oid=None, entry_cloid=None, updated_at=None):
     mt = ManagedTrade(
         user_id=user_id, coin=coin, direction=direction, entry=entry,
         stop_loss=stop_loss, take_profits="[]", status=status,
+        resting_oid=resting_oid, entry_oid=entry_oid, entry_cloid=entry_cloid,
     )
     db.add(mt)
     db.commit()
+    # updated_at hat onupdate=utcnow → nach dem commit explizit zurückdatieren
+    # (H-2-Tests brauchen eine Row, die älter als der Watcher-Grace-Timer ist).
+    if updated_at is not None:
+        mt.updated_at = updated_at
+        db.commit()
     return mt
 
 
@@ -305,6 +312,80 @@ def test_backfill_enabled_toggle(monkeypatch):
     assert dl._backfill_enabled() is True
 
 
+# ── Listener: H-14 toter SIGNALS_CHANNEL_ID → Alert statt stiller Ausfall ────
+class _FakeClient:
+    """discord.Client-Fake: get_channel (Cache) + fetch_channel (REST, async)
+    nach Vorgabe. raises=True → fetch_channel wirft (gelöschter Channel)."""
+    def __init__(self, get_result=None, fetch_result=None, fetch_raises=False):
+        self._get = get_result
+        self._fetch = fetch_result
+        self._fetch_raises = fetch_raises
+        self.get_calls = 0
+        self.fetch_calls = 0
+
+    def get_channel(self, cid):
+        self.get_calls += 1
+        return self._get
+
+    async def fetch_channel(self, cid):
+        self.fetch_calls += 1
+        if self._fetch_raises:
+            raise RuntimeError("Unknown Channel (404)")
+        return self._fetch
+
+
+def test_h14_resolve_channel_returns_none_when_both_fail():
+    """get_channel None + fetch_channel wirft → _resolve_signals_channel liefert
+    None (= toter Channel, oben löst das den Alert aus)."""
+    client = _FakeClient(get_result=None, fetch_raises=True)
+    ch = asyncio.run(dl._resolve_signals_channel(client))
+    assert ch is None
+    assert client.get_calls == 1 and client.fetch_calls == 1
+
+
+def test_h14_resolve_channel_get_hit_skips_fetch():
+    """get_channel trifft (Cache) → fetch_channel wird gar nicht erst gerufen."""
+    sentinel = types.SimpleNamespace(id=42)
+    client = _FakeClient(get_result=sentinel)
+    ch = asyncio.run(dl._resolve_signals_channel(client))
+    assert ch is sentinel
+    assert client.fetch_calls == 0
+
+
+def test_h14_resolve_channel_falls_back_to_fetch():
+    """get_channel None, aber fetch_channel liefert (nicht gecacht, aber lebt)."""
+    sentinel = types.SimpleNamespace(id=42)
+    client = _FakeClient(get_result=None, fetch_result=sentinel)
+    ch = asyncio.run(dl._resolve_signals_channel(client))
+    assert ch is sentinel
+    assert client.get_calls == 1 and client.fetch_calls == 1
+
+
+def test_h14_dead_channel_posts_alert(monkeypatch):
+    """H-14 (Kern): toter Channel (beide Auflösungen scheitern) → _alert ruft
+    engine._post_alert. Vorher empfing der Listener SCHWEIGEND null Signale."""
+    alerts = []
+    monkeypatch.setattr(engine, "_post_alert", lambda text, *a, **k: alerts.append(text))
+
+    # _alert geht über engine._post_alert (lazy import) → Aufruf landet in alerts.
+    client = _FakeClient(get_result=None, fetch_raises=True)
+    ch = asyncio.run(dl._resolve_signals_channel(client))
+    assert ch is None
+    # genau die on_ready-Reaktion: bei None alerten
+    if ch is None:
+        dl._alert("🚨 dead channel test")
+    assert len(alerts) == 1 and "dead channel test" in alerts[0]
+
+
+def test_h14_alert_swallows_post_errors(monkeypatch):
+    """_alert ist best-effort: ein Fehler in _post_alert darf nie nach außen
+    raisen (sonst stirbt on_ready / der Listener)."""
+    def _boom(text, *a, **k):
+        raise RuntimeError("webhook down")
+    monkeypatch.setattr(engine, "_post_alert", _boom)
+    dl._alert("anything")   # darf nicht raisen
+
+
 # ── Sync: Strike-Logik (B-#5) + LOW-5-Hook ──────────────────────────────────
 class _FakeInfo:
     """HL-Info-Fake: user_state liefert die konfigurierten assetPositions."""
@@ -406,10 +487,134 @@ def test_strike_resets_when_position_reappears(monkeypatch):
     db.close()
 
 
+# ── Sync: H-2 resting→open Fill-Verifikation via order_status ────────────────
+class _FakeTraderOS:
+    """Trader-Fake für H-2: order_status liefert den konfigurierten Status,
+    cancel_order_oid + position_size sind no-ops (best-effort-Cleanup nach Flip)."""
+    def __init__(self, status="filled", pos=0.0):
+        self._status = status
+        self._pos = pos
+        self.order_status_calls = []
+        self.cancel_oid_calls = []
+
+    def order_status(self, oid=None, cloid=None):
+        self.order_status_calls.append((oid, cloid))
+        return {"status": self._status, "filled_sz": 0.5, "raw": {}}
+
+    def cancel_order_oid(self, coin, oid):
+        self.cancel_oid_calls.append((coin, oid))
+        return {"ok": True, "already_filled": False}
+
+    def position_size(self, coin):
+        return self._pos
+
+
+def _old_ts():
+    """updated_at weit jenseits des Watcher-Grace-Fensters (300 + 2×60 = 420s)."""
+    import datetime as _dt
+    return _dt.datetime.utcnow() - _dt.timedelta(hours=1)
+
+
+def test_h2_resting_flips_only_when_bot_entry_filled(monkeypatch):
+    """H-2: resting-Row + HL-Position im Coin flippt NUR dann auf 'open', wenn
+    trader.order_status den BOT-Entry als (teil)gefüllt bestätigt."""
+    _reset_db()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed(db, user_id=1, coin="BTC", status="resting",
+                       entry_oid="555", entry_cloid="0xabc", updated_at=_old_ts())
+    mt_id = mt.id
+    db.close()
+
+    # HL meldet eine BTC-Position (kann Bot ODER manuell sein — order_status entscheidet).
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfo([("BTC", 0.5)]))
+    fake = _FakeTraderOS(status="filled")
+
+    async def _fake_build_trader(u):
+        return fake
+
+    monkeypatch.setattr(engine, "_build_trader", _fake_build_trader)
+
+    asyncio.run(sync._reconcile_one_user(1, "0x12E3"))
+
+    db = SessionLocal()
+    assert db.get(ManagedTrade, mt_id).status == "open"   # verifizierter Bot-Fill → Flip
+    db.close()
+    # order_status wurde mit der Bot-Order-Kennung aufgerufen
+    assert fake.order_status_calls == [("555", "0xabc")]
+    # Partial-Rest wird ownership-bewusst per cancel_order_oid geräumt (nicht Sweep)
+    assert fake.cancel_oid_calls == [("BTC", 555)]
+
+
+def test_h2_no_flip_when_order_status_open(monkeypatch):
+    """H-2 (Kern): HL hat eine Position im Coin, aber der BOT-Entry ist laut
+    order_status noch 'open' (= NICHT gefüllt) → die Position gehört NICHT dem
+    Bot (manuelle User-Position). Die resting-Row darf NICHT auf 'open' flippen,
+    sonst hängt der Coverage-Reconciler den alten SL/TP an die fremde Position."""
+    _reset_db()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed(db, user_id=1, coin="BTC", status="resting",
+                       entry_oid="555", entry_cloid="0xabc", updated_at=_old_ts())
+    mt_id = mt.id
+    db.close()
+
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfo([("BTC", 0.5)]))
+    fake = _FakeTraderOS(status="open")   # Bot-Entry ruht noch — kein Bot-Fill
+
+    async def _fake_build_trader(u):
+        return fake
+
+    monkeypatch.setattr(engine, "_build_trader", _fake_build_trader)
+
+    asyncio.run(sync._reconcile_one_user(1, "0x12E3"))
+
+    db = SessionLocal()
+    row = db.get(ManagedTrade, mt_id)
+    acts = db.query(Activity).filter(Activity.user_id == 1).all()
+    db.close()
+    assert row.status == "resting"        # KEIN Flip
+    assert fake.order_status_calls == [("555", "0xabc")]
+    assert fake.cancel_oid_calls == []    # nichts geflippt → nichts zu canceln
+    # keine "filled WITHOUT watcher"-Activity geschrieben
+    assert all("WITHOUT an active fill-watcher" not in (a.text or "") for a in acts)
+
+
+def test_h2_legacy_row_without_oid_uses_conservative_fallback(monkeypatch):
+    """H-2 (dokumentierter Fallback): Alt-Row OHNE entry_oid/entry_cloid (und ohne
+    resting_oid) kann nicht verifiziert werden → konservativ wie bisher flippen,
+    damit das bestehende Self-Heal nicht still ausfällt."""
+    _reset_db()
+    db = SessionLocal()
+    _make_user(db, user_id=1)
+    mt = _make_managed(db, user_id=1, coin="BTC", status="resting",
+                       resting_oid=None, entry_oid=None, entry_cloid=None,
+                       updated_at=_old_ts())
+    mt_id = mt.id
+    db.close()
+
+    monkeypatch.setattr(hl_exec, "get_info", lambda testnet: _FakeInfo([("BTC", 0.5)]))
+
+    # _build_trader darf hier GAR NICHT gebraucht werden (kein verifizierbarer
+    # Kandidat) — wenn doch aufgerufen, schlägt der Test fehl.
+    async def _must_not_build(u):
+        raise AssertionError("legacy fallback darf keinen Trader bauen")
+
+    monkeypatch.setattr(engine, "_build_trader", _must_not_build)
+
+    asyncio.run(sync._reconcile_one_user(1, "0x12E3"))
+
+    db = SessionLocal()
+    assert db.get(ManagedTrade, mt_id).status == "open"   # konservativer Flip
+    db.close()
+
+
 # ── Sync: LOW-5 _cancel_leftover_orders ─────────────────────────────────────
 def test_low5_cancel_leftover_orders_guard_and_cancel(monkeypatch):
     """LOW-5: cancelt NUR wenn keine nicht-geschlossene Row mehr existiert
-    (sonst würden die frischen Orders eines neuen Signals weggeräumt)."""
+    (sonst würden die frischen Orders eines neuen Signals weggeräumt).
+    C-4 (2026-06-13): zusätzlich nur sweepen, wenn HL den Coin als FLAT meldet —
+    eine noch offene Position nach Bot-Close ist manuell und darf nicht sweepen."""
     _reset_db()
     db = SessionLocal()
     _make_user(db, user_id=1)
@@ -418,12 +623,20 @@ def test_low5_cancel_leftover_orders_guard_and_cancel(monkeypatch):
     cancels = []
 
     class _FakeTrader:
+        def __init__(self, pos=0.0):
+            self._pos = pos
+
+        def position_size(self, coin):
+            return self._pos
+
         def cancel_orders(self, coin):
             cancels.append(coin)
             return 2
 
+    flat = {"pos": 0.0}
+
     async def _fake_build_trader(u):
-        return _FakeTrader()
+        return _FakeTrader(pos=flat["pos"])
 
     monkeypatch.setattr(engine, "_build_trader", _fake_build_trader)
 
@@ -435,12 +648,20 @@ def test_low5_cancel_leftover_orders_guard_and_cancel(monkeypatch):
         await sync._cancel_leftover_orders(1, "BTC")
         assert cancels == []
 
-        # Fall 2: alle Rows closed → Cancel läuft
+        # Rows alle closed für die nächsten zwei Fälle.
         db = SessionLocal()
         for mt in db.query(ManagedTrade).all():
             mt.status = "closed"
         db.commit()
         db.close()
+
+        # Fall 2 (C-4): Row closed ABER HL zeigt noch Position → manuell → KEIN Sweep
+        flat["pos"] = 0.5
+        await sync._cancel_leftover_orders(1, "BTC")
+        assert cancels == []
+
+        # Fall 3: Row closed UND HL flat → verwaiste Bot-Trigger sweepen
+        flat["pos"] = 0.0
         await sync._cancel_leftover_orders(1, "BTC")
         assert cancels == ["BTC"]
 

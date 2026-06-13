@@ -80,6 +80,29 @@ def init_db():
                     continue
                 log.error("init_db: ALTER TABLE users ADD COLUMN %s fehlgeschlagen: %s", col, e)
                 raise
+        # 2026-06-13 C-4 (Ownership-Modell): pro managed_trade die Bot-eigene
+        # Entry-Order-ID/-Cloid + die vom BOT gefüllte Menge persistieren, damit
+        # _adjust/_cancel/Watcher/Sync NUR Bot-attribuierte Positionen/Orders
+        # anfassen — nie eine manuelle User-Position. Alle nullable OHNE Default:
+        # NULL = Legacy-Row von vor dieser Änderung → konservativer Fallback im
+        # Engine-Code (bot_filled_sz IS NULL ⇒ ownership "unknown", alte Logik).
+        # bot_filled_sz ist MoneyDecimal = TEXT auf SQLite (wie die Preis-Spalten).
+        mt_cols = {c["name"] for c in inspect(engine).get_columns("managed_trades")}
+        for col, typedef in [
+            ("entry_oid", "VARCHAR"),
+            ("entry_cloid", "VARCHAR"),
+            ("bot_filled_sz", "VARCHAR"),
+        ]:
+            if col in mt_cols:
+                continue
+            try:
+                conn.execute(text(f"ALTER TABLE managed_trades ADD COLUMN {col} {typedef}"))
+                conn.commit()
+            except OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    continue
+                log.error("init_db: ALTER TABLE managed_trades ADD COLUMN %s fehlgeschlagen: %s", col, e)
+                raise
         # 2026-06-12 #44: Composite-Index für den Idempotenz-Lookup des
         # Token-Scrapers (6-Spalten-Filter, lief vorher als Full-Scan pro
         # Log-Zeile alle 5 Minuten). ts+model+prompt+output selektiert genug.

@@ -134,6 +134,28 @@ class ManagedTrade(Base):
     status = Column(String, default="resting")          # resting | open | closed
     resting_oid = Column(String, nullable=True)
     signal_id = Column(String, nullable=True)
+    # 2026-06-13 Audit C-4: Ownership-Modell. Auf einem Multi-User-Account kann
+    # der User SELBST traden — der Bot darf nur SEINEN Anteil anfassen. Diese
+    # drei Spalten attribuieren die vom Bot platzierte Entry-Order + die vom Bot
+    # gefüllte Größe, damit _adjust/_cancel/Sweeps/Watcher/Reconciler nie fremde
+    # (manuelle) Orders canceln oder mehr als die Bot-Größe market-closen.
+    #   entry_oid    = oid der ruhenden Bot-Entry-Order (für gezieltes cancel_order_oid)
+    #   entry_cloid  = client-order-id derselben Order (für order_status-Poll)
+    #   bot_filled_sz= tatsächlich vom Bot über DIESEN Entry gefüllte Menge
+    #                  (aus order_status.filled_sz, NICHT aus position_size —
+    #                   letztere enthält auch manuelle Positionen des Users)
+    # ALLE nullable, KEIN column-default: bestehende Live-Rows (vor dieser
+    # Änderung) haben sie nicht → NULL/None, und auch eine über _save_managed
+    # angelegte Row, die bot_filled_sz NICHT explizit setzt, bleibt NULL. Die
+    # Engine nutzt "bot_filled_sz IS NOT NULL" als Ownership-Bekanntheits-Signal
+    # (_load_bot_ownership.known): NULL = Pre-Ownership-Row → konservativer
+    # Alt-Pfad (nie fremde Orders/Größe zerstören). Der neue Code-Pfad setzt
+    # bot_filled_sz IMMER explizit (0 für resting, gefüllte Menge für open).
+    # (Brief-Spec sagte "default 0" — bewusst auf NULL-default geändert, weil
+    #  genau die NULL-vs-0-Unterscheidung den Legacy-Fallback trägt.)
+    entry_oid = Column(String, nullable=True)
+    entry_cloid = Column(String, nullable=True)
+    bot_filled_sz = Column(MoneyDecimal, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 

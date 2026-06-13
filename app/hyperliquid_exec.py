@@ -17,6 +17,10 @@ from hyperliquid.utils.types import Cloid
 
 log = logging.getLogger("goathub.hl")
 
+# C-3 (2026-06-13): HTTP-Timeout (Sekunden) für ALLE HL-Calls — Info() + Exchange().
+# Param existiert in SDK 0.23.0 (api.py: session.post(..., timeout=self.timeout)).
+HL_HTTP_TIMEOUT = 10
+
 
 class HLOutageError(RuntimeError):
     """Raised when both perps + spot info-calls failed — HL is unreachable.
@@ -45,7 +49,11 @@ def get_info(testnet: bool) -> Info:
         info = _info_singletons.get(testnet)
         if info is None:
             url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
-            info = Info(url, skip_ws=True)
+            # C-3 (2026-06-13): HTTP-Timeout. Ohne timeout= blockt requests
+            # unbegrenzt auf einer hängenden Verbindung → hl_retry greift NIE,
+            # der Thread friert unter Locks ein. Mit Timeout wird ein Hänger zu
+            # einer Exception, die retry/Notfall sehen.
+            info = Info(url, skip_ws=True, timeout=HL_HTTP_TIMEOUT)
             _info_singletons[testnet] = info
         return info
 
@@ -61,7 +69,12 @@ def round_sig(x, sig=5):
 # 2026-06-08 Mainnet-Hardening A5: HL-Retry-Wrapper.
 # hl_retry und is_transient_error sind in app/hl_retry.py (standalone, kein
 # eth_account-dep, damit lokal testbar). Hier nur Re-Export für convenience.
-from app.hl_retry import hl_retry, is_transient_error  # noqa: F401
+from app.hl_retry import (  # noqa: F401
+    hl_retry,
+    is_transient_error,
+    is_hl_rate_limited,
+    note_rate_limit,
+)
 
 
 def _f(x, d=0.0):
@@ -99,8 +112,12 @@ class HyperliquidTrader:
         base = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
         self.address = account_address
         self.builder = builder            # {"b": addr, "f": int} oder None
-        self.exchange = Exchange(Account.from_key(secret_key), base, account_address=account_address)
-        self.info = Info(base, skip_ws=True)
+        # C-3 (2026-06-13): timeout= an BEIDE Clients. Ein hängender Socket im
+        # place_protection NACH gefülltem Entry hieße sonst: ungeschützte Position,
+        # unbegrenzt, ohne Alert (der Thread friert unter dem Lock ein statt zu erroren).
+        self.exchange = Exchange(Account.from_key(secret_key), base,
+                                 account_address=account_address, timeout=HL_HTTP_TIMEOUT)
+        self.info = Info(base, skip_ws=True, timeout=HL_HTTP_TIMEOUT)
         meta = self.info.meta()
         self._sz = {a["name"]: a.get("szDecimals", 2) for a in meta.get("universe", [])}
         # 2026-06-12 (Review #17): per-Asset maxLeverage aus meta merken. Viele Alts
@@ -266,7 +283,22 @@ class HyperliquidTrader:
         return coin_of(coin) in self._sz
 
     def _round_sz(self, coin, sz):
-        return round(sz, self._sz.get(coin_of(coin), 3))
+        """Größe auf szDecimals ABRUNDEN (floor), nicht round-half-even (H-9).
+
+        round() rundet bei .5 auf — bei szDecimals=0-Coins bis zu +0.5 Einheiten,
+        was realisiertes Risiko UND Margin über risk_pct/den Pre-Check-Schätzwert
+        treibt (eff×leverage-Cap lautlos gerissen). Floor garantiert sz ≤ angefragt.
+
+        Hinweis: vor dem Floor auf (decimals+4) gerundet, sonst frisst die Float-
+        Repräsentation knapp die letzte gültige Stelle (z.B. 0.3*10 = 2.9999996 →
+        floor 2 statt 3). min-notional-Recheck auf der gerundeten Zahl macht Agent B.
+        """
+        sz = _f(sz)
+        if sz <= 0:
+            return 0.0
+        dec = self._sz.get(coin_of(coin), 3)
+        scale = 10 ** dec
+        return floor(round(sz * scale, 4)) / scale
 
     def _round_px(self, coin, px):
         """HL-konforme PREIS-Rundung (Audit H-3, 2026-06-12). HL verlangt max 5
@@ -295,6 +327,125 @@ class HyperliquidTrader:
             log.debug("cancel_order(%s, %s): %s", coin, oid, e)
             return False
 
+    def cancel_order_oid(self, coin, oid):
+        """Schnittstelle für Agent B/C — cancelt GENAU EINE Order per oid und
+        parst statuses (H-6). Anders als cancel_order (best-effort bool) liefert
+        das hier auseinander, OB wirklich gecancelt wurde oder ob die Order schon
+        gefüllt war (dann lebt die Position → Caller muss in den Schutzpfad).
+
+        Returns:
+            {"ok": bool, "already_filled": bool, "raw": res}
+            ok=True  → Order ist jetzt weg (frisch gecancelt ODER schon gecancelt).
+            already_filled=True → Order war bereits GEFÜLLT (Position lebt!).
+            Bei Exception: {"ok": False, "already_filled": False, "error": str(e)}.
+        """
+        coin = coin_of(coin)
+        if oid is None:
+            return {"ok": False, "already_filled": False, "error": "no oid"}
+        try:
+            res = hl_retry(lambda: self.exchange.cancel(coin, int(oid)),
+                           max_attempts=3, label=f"cancel_order_oid {coin}")
+        except Exception as e:
+            log.warning("cancel_order_oid(%s, %s): %s", coin, oid, e)
+            return {"ok": False, "already_filled": False, "error": str(e)}
+        st = self._first_status(res)
+        # statuses[0] == "success" (String) → sauber gecancelt.
+        if st == "success":
+            return {"ok": True, "already_filled": False, "raw": res}
+        if isinstance(st, dict) and "error" in st:
+            filled = self._cancel_already_filled(st)
+            done = self._is_already_done_cancel(st)
+            # schon gefüllt ODER schon gecancelt = Order ist weg → ok=True,
+            # aber already_filled flaggt den gefährlichen Fall.
+            return {"ok": done, "already_filled": filled, "raw": res}
+        # Unerwartete Form: konservativ ok an _status_ok hängen.
+        return {"ok": self._status_ok(res), "already_filled": False, "raw": res}
+
+    def order_status(self, oid=None, cloid=None):
+        """Schnittstelle für Agent B/C — Order-Status per oid ODER cloid abfragen.
+
+        Erlaubt dem Aufrufer, einen ambigen/timeout-verlorenen Order-Ausgang
+        aufzulösen (C-2), bevor er FAILED klassifiziert. Nutzt info.query_order_by_cloid
+        bzw. query_order_by_oid (info.py: type=orderStatus). HL liefert
+        {"status":"order","order":{"order":{...},"status":"filled"|"open"|...}}
+        oder {"status":"unknownOid"}.
+
+        Returns:
+            {"status": "filled"|"open"|"partial"|"canceled"|"unknown",
+             "filled_sz": float, "raw": raw}
+            Bei Exception: {"status":"unknown","filled_sz":0.0,"error":str(e)}.
+
+        # Testnet-Verifikation ausstehend: exakte orderStatus-Response-Form/Felder
+        """
+        try:
+            if cloid is not None:
+                cl = cloid if isinstance(cloid, Cloid) else Cloid.from_str(str(cloid))
+                raw = hl_retry(lambda: self.info.query_order_by_cloid(self.address, cl),
+                               max_attempts=3, label="order_status cloid")
+            elif oid is not None:
+                raw = hl_retry(lambda: self.info.query_order_by_oid(self.address, int(oid)),
+                               max_attempts=3, label="order_status oid")
+            else:
+                return {"status": "unknown", "filled_sz": 0.0, "error": "no oid/cloid"}
+        except Exception as e:
+            log.warning("order_status(oid=%s, cloid=%s): %s", oid, cloid, e)
+            return {"status": "unknown", "filled_sz": 0.0, "error": str(e)}
+        return self._parse_order_status(raw)
+
+    @staticmethod
+    def _parse_order_status(raw):
+        """orderStatus-Response → normalisiertes {status, filled_sz, raw}.
+
+        HL-Form (defensiv, jedes Feld kann fehlen):
+            {"status":"order","order":{
+                "order":{"sz": <rest>, "origSz": <urspr.>, "coin":..., ...},
+                "status":"filled"|"open"|"canceled"|"triggered"|"rejected"|...}}
+        filled_sz = origSz - sz (rest). Bei "unknownOid"/sonst → unknown/0.
+        """
+        if not isinstance(raw, dict):
+            return {"status": "unknown", "filled_sz": 0.0, "raw": raw}
+        if raw.get("status") != "order":
+            # z.B. {"status":"unknownOid"}
+            return {"status": "unknown", "filled_sz": 0.0, "raw": raw}
+        order_wrap = raw.get("order") or {}
+        inner_status = str(order_wrap.get("status", "")).lower()
+        o = order_wrap.get("order") or {}
+        orig = _f(o.get("origSz"))
+        rest = _f(o.get("sz"))
+        filled_sz = max(0.0, orig - rest)
+        if inner_status == "filled":
+            status = "filled"
+            if filled_sz <= 0 and orig > 0:
+                filled_sz = orig  # voll gefüllt, rest evtl. nicht mehr im Feld
+        elif inner_status == "open":
+            # teilgefüllt vs. ganz offen
+            status = "partial" if filled_sz > 0 else "open"
+        elif inner_status in ("canceled", "cancelled", "rejected", "marginCanceled".lower()):
+            status = "canceled"
+        elif inner_status == "triggered":
+            # Trigger-Order ausgelöst → behandeln wir wie (teil)gefüllt-fortschreitend
+            status = "partial" if 0 < filled_sz < orig else ("filled" if filled_sz >= orig and orig > 0 else "open")
+        else:
+            status = "unknown"
+        return {"status": status, "filled_sz": filled_sz, "raw": raw}
+
+    @staticmethod
+    def _statuses(raw):
+        """Das statuses[]-Array aus einer HL-Order/Cancel-Antwort holen, oder []."""
+        try:
+            if not isinstance(raw, dict) or raw.get("status") != "ok":
+                return []
+            sts = raw["response"]["data"]["statuses"]
+            return sts if isinstance(sts, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _first_status(raw):
+        """Erstes statuses[]-Element (kann String 'success' ODER dict sein), oder None."""
+        sts = HyperliquidTrader._statuses(raw)
+        return sts[0] if sts else None
+
     @staticmethod
     def _status_ok(raw):
         """True, wenn eine Order-Antwort akzeptiert wurde (kein error-Status)."""
@@ -305,6 +456,46 @@ class HyperliquidTrader:
             return "error" not in st
         except Exception:
             return False
+
+    @staticmethod
+    def _is_duplicate_cloid_error(st):
+        """C-2: True wenn ein statuses-Element ein Duplicate-Cloid-Reject ist.
+
+        Tritt auf, wenn ein Retry dieselbe Cloid mit einer schon serverseitig
+        akzeptierten Order schickt → die ERSTE Order lebt, der Reject ist also
+        ein ERFOLG. HL-Wortlaut ist nicht offiziell dokumentiert, daher matchen
+        wir mehrere plausible Formulierungen.
+
+        # Testnet-Verifikation ausstehend: HL-Cloid-Dedup-Verhalten
+        """
+        if not isinstance(st, dict):
+            return False
+        err = str(st.get("error", "")).lower()
+        if not err:
+            return False
+        return ("cloid" in err and ("already" in err or "duplicate" in err or "exists" in err)) \
+            or "duplicate client order id" in err
+
+    @staticmethod
+    def _is_already_done_cancel(st):
+        """H-6: True wenn ein Cancel-statuses-Element 'Order ist schon weg' meldet
+        (gefüllt oder bereits gecancelt) — kein echter Fehler, aber AUCH kein
+        'wir haben gerade gecancelt'. Caller muss bei 'filled' den Schutzpfad gehen."""
+        if not isinstance(st, dict):
+            return False
+        err = str(st.get("error", "")).lower()
+        if not err:
+            return False
+        return ("filled" in err) or ("already" in err and ("cancel" in err or "canceled" in err)) \
+            or "never placed" in err or "was never placed" in err or "unknown oid" in err
+
+    @staticmethod
+    def _cancel_already_filled(st):
+        """Spezialfall von _is_already_done_cancel: Order wurde GEFÜLLT (nicht nur
+        schon gecancelt). Das ist der gefährliche Fall — die Position lebt."""
+        if not isinstance(st, dict):
+            return False
+        return "filled" in str(st.get("error", "")).lower()
 
     def set_leverage(self, coin, lev):
         # 2026-06-08 A5: 3 retries auf transient errors. Wenn final fail, return
@@ -343,11 +534,17 @@ class HyperliquidTrader:
         # nach verlorener Response (Order war serverseitig akzeptiert) ist IDEMPOTENT
         # statt eine zweite Position zu öffnen.
         cloid = Cloid.from_str("0x" + os.urandom(16).hex())
+        # C-2: cloid IMMER zurückgeben — der Caller persistiert sie auf der Row und
+        # kann einen ambigen/timeout-verlorenen Ausgang später via order_status(cloid)
+        # auflösen, statt die LIVE-Order als FAILED zu verwerfen.
+        cloid_str = cloid.to_raw()
         try:
             raw = self._order(coin, is_buy, sz, self._round_px(coin, px), {"limit": {"tif": "Gtc"}}, cloid=cloid)
         except Exception as e:
-            return {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0, "error": str(e)}
-        out = {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0, "error": None, "raw": raw}
+            return {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0,
+                    "cloid": cloid_str, "error": str(e)}
+        out = {"ok": False, "filled": False, "resting_oid": None, "filled_sz": 0.0,
+               "cloid": cloid_str, "dedup": False, "error": None, "raw": raw}
         if not isinstance(raw, dict) or raw.get("status") != "ok":
             out["error"] = raw.get("response") if isinstance(raw, dict) else str(raw)
             return out
@@ -360,6 +557,15 @@ class HyperliquidTrader:
             out.update(ok=True, filled=True, filled_sz=_f(st["filled"].get("totalSz"), sz))
         elif "resting" in st:
             out.update(ok=True, resting_oid=st["resting"].get("oid"))
+        elif self._is_duplicate_cloid_error(st):
+            # C-2: Retry traf eine schon akzeptierte Order (Response der 1. ging
+            # verloren). Die ERSTE Order lebt → ERFOLG, nicht FAILED. Wir kennen
+            # oid/Füllung hier nicht; ok+dedup signalisieren dem Caller, via
+            # order_status(cloid=...) aufzulösen statt erneut zu platzieren.
+            # # Testnet-Verifikation ausstehend: HL-Cloid-Dedup-Verhalten
+            out.update(ok=True, dedup=True, error=None)
+            log.warning("place_entry(%s): duplicate-cloid reject → treating as success "
+                        "(first order lives), resolve via order_status cloid=%s", coin, cloid_str)
         elif "error" in st:
             out["error"] = st["error"]
         return out
@@ -428,7 +634,11 @@ class HyperliquidTrader:
                                 {"trigger": {"triggerPx": self._round_px(coin, sl_px), "isMarket": True, "tpsl": "sl"}},
                                 reduce_only=True,
                                 cloid=Cloid.from_str("0x" + os.urandom(16).hex()))
-        res["sl_ok"] = self._status_ok(res["sl"])
+        # C-2: Auf dem reduce-only-SL-Pfad (5 Retries) heißt ein Duplicate-Cloid-
+        # Reject, dass die ERSTE SL-Order serverseitig lebt → sl_ok=True. Sonst
+        # würde der Caller eine KORREKT geschützte Position notfall-schließen.
+        sl_st = self._first_status(res["sl"])
+        res["sl_ok"] = self._status_ok(res["sl"]) or self._is_duplicate_cloid_error(sl_st)
         for px, frac in (tps or []):
             # Gleicher Side-Check für TPs:
             #   LONG TP  muss ÜBER mark sein  (close-sell wenn Preis steigt)
@@ -449,7 +659,15 @@ class HyperliquidTrader:
         return res
 
     def cancel_orders(self, coin):
-        """Alle offenen Orders (Entry + SL/TP) für einen Coin canceln. -> Anzahl.
+        """Alle offenen Orders (Entry + SL/TP) für einen Coin canceln. -> Anzahl
+        TATSÄCHLICH gecancelter Orders (int — Rückgabetyp unverändert, Caller in
+        engine/sync prüfen `if n`).
+
+        H-6 (2026-06-13): jeder Cancel parst jetzt statuses. Vorher zählte ein
+        "could not cancel … already filled" als Cancel-Erfolg (n++), obwohl die
+        Order GEFÜLLT war (Position lebt). Jetzt: nur echte Cancels erhöhen n;
+        ein "already filled" wird geloggt und NICHT gezählt. (Der strukturierte
+        {ok, already_filled, …}-Rückgabe-Pfad für B/C ist cancel_order_oid.)
         2026-06-08 A5: jeder cancel mit retry (must-succeed-ish).
         """
         coin = coin_of(coin)
@@ -460,36 +678,65 @@ class HyperliquidTrader:
             for o in orders or []:
                 if o.get("coin") == coin and o.get("oid") is not None:
                     try:
-                        hl_retry(lambda: self.exchange.cancel(coin, o["oid"]),
-                                 max_attempts=5, label=f"cancel {coin}")
-                        n += 1
+                        res = hl_retry(lambda: self.exchange.cancel(coin, o["oid"]),
+                                       max_attempts=5, label=f"cancel {coin}")
                     except Exception as e:
                         log.warning("cancel %s oid %s final fail: %s", coin, o.get("oid"), e)
+                        continue
+                    st = self._first_status(res)
+                    if st == "success" or self._status_ok(res):
+                        n += 1
+                    elif isinstance(st, dict) and self._cancel_already_filled(st):
+                        # H-6: GEFÜLLT, nicht gecancelt → NICHT zählen (Position lebt).
+                        log.warning("cancel %s oid %s: order already filled — NOT counted as cancel",
+                                    coin, o.get("oid"))
+                    elif isinstance(st, dict) and self._is_already_done_cancel(st):
+                        # schon weg/gecancelt — kein neuer Cancel, aber harmlos.
+                        log.debug("cancel %s oid %s: already gone", coin, o.get("oid"))
+                    else:
+                        log.warning("cancel %s oid %s: unexpected response %s", coin, o.get("oid"), res)
         except Exception as e:
             log.warning("open_orders(%s) final fail: %s", coin, e)
         return n
+
+    def _position_size_safe(self, coin):
+        """position_size, aber bei Read-Fehler None statt raise (für Re-Read-Bestätigung)."""
+        try:
+            return self.position_size(coin)
+        except Exception as e:
+            log.debug("position_size(%s) re-read failed: %s", coin, e)
+            return None
 
     def close_position(self, coin, slippage_cap=None):
         """Offene Position per Market schließen (reduce-only, ohne Builder-Code).
         Phase 6+ (2026-06-03, H-8): explizite Slippage-Cap statt HL-Default (8 %).
 
-        2026-06-12 (Review #4): market_close jetzt via hl_retry (5 Versuche,
-        must-succeed wie alle reduce-only Ops) — vorher war das der EINZIGE
-        Exchange-Call ohne Retry, ausgerechnet im SL-Fail-Sicherheitsnetz.
-        Caller MÜSSEN result['ok'] prüfen: ok=False heißt die Position ist
-        evtl. noch OFFEN und UNGESCHÜTZT (alter Schutz schon gecancelt).
+        2026-06-12 (Review #4): market_close via hl_retry (5 Versuche, must-succeed).
+
+        C-1 (2026-06-13): SDK market_close ist eine IoC reduce-only LIMIT (mid±slippage).
+        Bei No-Match im schnellen/gappenden Markt liefert HL {"status":"ok",
+        statuses:[{"error":"…could not immediately match…"}]} — top-level status=="ok"
+        ist also KEIN Beweis fürs Schließen. Außerdem: schon flat → SDK returnt None
+        (vorher fälschlich ok=False). Jetzt:
+          - psz==0 ODER raw is None  → schon flat = ERFOLG.
+          - sonst statuses parsen (gefüllte Größe aus statuses[0].filled.totalSz)
+            UND mit frischem position_size(coin) RE-READ bestätigen (kurzer Retry).
+          - ok = Re-Read zeigt flat (autoritativ; deckt Partial-IoC + No-Match ab).
+        Caller MÜSSEN result['ok'] prüfen: ok=False heißt Position evtl. noch OFFEN
+        und UNGESCHÜTZT (alter Schutz schon gecancelt).
+
+        Returns: {"ok": bool, "closed": float, "still_open": float, "raw": res}
         """
         coin = coin_of(coin)
-        # Positions-Read kann jetzt raisen (Review #0). Close ist risk-reduzierend:
-        # bei unbekanntem Status trotzdem den market_close versuchen (das SDK liest
-        # die Größe selbst) statt blind abzubrechen.
+        # Positions-Read kann raisen (Review #0). Close ist risk-reduzierend:
+        # bei unbekanntem Status trotzdem market_close versuchen (SDK liest Größe selbst).
         psz = None
         try:
             psz = self.position_size(coin)
         except Exception as e:
             log.warning("close_position(%s): position read failed (%s) — versuche market_close trotzdem", coin, e)
         if psz is not None and abs(psz) == 0:
-            return {"ok": True, "closed": 0.0}
+            return {"ok": True, "closed": 0.0, "still_open": 0.0, "raw": None}
         if slippage_cap is None:
             try:
                 from app import config as _cfg
@@ -505,11 +752,45 @@ class HyperliquidTrader:
                 except TypeError:
                     return self.exchange.market_close(coin)
             raw = hl_retry(_do, max_attempts=5, label=f"market_close {coin}")
-            ok = isinstance(raw, dict) and raw.get("status") == "ok"
-            return {"ok": ok, "closed": abs(psz) if psz is not None else 0.0, "raw": raw}
         except Exception as e:
             log.warning("market_close(%s) final fail: %s", coin, e)
-            return {"ok": False, "closed": 0.0, "error": str(e)}
+            return {"ok": False, "closed": 0.0, "still_open": abs(psz) if psz is not None else 0.0,
+                    "error": str(e), "raw": None}
+
+        # SDK gibt None zurück, wenn keine Position für den Coin gefunden wurde
+        # (for-Loop trifft kein return) → schon flat = Erfolg.
+        if raw is None:
+            return {"ok": True, "closed": abs(psz) if psz is not None else 0.0,
+                    "still_open": 0.0, "raw": None}
+
+        # Gefüllte Größe aus statuses[0].filled.totalSz (best effort).
+        filled_sz = 0.0
+        st = self._first_status(raw)
+        if isinstance(st, dict) and "filled" in st:
+            filled_sz = _f(st["filled"].get("totalSz"))
+
+        # AUTORITATIV: frischer Positions-Read bestätigt, ob wirklich flat. Deckt
+        # IoC-No-Match (status==ok aber statuses[].error) UND Partial-Fill ab.
+        # Kurzer Retry, damit ein einzelner transienter Read den Erfolg nicht maskiert.
+        still_open = None
+        for _ in range(3):
+            pos_after = self._position_size_safe(coin)
+            if pos_after is not None:
+                still_open = abs(pos_after)
+                break
+        if still_open is not None:
+            ok = (still_open == 0.0)
+            closed = (abs(psz) - still_open) if psz is not None else filled_sz
+            if closed < 0:
+                closed = filled_sz
+            return {"ok": ok, "closed": closed, "still_open": still_open, "raw": raw}
+
+        # Re-Read komplett fehlgeschlagen → NICHT blind Erfolg melden. Wir können
+        # nur den statuses-Befund nutzen: error-Status = sicher nicht ok.
+        st_error = isinstance(st, dict) and "error" in st
+        ok = self._status_ok(raw) and not st_error
+        return {"ok": ok, "closed": filled_sz,
+                "still_open": (abs(psz) - filled_sz) if psz is not None else 0.0, "raw": raw}
 
     def referral_state(self):
         """Referral-Status der MASTER-Adresse von HL lesen (read-only).

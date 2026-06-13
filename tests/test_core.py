@@ -48,6 +48,45 @@ def test_parser():
     print("parser: OK ->", s.ticker, s.direction, s.entry, [(t.percent, t.price) for t in s.take_profits])
 
 
+def test_num_rejects_nonfinite():
+    """2026-06-13 H-15: _num akzeptierte 'nan'/'inf' (float() parst sie), aber
+    das sind keine echten Levels. NaN ist besonders gefährlich, weil JEDER
+    Vergleich (auch `nan < MIN_CONFIDENCE`) False ist → ein Signal mit
+    confidence=NaN passierte das Confidence-Gate. Nicht-endliche Werte müssen
+    wie ein fehlendes Feld behandelt werden (None)."""
+    import math
+    from app.parser import _num
+    for bad in ("nan", "NaN", "-nan", "inf", "Inf", "+inf", "-inf", "infinity"):
+        assert _num(bad) is None, f"_num({bad!r}) should be None, got {_num(bad)!r}"
+    # Endliche Werte bleiben unangetastet
+    assert _num("0.85") == 0.85
+    assert _num("-0.5") == -0.5
+    assert _num("0") == 0.0
+
+    # Und der eigentliche Effekt: ein Confidence-NaN trifft das Gate jetzt nicht
+    # mehr. Vorher trug die Signal-confidence NaN; das Gate
+    # `confidence is not None and confidence < MIN_CONFIDENCE` ließ es durch
+    # (beide Teile True bzw. False-aber-not-None). Jetzt parst der Parser NaN zu
+    # None → das Gate wird übersprungen (None = "keine Confidence angegeben").
+    embed = {"title": "LONG BTC/USDT — NEW_TRADE", "description": "Signal `nanconf`",
+             "fields": [{"name": "Action", "value": "NEW_TRADE"},
+                        {"name": "Direction", "value": "LONG"},
+                        {"name": "Entry", "value": "100"},
+                        {"name": "Stop Loss", "value": "90"},
+                        {"name": "Confidence", "value": "nan"}]}
+    s = parse_signal(embed)
+    assert s is not None
+    assert s.confidence is None, f"NaN confidence must parse to None, got {s.confidence!r}"
+    # Sanity: ein NaN-Entry/SL macht das NEW_TRADE jetzt ungültig (Pflichtfelder).
+    embed_bad_entry = dict(embed)
+    embed_bad_entry["fields"] = [{"name": "Action", "value": "NEW_TRADE"},
+                                 {"name": "Direction", "value": "LONG"},
+                                 {"name": "Entry", "value": "inf"},
+                                 {"name": "Stop Loss", "value": "90"}]
+    assert parse_signal(embed_bad_entry) is None
+    print("num-nonfinite: OK -> nan/inf → None, confidence=NaN trifft das Gate nicht mehr")
+
+
 def test_bcrypt_max_length():
     """2026-06-04 Restposten #3: SHA256-pre-hash macht das 72-Byte-Limit
     obsolet. v2-Hashes (mit 'v2:'-Prefix) akzeptieren beliebig lange PWs,
@@ -214,6 +253,7 @@ if __name__ == "__main__":
     test_cap_limits_capital()
     test_no_cap_uses_full()
     test_parser()
+    test_num_rejects_nonfinite()
     test_bcrypt_max_length()
     test_auto_leverage()
     test_settings_validation_rejects()

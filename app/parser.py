@@ -1,6 +1,7 @@
 """Parst das Signal-Embed (von Bot 1 in #signals) in ein Signal.
 Dependency-frei (kein discord.py nötig) -> lokal testbar.
 """
+import math
 import re
 from dataclasses import dataclass
 
@@ -30,9 +31,17 @@ def _num(v):
     if s in ("", "—", "-"):
         return None
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return None
+    # 2026-06-13 H-15: "nan"/"inf"/"-inf" parsen als float, sind aber keine
+    # echten Levels. NaN ist besonders gefährlich: `nan < MIN_CONFIDENCE` ist
+    # False → ein Signal mit confidence=NaN passierte das Confidence-Gate und
+    # tradete (verifiziert). Nicht-endliche Werte fallen hier sauber raus
+    # (entry/SL/confidence/TP) → behandeln wie ein fehlendes Feld.
+    if not math.isfinite(f):
+        return None
+    return f
 
 
 def _fields(embed):

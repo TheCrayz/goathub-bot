@@ -4,6 +4,7 @@ Standalone module ohne eth_account-dependency, damit lokal testbar.
 Wird von hyperliquid_exec.py importiert.
 """
 import logging
+import threading
 import time as _time
 
 log = logging.getLogger("goathub.hl_retry")
@@ -14,6 +15,74 @@ _TRANSIENT_PATTERNS = (
     "timeout", "timed out", "connection", "temporarily unavailable",
     "service unavailable", "internal server error", "bad gateway",
 )
+
+# Patterns die speziell ein Rate-Limit (429) signalisieren — lösen den
+# prozessweiten Breaker aus (H-12).
+_RATE_LIMIT_PATTERNS = ("rate limit", "rate_limit", "429", "too many requests")
+
+# H-12 (2026-06-13): Prozessweiter Rate-Limit-Breaker. Wenn HL 429t, hämmern
+# bisher ALLE Caller (sync, watcher, jeder User-Entry) den schon überlasteten
+# Endpoint weiter und verschlimmern den Brownout. Wir merken uns hier EINEN
+# prozessweiten "gesperrt bis"-Zeitpunkt (monotone Uhr). Aufrufer (handle_signal,
+# sync) prüfen is_hl_rate_limited() VOR teuren Aktionen und schieben auf.
+_BACKOFF_CAP = 30.0        # max. Backoff-Sekunden für einen einzelnen 429-Retry
+_rate_limited_until = 0.0  # monotonic deadline; 0 = nicht gesperrt
+_rate_lock = threading.Lock()
+
+
+def is_rate_limit_error(err) -> bool:
+    """True wenn der Error-String spezifisch nach Rate-Limit (429) aussieht."""
+    s = str(err).lower()
+    return any(p in s for p in _RATE_LIMIT_PATTERNS)
+
+
+def note_rate_limit(retry_after: float = None):
+    """Prozessweiten Rate-Limit-Breaker setzen: HL ist bis jetzt+retry_after
+    gesperrt. retry_after None → konservativer Default (Backoff-Cap). Nur
+    verlängern, nie verkürzen (mehrere Threads können parallel 429 sehen)."""
+    delay = _BACKOFF_CAP if retry_after is None else max(0.0, float(retry_after))
+    deadline = _time.monotonic() + delay
+    global _rate_limited_until
+    with _rate_lock:
+        if deadline > _rate_limited_until:
+            _rate_limited_until = deadline
+
+
+def is_hl_rate_limited() -> bool:
+    """True solange der prozessweite Rate-Limit-Breaker aktiv ist. Aufrufer
+    (handle_signal/sync) nutzen das, um teure HL-Aktionen aufzuschieben statt
+    den gedrosselten Endpoint weiter zu hämmern (H-12)."""
+    with _rate_lock:
+        return _time.monotonic() < _rate_limited_until
+
+
+def hl_rate_limit_remaining() -> float:
+    """Restliche Sperr-Sekunden des Breakers (0.0 wenn nicht gesperrt)."""
+    with _rate_lock:
+        return max(0.0, _rate_limited_until - _time.monotonic())
+
+
+def _retry_after_from_exc(err) -> float:
+    """Versucht ein Retry-After (Sekunden) aus einer HL-ClientError zu lesen.
+
+    SDK ClientError trägt `.header` (requests-Headers der 4xx-Antwort, siehe
+    api.py:38/42) — daraus 'Retry-After' (HTTP-Standard: Sekunden oder HTTP-Datum,
+    wir lesen nur die Sekunden-Form). None wenn nicht vorhanden/parsebar.
+    """
+    header = getattr(err, "header", None)
+    if header is None:
+        return None
+    try:
+        # requests.structures.CaseInsensitiveDict unterstützt .get
+        val = header.get("Retry-After") if hasattr(header, "get") else None
+    except Exception:
+        return None
+    if val is None:
+        return None
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return None  # HTTP-Datum-Form ignorieren wir bewusst (selten bei HL)
 
 
 def is_transient_error(err) -> bool:
@@ -43,6 +112,9 @@ def hl_retry(fn, *args, max_attempts: int = 3, backoff: float = 1.5,
         - Returns dict with status="err" → if transient text, retry; if not,
           return as-is (final attempt also returns err-response).
         - Returns success value → return immediately.
+        - H-12: bei 429/Rate-Limit wird der prozessweite Breaker (note_rate_limit)
+          gesetzt; der Sleep nutzt Retry-After (aus ClientError-Header) falls da,
+          sonst exp. Backoff — beides hart auf _BACKOFF_CAP gedeckelt.
     """
     last_exc = None
     delay = initial_delay
@@ -54,10 +126,13 @@ def hl_retry(fn, *args, max_attempts: int = 3, backoff: float = 1.5,
                 err_text = str(res.get("response", res))
                 if is_transient_error(err_text):
                     last_exc = RuntimeError(f"HL transient: {err_text[:200]}")
+                    if is_rate_limit_error(err_text):
+                        note_rate_limit()  # kein Header-Objekt im dict-Pfad
                     if attempt < max_attempts:
+                        sleep_for = min(delay, _BACKOFF_CAP)
                         log.warning("hl_retry [%s] attempt %d/%d soft-fail: %s — sleeping %.1fs",
-                                    label, attempt, max_attempts, err_text[:120], delay)
-                        _time.sleep(delay)
+                                    label, attempt, max_attempts, err_text[:120], sleep_for)
+                        _time.sleep(sleep_for)
                         delay *= backoff
                         continue
                     return res  # return the err-response on final attempt
@@ -66,10 +141,17 @@ def hl_retry(fn, *args, max_attempts: int = 3, backoff: float = 1.5,
             last_exc = e
             if not is_transient_error(e):
                 raise  # non-transient: fail fast
+            # H-12: 429 → prozessweiten Breaker setzen, Retry-After bevorzugen.
+            retry_after = None
+            if is_rate_limit_error(e):
+                retry_after = _retry_after_from_exc(e)
+                note_rate_limit(retry_after)
             if attempt < max_attempts:
+                # Retry-After (gedeckelt) hat Vorrang vor exp. Backoff.
+                sleep_for = min(retry_after if retry_after is not None else delay, _BACKOFF_CAP)
                 log.warning("hl_retry [%s] attempt %d/%d transient: %s — sleeping %.1fs",
-                            label, attempt, max_attempts, str(e)[:120], delay)
-                _time.sleep(delay)
+                            label, attempt, max_attempts, str(e)[:120], sleep_for)
+                _time.sleep(sleep_for)
                 delay *= backoff
                 continue
     if last_exc is not None:

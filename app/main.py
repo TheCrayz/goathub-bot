@@ -207,8 +207,25 @@ async def lifespan(app: FastAPI):
         log.info("Token-Usage-Scraper AUS (TOKEN_SCRAPER_ENABLED=false — "
                  "Pfad via TOKEN_USAGE_LOG_PATH/SIGNALBOT_LOG_PATH setzen).")
     yield
+    # 2026-06-13 H-4: geordneter Shutdown. Vorher wurden nur die Lifespan-Tasks
+    # gecancelt (ohne await) und engine._tasks NIE angefasst → ein Deploy konnte
+    # einen Trade-Task zwischen place_entry und _save_managed killen (nackte,
+    # unprotected Position auf Mainnet). Jetzt: ZUERST die Listener/Loops canceln
+    # (stoppt das Reinkommen neuer Signale → keine neuen Trade-Tasks mehr), DANN
+    # die bereits laufenden Trade-Tasks sauber auslaufen lassen.
+    from app import engine
     for t in tasks:
         t.cancel()
+    # In-flight Trade-Tasks (engine._tasks) drainen. Agent B baut
+    # `async def drain_tasks(timeout)` in engine.py — getattr-Fallback, falls
+    # die Funktion in diesem Deploy noch nicht existiert (dann wie bisher: nur
+    # die Lifespan-Tasks gecancelt, kein Drain).
+    drain = getattr(engine, "drain_tasks", None)
+    if drain:
+        try:
+            await drain(timeout=20)
+        except Exception as e:
+            log.warning("drain_tasks beim Shutdown fehlgeschlagen: %s", e)
 
 
 # 2026-06-04 Audit-Find: /docs, /redoc und /openapi.json waren publik ohne Auth

@@ -307,6 +307,64 @@ def test_health_is_minimal(client):
     assert r.json() == {"status": "ok"}
 
 
+# ── H-17: HL_TESTNET strikt parsen (fail-closed) ────────────────────────────
+# config.py validiert beim IMPORT — und app.config ist in diesem Prozess längst
+# importiert (gecacht). Um das Import-Verhalten unter verschiedenen
+# HL_TESTNET-Werten zu prüfen, importieren wir app.config je in einem frischen
+# Subprozess mit kontrollierter Env. JWT_SECRET/ENCRYPTION_KEY müssen gesetzt
+# sein (config validiert die zuerst), sonst träfe der falsche Hard-Fail.
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+
+def _import_config_with(hl_testnet):
+    """Importiert app.config in einem frischen Prozess. hl_testnet=None → Var
+    NICHT setzen (Default-Pfad). Gibt (returncode, stdout+stderr) zurück."""
+    env = dict(os.environ)
+    env["JWT_SECRET"] = "test-only-secret-not-prod-1234567890abcdef"
+    env["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    env.pop("HL_TESTNET", None)
+    if hl_testnet is not None:
+        env["HL_TESTNET"] = hl_testnet
+    code = (
+        "import app.config as c;"
+        "print('NET=TESTNET' if c.HL_TESTNET else 'NET=MAINNET')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    return proc.returncode, (proc.stdout + proc.stderr)
+
+
+def test_hl_testnet_missing_defaults_to_testnet():
+    """Fehlendes HL_TESTNET → sauberer Default (testnet=true), KEIN Hard-Fail."""
+    rc, out = _import_config_with(None)
+    assert rc == 0, f"import should succeed when HL_TESTNET unset:\n{out}"
+    assert "NET=TESTNET" in out, out
+
+
+def test_hl_testnet_recognized_values_parse():
+    """Explizit erkannte true/false-Werte werden korrekt geparst."""
+    for val, expect in [("true", "NET=TESTNET"), ("1", "NET=TESTNET"),
+                        ("false", "NET=MAINNET"), ("0", "NET=MAINNET"),
+                        ("FALSE", "NET=MAINNET"), ("On", "NET=TESTNET")]:
+        rc, out = _import_config_with(val)
+        assert rc == 0, f"HL_TESTNET={val!r} should import cleanly:\n{out}"
+        assert expect in out, f"HL_TESTNET={val!r} → expected {expect}:\n{out}"
+
+
+def test_hl_testnet_garbage_fails_closed():
+    """Ein GESETZTER, aber unparsebarer Wert (z.B. 'ture', 'True ' mit Space)
+    lässt den Import hart fehlschlagen — statt still auf Mainnet zu schalten."""
+    for bad in ["ture", "tru", "maybe", "yesnt", "2", "mainnet"]:
+        rc, out = _import_config_with(bad)
+        assert rc != 0, f"HL_TESTNET={bad!r} should fail the import (got rc=0):\n{out}"
+        assert "HL_TESTNET" in out, out
+        assert "Boolean" in out or "RuntimeError" in out, out
+
+
 # ── Referral: /api/referral-status ──────────────────────────────────────────
 def _connect_wallet(client, hdrs):
     """Verbindet eine valide (Master, Agent)-Wallet für den eingeloggten User."""

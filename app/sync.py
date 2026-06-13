@@ -135,7 +135,21 @@ async def _reconcile_one_user(user_id: int, address: str):
         open_coins = {(mt.id, mt.coin) for mt in mts if mt.status == "open"}
         # 2026-06-12 (Review #1): resting-Rows für die Fill-Detection mitnehmen
         # (updated_at für den Watcher-Grace-Timer).
-        resting_rows = [(mt.id, mt.coin, mt.updated_at) for mt in mts if mt.status == "resting"]
+        # H-2 (2026-06-13): zusätzlich die Bot-Entry-Order-Kennung mitsnapshotten.
+        # entry_oid/entry_cloid sind die von Agent B neu hinzugefügten Spalten;
+        # getattr-Fallback, damit sync auch gegen ein DB-Schema OHNE diese Spalten
+        # läuft (Migration evtl. noch nicht durch). resting_oid ist der bestehende
+        # Fallback — dort steht bei Alt-Rows die Entry-oid schon drin.
+        resting_rows = [
+            {
+                "id": mt.id,
+                "coin": mt.coin,
+                "updated_at": mt.updated_at,
+                "entry_oid": getattr(mt, "entry_oid", None) or mt.resting_oid,
+                "entry_cloid": getattr(mt, "entry_cloid", None),
+            }
+            for mt in mts if mt.status == "resting"
+        ]
     finally:
         db.close()
 
@@ -199,10 +213,18 @@ async def _reconcile_one_user(user_id: int, address: str):
     grace = datetime.timedelta(
         seconds=int(getattr(config, "ENTRY_FILL_TIMEOUT_S", 300)) + 2 * SYNC_INTERVAL_S)
     now = datetime.datetime.utcnow()
-    filled_resting = [
-        (mt_id, coin) for (mt_id, coin, updated_at) in resting_rows
-        if coin in hl_positions and (updated_at is None or now - updated_at > grace)
+    grace_candidates = [
+        r for r in resting_rows
+        if r["coin"] in hl_positions
+        and (r["updated_at"] is None or now - r["updated_at"] > grace)
     ]
+    # H-2 (2026-06-13): "es gibt IRGENDEINE HL-Position im Coin" reicht NICHT mehr
+    # zum Flip auf 'open'. Diese Position kann eine MANUELLE User-Position sein —
+    # der Coverage-Reconciler würde danach den alten Signal-SL/TP DRAUFSETZEN. Vor
+    # dem Flip via trader.order_status(oid/cloid) verifizieren, dass DER BOT-ENTRY
+    # wirklich (teil-)gefüllt ist. order_status liegt im Trader (signierter Pfad
+    # nicht nötig, aber Agent A baut es dort an) → _build_trader lazy importieren.
+    filled_resting = await _verify_bot_fills(user_id, grace_candidates)
 
     # Jede open managed_trade prüfen
     db = SessionLocal()
@@ -211,7 +233,8 @@ async def _reconcile_one_user(user_id: int, address: str):
     try:
         closed_count = 0
         reopened_count = 0
-        for mt_id, coin in filled_resting:
+        for cand in filled_resting:
+            mt_id, coin = cand["id"], cand["coin"]
             mt = db.get(ManagedTrade, mt_id)
             if mt is None or mt.status != "resting":
                 continue
@@ -219,9 +242,12 @@ async def _reconcile_one_user(user_id: int, address: str):
             # 2026-06-13 Review-Fix: der Limit-Entry kann PARTIAL gefüllt haben —
             # der Rest der Order liegt dann noch im Buch und würde später ohne
             # Watcher/Schutz nachfüllen. Oid merken und nach dem Commit
-            # best-effort canceln (gleiches Muster wie LOW-5).
-            if mt.resting_oid:
-                resting_cancels.append((coin, mt.resting_oid))
+            # best-effort canceln. C-4-konsistent: bevorzugt die bot-eigene
+            # entry_oid (cancel_order_oid statt Coin-weitem Sweep), schützt manuelle
+            # User-Orders. resting_oid bleibt der Fallback für Alt-Rows.
+            entry_oid = cand.get("entry_oid") or mt.resting_oid
+            if entry_oid:
+                resting_cancels.append((coin, entry_oid))
             db.add(Activity(
                 user_id=user_id,
                 kind="error",
@@ -285,6 +311,86 @@ async def _reconcile_one_user(user_id: int, address: str):
         await _cancel_resting_remainder(user_id, coin, oid)
 
 
+async def _verify_bot_fills(user_id: int, candidates):
+    """H-2 (2026-06-13): Filtert die resting→open Flip-Kandidaten auf die, deren
+    BOT-EIGENER Entry-Order via trader.order_status nachweislich (teil-)gefüllt ist.
+
+    Warum: der bisherige Fill-Detect flippte eine resting-Row auf 'open', sobald
+    HL IRGENDEINE Position im Coin meldete. Diese Position kann eine MANUELLE
+    User-Position sein (Multi-User-Plattform, User traden ihr Konto selbst). Der
+    Coverage-Reconciler hängt danach den alten Signal-SL/TP an diese fremde
+    Position. Wir verifizieren deshalb pro Kandidat, dass DER BOT-ENTRY
+    (entry_oid/entry_cloid) wirklich (teil)gefüllt ist, bevor wir flippen.
+
+    order_status(oid=, cloid=) -> {"status": "filled"|"open"|"partial"|"canceled"
+    |"unknown", "filled_sz": float, ...} (Schnittstelle von Agent A in
+    hyperliquid_exec.py). "filled"/"partial" → flip; "open"/"canceled"/"unknown"
+    → NICHT flippen (kein verifizierter Bot-Fill).
+
+    Konservativer Fallback (DOKUMENTIERT): Alt-Rows OHNE entry_oid UND ohne
+    entry_cloid (vor Agent Bs Migration angelegt) können nicht verifiziert werden
+    → wie bisher flippen (Verhalten unverändert). Ebenso, wenn der Trader die
+    order_status-Methode (noch) nicht hat (Agent A nicht deployed): fail-open auf
+    das alte Verhalten, damit das bestehende Self-Heal nicht still ausfällt.
+
+    Trader-Build/Read-Fehler → KEINE Kandidaten flippen (sicherere Richtung;
+    nächste Runde versucht es erneut)."""
+    if not candidates:
+        return []
+    # Kandidaten mit verifizierbarer Order-Kennung von denen ohne trennen.
+    verifiable = [c for c in candidates if c.get("entry_oid") or c.get("entry_cloid")]
+    legacy = [c for c in candidates if not (c.get("entry_oid") or c.get("entry_cloid"))]
+    for c in legacy:
+        log.warning("position-sync user=%d coin=%s mt=%d: resting-Row OHNE entry_oid/"
+                    "entry_cloid — Bot-Fill nicht verifizierbar, konservativer Flip-Fallback",
+                    user_id, c["coin"], c["id"])
+    if not verifiable:
+        return legacy
+
+    from app.engine import _build_trader, _get_user
+    u = _get_user(user_id)
+    if u is None or not u.hl_api_secret_enc:
+        # Kein Trader baubar → verifizierbare nicht flippen, nur Legacy (Verhalten alt).
+        return legacy
+    try:
+        trader = await _build_trader(u)
+    except Exception as e:
+        log.warning("position-sync verify: trader build failed user=%d: %s — "
+                    "keine verifizierten Flips diese Runde", user_id, e)
+        return legacy
+
+    order_status = getattr(trader, "order_status", None)
+    if order_status is None:
+        # Agent As order_status noch nicht da → fail-open auf altes Verhalten.
+        log.warning("position-sync verify: trader.order_status fehlt — "
+                    "Fallback auf ungeprüften Flip (alle Kandidaten)")
+        return legacy + verifiable
+
+    confirmed = list(legacy)
+    for c in verifiable:
+        coin = c["coin"]
+        oid, cloid = c.get("entry_oid"), c.get("entry_cloid")
+        try:
+            st = await asyncio.to_thread(
+                lambda o=oid, cl=cloid: order_status(oid=o, cloid=cl))
+        except Exception as e:
+            log.warning("position-sync verify user=%d coin=%s mt=%d: order_status failed (%s) "
+                        "— nicht geflippt", user_id, coin, c["id"], e)
+            continue
+        status = (st or {}).get("status")
+        if status in ("filled", "partial"):
+            confirmed.append(c)
+        else:
+            # 'open'/'canceled'/'unknown' → KEIN verifizierter Bot-Fill. Die
+            # HL-Position (falls vorhanden) gehört nicht zu diesem Entry — Flip
+            # unterlassen, sonst setzt der Reconciler Schutz auf eine Fremd-/
+            # Manual-Position.
+            log.info("position-sync user=%d coin=%s mt=%d: Bot-Entry status=%s — "
+                     "kein Flip (HL-Position nicht bot-attribuiert)",
+                     user_id, coin, c["id"], status)
+    return confirmed
+
+
 async def _cancel_leftover_orders(user_id: int, coin: str):
     """LOW-5 (2026-06-12): TP/SL-Trigger-Orders eines gerade auf 'closed'
     geflippten Coins von HL räumen. Braucht (anders als der Read-Pfad oben)
@@ -314,6 +420,24 @@ async def _cancel_leftover_orders(user_id: int, coin: str):
             if live is not None:
                 return  # neues Signal hat den Coin schon übernommen — nicht anfassen
             trader = await _build_trader(u)
+            # C-4 (2026-06-13): cancel_orders(coin) sweept ALLE Orders des Coins —
+            # auch manuelle User-Orders. Die Row ist zwar 'closed', aber wenn HL
+            # noch eine Position im Coin zeigt, ist das eine MANUELLE Position
+            # (Bot-Position wurde ja geschlossen). Dann NICHT sweepen (würde ihren
+            # SL/manuelle Orders killen) — nur, wenn der Coin wirklich flat ist,
+            # sind die Rest-Trigger sicher verwaiste Bot-Orders. Im Zweifel (Read-
+            # Fehler) konservativ nicht sweepen, nur loggen.
+            try:
+                psz = await asyncio.to_thread(trader.position_size, coin)
+            except Exception as e:
+                log.warning("position-sync user=%d coin=%s: position read before leftover-sweep "
+                            "failed (%s) — Sweep übersprungen (manuelle Order nicht riskieren)",
+                            user_id, coin, e)
+                return
+            if abs(psz) > 0:
+                log.info("position-sync user=%d coin=%s: HL zeigt noch Position (qty %.6g) nach "
+                         "Bot-Close — vermutlich MANUELL, kein Order-Sweep", user_id, coin, abs(psz))
+                return
             n = await asyncio.to_thread(trader.cancel_orders, coin)
             if n:
                 log.info("position-sync user=%d coin=%s: %d verwaiste Order(s) nach Flip gecancelt",
@@ -327,7 +451,12 @@ async def _cancel_resting_remainder(user_id: int, coin: str, oid):
     nachdem ihre resting-Row auf 'open' geflippt wurde. Anders als
     _cancel_leftover_orders KEIN Sweep über alle Orders des Coins — die Position
     ist ja live und der Coverage-Reconciler legt gleich SL/TP nach, die wir
-    nicht wegräumen dürfen. Best-effort: Fehler nur loggen."""
+    nicht wegräumen dürfen. Best-effort: Fehler nur loggen.
+
+    C-4 (2026-06-13): bevorzugt die ownership-bewusste trader.cancel_order_oid
+    (cancelt GENAU diese oid, returnt {"ok", "already_filled"}). Fallback auf das
+    bestehende trader.cancel_order, falls Agent As Methode noch nicht deployed
+    ist. Beide fassen nur DIESE Bot-oid an — nie einen Coin-weiten Sweep."""
     try:
         from app.engine import _build_trader, _get_user, _lock_for
         u = _get_user(user_id)
@@ -335,9 +464,20 @@ async def _cancel_resting_remainder(user_id: int, coin: str, oid):
             return
         async with _lock_for(user_id, coin):
             trader = await _build_trader(u)
-            await asyncio.to_thread(trader.cancel_order, coin, int(oid))
-            log.info("position-sync user=%d coin=%s: Rest der Limit-Entry-Order %s gecancelt",
-                     user_id, coin, oid)
+            cancel_oid = getattr(trader, "cancel_order_oid", None)
+            if cancel_oid is not None:
+                res = await asyncio.to_thread(lambda: cancel_oid(coin, int(oid)))
+                if isinstance(res, dict) and res.get("already_filled"):
+                    log.info("position-sync user=%d coin=%s: Entry-Rest-Order %s war bereits "
+                             "gefüllt (cancel no-op) — voller Fill, Reconciler deckt ihn",
+                             user_id, coin, oid)
+                else:
+                    log.info("position-sync user=%d coin=%s: Rest der Limit-Entry-Order %s gecancelt",
+                             user_id, coin, oid)
+            else:
+                await asyncio.to_thread(trader.cancel_order, coin, int(oid))
+                log.info("position-sync user=%d coin=%s: Rest der Limit-Entry-Order %s gecancelt",
+                         user_id, coin, oid)
     except Exception as e:
         log.warning("resting-remainder-cancel user=%d coin=%s oid=%s failed: %s",
                     user_id, coin, oid, e)
