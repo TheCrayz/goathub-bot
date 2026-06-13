@@ -651,7 +651,7 @@ def discord_login():
     return response
 
 
-def _resolve_discord_user(db, discord_id: str, username: str, avatar: str):
+def _resolve_discord_user(discord_id: str, username: str, avatar: str):
     """Find-or-create the User row for a Discord identity and return the
     primitives needed to mint a JWT: (uid, token_version, identity).
 
@@ -661,33 +661,66 @@ def _resolve_discord_user(db, discord_id: str, username: str, avatar: str):
     (das Sync-DB-in-async-Route-Anti-Pattern). ALLE DB-Reads (auch die nach
     dem commit() durch expire_on_commit=True ausgelösten Lazy-Loads von u.id/
     Identity) passieren hier im Thread, deshalb geben wir nur fertige
-    Primitives zurück — der Caller fasst die Session danach nicht mehr an."""
-    u = db.query(User).filter(User.discord_id == discord_id).first()
-    if not u:
-        u = User(
-            email=f"discord_{discord_id}@goathub.internal",
-            password_hash="",
-            discord_id=discord_id,
-            discord_username=username,
-            discord_avatar=avatar,
-            risk_pct=config.DEFAULT_RISK_PCT,
-            leverage=config.DEFAULT_LEVERAGE,
-            max_open_positions=config.DEFAULT_MAX_OPEN,
-        )
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-    else:
-        # Update discord info
-        u.discord_username = username
-        u.discord_avatar = avatar
-        db.commit()
-    return u.id, int(getattr(u, "token_version", 0) or 0), _user_identity(u)
+    Primitives zurück.
+
+    2026-06-13 Copilot-Review: öffnet seine EIGENE SessionLocal() im Thread
+    statt die request-scoped `db` von get_db() entgegenzunehmen. Eine
+    SQLAlchemy-Session ist nicht thread-safe; get_db() erstellt sie in FastAPIs
+    Dependency-Threadpool und schließt sie dort wieder — sie über to_thread in
+    einen ANDEREN Worker zu reichen, ließe ihren Connection-Lebenszyklus über
+    mehrere Threads laufen. Eigene Session = alles auf genau einem Thread
+    (gleiches Muster wie die Background-Loops, z.B. _activity_purge_loop)."""
+    from app.db import SessionLocal
+    db = SessionLocal()
+    try:
+        u = db.query(User).filter(User.discord_id == discord_id).first()
+        if not u:
+            u = User(
+                email=f"discord_{discord_id}@goathub.internal",
+                password_hash="",
+                discord_id=discord_id,
+                discord_username=username,
+                discord_avatar=avatar,
+                risk_pct=config.DEFAULT_RISK_PCT,
+                leverage=config.DEFAULT_LEVERAGE,
+                max_open_positions=config.DEFAULT_MAX_OPEN,
+            )
+            db.add(u)
+            try:
+                db.commit()
+            except IntegrityError:
+                # 2026-06-13 Copilot-Review: Race auf UNIQUE(discord_id) —
+                # paralleler Erst-Login / Doppel-Callback desselben Discord-
+                # Accounts. Vorher knallte die IntegrityError durch → der
+                # äußere except → /?error=oauth_failed. Jetzt: rollback, die
+                # vom Konkurrenten gerade angelegte Row neu lesen und mit ihr
+                # weitermachen (Update + Token), statt den Login zu verwerfen.
+                db.rollback()
+                u = db.query(User).filter(User.discord_id == discord_id).first()
+                if u is None:
+                    raise   # keine kollidierende Row → unerwartet, weiterreichen
+                u.discord_username = username
+                u.discord_avatar = avatar
+                db.commit()
+            else:
+                db.refresh(u)
+        else:
+            # Update discord info
+            u.discord_username = username
+            u.discord_avatar = avatar
+            db.commit()
+        return u.id, int(getattr(u, "token_version", 0) or 0), _user_identity(u)
+    finally:
+        db.close()
 
 
 @app.get("/auth/callback")
-async def discord_callback(request: Request, code: str = None, state: str = None, error: str = None, db: Session = Depends(get_db)):
-    """Handle Discord OAuth callback — mit CSRF-state-Check (Phase 1)."""
+async def discord_callback(request: Request, code: str = None, state: str = None, error: str = None):
+    """Handle Discord OAuth callback — mit CSRF-state-Check (Phase 1).
+
+    2026-06-13 Copilot-Review: keine `db`-Dependency mehr — die DB-Arbeit liegt
+    komplett in _resolve_discord_user, das seine eigene Session im to_thread-
+    Worker öffnet/schließt (Session nie über Threads reichen)."""
     # CSRF-Check: state aus dem Query-Param muss mit dem httpOnly-Cookie übereinstimmen.
     expected_state = request.cookies.get(OAUTH_STATE_COOKIE)
     if not expected_state or not state or not secrets.compare_digest(state, expected_state):
@@ -732,7 +765,7 @@ async def discord_callback(request: Request, code: str = None, state: str = None
 
         # Find or create user by discord_id — off-loop (sync DB in async route).
         uid, token_version, identity = await asyncio.to_thread(
-            _resolve_discord_user, db, discord_id, username, avatar)
+            _resolve_discord_user, discord_id, username, avatar)
 
         jwt_token = make_token(uid, token_version, identity)
         # Phase 2 #18 (2026-06-02): Session-Cookie (httpOnly) ist DER Auth-Weg.

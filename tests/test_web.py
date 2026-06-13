@@ -591,3 +591,70 @@ def test_m21_activity_ts_is_utc_marked(client, monkeypatch):
     assert activity[0]["ts"].endswith("Z"), activity[0]["ts"]
     # Form: ISO-8601 mit UTC-Marker (z.B. 2026-06-13T09:00:00Z)
     assert "T" in activity[0]["ts"]
+
+
+# ── _resolve_discord_user (Copilot-Review: eigene Session + UNIQUE-Race) ──────
+# Der OAuth-Callback-Pfad war bisher untested. Diese Tests decken den Helper
+# direkt ab: er öffnet seine EIGENE SessionLocal() (keine Session über Threads)
+# und behandelt die UNIQUE(discord_id)-Race sauber.
+def test_resolve_discord_user_creates_new(client):
+    """Neuer discord_id → Row wird angelegt, identity == discord_id."""
+    uid, tv, identity = main._resolve_discord_user("disc-100", "alice", "av1")
+    assert isinstance(uid, int) and uid > 0
+    assert tv == 0
+    assert identity == "disc-100"   # _user_identity: discord_id vor email
+    db = SessionLocal()
+    try:
+        u = db.get(User, uid)
+        assert u.discord_id == "disc-100"
+        assert u.discord_username == "alice"
+        assert u.email == "discord_disc-100@goathub.internal"
+    finally:
+        db.close()
+
+
+def test_resolve_discord_user_updates_existing(client):
+    """Zweiter Call für denselben discord_id → kein neuer User, Profil-Update,
+    gleiche uid (idempotenter Login)."""
+    uid1, _, _ = main._resolve_discord_user("disc-200", "bob", "av1")
+    uid2, _, ident2 = main._resolve_discord_user("disc-200", "bob_renamed", "av2")
+    assert uid1 == uid2
+    assert ident2 == "disc-200"
+    db = SessionLocal()
+    try:
+        assert db.query(User).filter(User.discord_id == "disc-200").count() == 1
+        u = db.get(User, uid1)
+        assert u.discord_username == "bob_renamed"
+        assert u.discord_avatar == "av2"
+    finally:
+        db.close()
+
+
+def test_resolve_discord_user_handles_insert_race(client, monkeypatch):
+    """UNIQUE(discord_id)-Race: der erste SELECT sieht die Row nicht, aber der
+    INSERT kollidiert (ein paralleler Callback war schneller). Der Helper muss
+    rollbacken, die existierende Row neu lesen und mit ihr weitermachen — statt
+    die IntegrityError durchzureichen (→ /?error=oauth_failed).
+
+    Deterministisch OHNE commit-Patch: die "Gewinner"-Row vorab anlegen und nur
+    den ERSTEN .first() im Helper zwingen, None zu liefern → der echte
+    UNIQUE(discord_id)-Constraint löst die IntegrityError beim commit selbst aus.
+    """
+    pre_uid, _, _ = main._resolve_discord_user("disc-300", "winner", "avW")
+
+    import sqlalchemy.orm.query as _q
+    orig_first = _q.Query.first
+    state = {"forced": False}
+
+    def patched_first(self):
+        if not state["forced"]:
+            state["forced"] = True
+            return None   # einmalig: Insert-Pfad erzwingen
+        return orig_first(self)
+
+    monkeypatch.setattr(_q.Query, "first", patched_first, raising=True)
+
+    uid, _, ident = main._resolve_discord_user("disc-300", "loser", "avL")
+    # Muss die bereits existierende Row wiederfinden (gleiche uid), nicht crashen.
+    assert uid == pre_uid
+    assert ident == "disc-300"
