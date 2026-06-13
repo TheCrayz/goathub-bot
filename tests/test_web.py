@@ -658,3 +658,33 @@ def test_resolve_discord_user_handles_insert_race(client, monkeypatch):
     # Muss die bereits existierende Row wiederfinden (gleiche uid), nicht crashen.
     assert uid == pre_uid
     assert ident == "disc-300"
+
+
+def test_register_email_race_returns_409_not_500(client, monkeypatch):
+    """fastapi-patterns #3: der db.query(...).first()-Pre-Check ist TOCTOU-
+    anfällig. Wenn zwei parallele Registrierungen derselben Email beide am
+    Pre-Check vorbeikommen, muss der zweite commit (UNIQUE(email)-Kollision)
+    als sauberer 409 enden — NICHT als unbehandelter 500.
+
+    Deterministisch über den echten Constraint: Email vorab anlegen und nur den
+    ERSTEN .first() (den Pre-Check) zwingen, None zu liefern → der Code läuft in
+    den Insert-Pfad, der echte UNIQUE(email)-Constraint löst die IntegrityError
+    aus."""
+    r1 = _register(client, "race@test.local")
+    assert r1.status_code == 200, r1.text[:200]
+
+    import sqlalchemy.orm.query as _q
+    orig_first = _q.Query.first
+    state = {"forced": False}
+
+    def patched_first(self):
+        if not state["forced"]:
+            state["forced"] = True
+            return None   # einmalig: Pre-Check verfehlen → Insert-Pfad
+        return orig_first(self)
+
+    monkeypatch.setattr(_q.Query, "first", patched_first, raising=True)
+
+    r2 = _register(client, "race@test.local")
+    assert r2.status_code == 409, r2.text[:200]
+    assert "already registered" in r2.json()["detail"].lower()
