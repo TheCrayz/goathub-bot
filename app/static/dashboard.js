@@ -153,6 +153,28 @@ function updateWalletLens(){
   if(btn){btn.disabled=!(aok&&sok); btn.style.opacity=(aok&&sok)?"1":"0.5"; btn.style.cursor=(aok&&sok)?"pointer":"not-allowed";}
 }
 // attach as soon as inputs exist
+// ── iOS-App-Shell (2026-06-13): Splash-Fade + Bottom-Tab-Active-State ──────
+(function(){
+  var sp=document.getElementById("splash");
+  if(!sp)return;
+  function go(){setTimeout(function(){sp.classList.add("hide");sp.addEventListener("transitionend",function(){if(sp.parentNode)sp.remove();},{once:true});},1500);}
+  if(document.readyState==="complete")go(); else window.addEventListener("load",go,{once:true});
+})();
+(function(){
+  var tabs=document.querySelectorAll(".tabbar a");
+  if(!tabs.length||!("IntersectionObserver" in window))return;
+  var map={}; tabs.forEach(function(t){var s=t.getAttribute("data-sec"); if(s)map[s]=t;});
+  // Aktiver Tab = die Sektion, die gerade die Bildschirmmitte kreuzt.
+  var io=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting && map[e.target.id]){
+        tabs.forEach(function(t){t.classList.remove("active");});
+        map[e.target.id].classList.add("active");
+      }
+    });
+  },{rootMargin:"-45% 0px -50% 0px",threshold:0});
+  Object.keys(map).forEach(function(id){var el=document.getElementById(id); if(el)io.observe(el);});
+})();
 document.addEventListener("DOMContentLoaded",function(){
   if(addr){addr.addEventListener("input",updateWalletLens);}
   if(sec){sec.addEventListener("input",updateWalletLens);}
@@ -798,6 +820,7 @@ async function load(){
 }
 function render(d){
   auth.classList.add("hide");app.classList.remove("hide");
+  document.body.classList.add("authed");   // App-Shell: Bottom-Tab-Nav nur eingeloggt zeigen
   // 2026-06-08: Mainnet-aware UI — Pille + Banner-Style switch. Banner-text
   // selbst ist immer der Risk-Warning (siehe HTML); auf Mainnet zusätzlich
   // roter Style + 'real money' emphasis.
