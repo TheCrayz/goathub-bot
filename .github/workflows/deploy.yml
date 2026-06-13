@@ -9,16 +9,19 @@ jobs:
   test:
     name: 🧪 Run tests
     runs-on: ubuntu-latest
-    # 2026-06-13 L-12: CI lief vorher NUR auf 3.13, der Prod-Server (goathub.service)
-    # läuft aber Python 3.9. asyncio.Lock bindet z.B. seinen Event-Loop bei der
-    # Erzeugung — genau das Verhalten, das conftest.py umschifft und das sich
-    # zwischen 3.9 und 3.13 unterscheidet. Eine 3.9-Matrix-Leg fängt 3.9-spezifische
-    # Regressionen (Syntax wie X|Y-Unions / match, geänderte stdlib-Semantik) VOR
-    # dem Deploy ab statt erst auf dem Prod-Host.
+    # 2026-06-13 REVERT von L-12: Das 3.9-Matrix-Leg wurde wieder entfernt.
+    # Die Audit-Annahme "Prod-Server läuft Python 3.9" war FALSCH: requirements.txt
+    # pinnt fastapi==0.136.3 (Requires-Python >=3.10), und der eacc52e-Deploy lief
+    # mit pipefail'd `pip install -r requirements.txt` auf dem Prod-Host erfolgreich
+    # durch → Prod ist >=3.10. Das 3.9-Leg testete damit eine NICHT-Prod-Umgebung
+    # und blockte den Deploy (pip kann fastapi 0.136.3 nicht auf 3.9 installieren).
+    # 3.13 ist nah an Prod und hat bei allen bisherigen Deploys funktioniert.
+    # (Das lokale 3.9-Dev-venv läuft die ältere, 3.9-kompatible fastapi 0.128.8 —
+    #  Dev/Prod-fastapi-Skew, separat sauberzuziehen, blockt aber nichts.)
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.13"]
+        python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
