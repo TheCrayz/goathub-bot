@@ -1,0 +1,55 @@
+name: 🔬 Payment-Server Diagnose (read-only)
+
+# Read-only: sammelt nginx-Config, lauschende Ports, lokales /healthz und .env-Flags
+# für pay.goathub.network. Ändert NICHTS am Server. Nutzt die Bot-Deploy-Secrets.
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    name: 🔬 Diagnose
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 SSH — read-only diagnostics
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
+        with:
+          host: ${{ vars.GOATHUB_HOST }}
+          username: root
+          key: ${{ secrets.GOATHUB_DEPLOY_KEY }}
+          command_timeout: 5m
+          script: |
+            APP=/srv/goathub-payments
+            echo "===== pay-api service ====="
+            systemctl is-active goathub-pay-api 2>&1 || true
+            systemctl status goathub-pay-api --no-pager -l 2>&1 | tail -8 || true
+
+            echo "===== lauschende Ports ====="
+            ss -ltnp 2>/dev/null | grep -iE 'python|uvicorn|gunicorn|:8[0-9]{3}|:4[0-9]{3}|:3[0-9]{3}' || ss -ltnp 2>/dev/null | head -20
+
+            echo "===== lokales /healthz (gängige Ports) ====="
+            for p in 8000 8790 4790 8001 8080 9000 3000; do
+              r=$(curl -s -m3 -o /dev/null -w "%{http_code}" "localhost:$p/healthz" 2>/dev/null || echo x)
+              echo "  localhost:$p/healthz -> $r"
+            done
+
+            echo "===== nginx: vhost für pay.goathub.network ====="
+            FILES=$(grep -rl "pay.goathub.network" /etc/nginx/ 2>/dev/null)
+            echo "Dateien: $FILES"
+            for f in $FILES; do echo "----- $f -----"; sed -n '1,120p' "$f"; done
+
+            echo "===== nginx -t ====="
+            nginx -t 2>&1 | tail -6
+
+            echo "===== SSL-Zertifikat für pay.goathub.network vorhanden? ====="
+            ls -la /etc/letsencrypt/live/ 2>/dev/null || echo "kein letsencrypt/live"
+            ls -la /etc/letsencrypt/live/pay.goathub.network/ 2>/dev/null || echo "kein Cert-Dir für pay.goathub.network"
+
+            echo "===== .env-Flags (NUR gesetzt/fehlt, keine Werte) ====="
+            for k in ADMIN_TOKEN DISCORD_ROLE_MEMBER DISCORD_ROLE_SUPPORTER DISCORD_BOT_TOKEN RECIPIENT_WALLET SESSION_SECRET ENV; do
+              if grep -q "^$k=" "$APP/.env" 2>/dev/null; then echo "  $k: gesetzt"; else echo "  $k: FEHLT"; fi
+            done
+
+            echo "===== Frontend deployed? ====="
+            ls -la "$APP/frontend/admin.html" 2>/dev/null || echo "admin.html FEHLT"
+
+            echo "✅ Diagnose fertig."
