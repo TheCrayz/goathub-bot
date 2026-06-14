@@ -1447,6 +1447,17 @@ def index():
         return f.read()
 
 
+# 2026-06-14 Backdoor: schlanke Email/Passwort-Login-Seite OHNE Discord — für
+# gratis vergebene Accounts (per `python -m app.manage create-user` angelegt).
+# Die Seite postet nur an das bestehende /api/login (rate-limited + Account-
+# Lockout); der eigentliche Gate sind die Credentials. Nicht verlinkt/„hidden".
+@app.get("/backdoor", response_class=HTMLResponse)
+def backdoor_page():
+    path = os.path.join(os.path.dirname(__file__), "backdoor.html")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     """Phase 3 (2026-06-02): Admin-Dashboard. Auth-Gate sitzt im Frontend

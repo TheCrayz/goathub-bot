@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GoatHub — Access</title>
+  <meta name="robots" content="noindex,nofollow" />
+  <meta name="theme-color" content="#050607" />
+  <meta name="color-scheme" content="dark" />
+  <style>
+    :root{--bg:#050607;--panel-2:#0e1110;--line:#1c2320;--text:#eef5f1;--mut:#94a8a0;
+      --green:#4af2b2;--green-mid:#10b981;--red:#ff8a8a;--num:ui-monospace,"SF Mono",Menlo,monospace}
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);
+      min-height:100vh;display:grid;place-items:center;padding:24px;line-height:1.5}
+    body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+      background:radial-gradient(600px 400px at 20% 0%,rgba(74,242,178,.08),transparent 70%),
+                 radial-gradient(600px 420px at 100% 10%,rgba(16,185,129,.06),transparent 72%)}
+    .card{width:100%;max-width:360px;border:1px solid var(--line);border-radius:18px;
+      background:linear-gradient(160deg,#0b1310,#070d0c);padding:34px 30px}
+    .kick{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#9fe8c8;font-weight:600;text-align:center}
+    h1{font-size:1.35rem;text-align:center;margin:8px 0 4px;font-weight:600}
+    .sub{text-align:center;color:var(--mut);font-size:.82rem;margin-bottom:24px}
+    .field{margin-bottom:14px}
+    .field label{display:block;font-size:.75rem;color:var(--mut);margin-bottom:6px}
+    .field input{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:11px;
+      padding:12px 13px;color:var(--text);font-family:var(--num);font-size:.95rem;transition:border-color .2s}
+    .field input:focus{outline:none;border-color:var(--green)}
+    .err{color:var(--red);font-size:.83rem;min-height:1.1em;margin:2px 2px 12px;text-align:center}
+    button{width:100%;border:0;border-radius:999px;padding:13px;cursor:pointer;font-weight:700;font-size:.95rem;
+      background:linear-gradient(100deg,#7df5b3,#34d399 55%,#0e7c5a);color:#042016;transition:transform .2s,opacity .2s}
+    button:hover{transform:translateY(-1px)}
+    button:disabled{opacity:.55;cursor:not-allowed;transform:none}
+    .foot{margin-top:18px;text-align:center;font-size:.74rem;color:#566c63}
+    .foot a{color:#7fe9c0;text-decoration:none}
+  </style>
+</head>
+<body>
+  <form class="card" id="f" autocomplete="on">
+    <div class="kick">GoatHub Trading Bot</div>
+    <h1>Member Access</h1>
+    <p class="sub">Sign in with your account credentials.</p>
+    <div class="field"><label for="email">Email</label>
+      <input id="email" type="email" autocomplete="username" spellcheck="false" required /></div>
+    <div class="field"><label for="pw">Password</label>
+      <input id="pw" type="password" autocomplete="current-password" required /></div>
+    <p class="err" id="err"></p>
+    <button type="submit" id="btn">Sign in →</button>
+    <p class="foot">Got a Discord supporter role instead? <a href="/">Use Discord login</a></p>
+  </form>
+  <script>
+    var f=document.getElementById("f"),btn=document.getElementById("btn"),err=document.getElementById("err");
+    f.addEventListener("submit",function(e){
+      e.preventDefault();
+      err.textContent="";btn.disabled=true;btn.textContent="Signing in…";
+      var email=document.getElementById("email").value.trim().toLowerCase();
+      var password=document.getElementById("pw").value;
+      fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+        credentials:"same-origin",body:JSON.stringify({email:email,password:password})})
+        .then(function(r){
+          if(r.ok){window.location.href="/";return;}
+          return r.json().catch(function(){return {};}).then(function(j){
+            btn.disabled=false;btn.textContent="Sign in →";
+            err.textContent=(j&&j.detail)?j.detail:(r.status===429?"Too many attempts — try again later.":"Wrong email or password.");
+          });
+        })
+        .catch(function(){btn.disabled=false;btn.textContent="Sign in →";err.textContent="Network error — is the server reachable?";});
+    });
+  </script>
+</body>
+</html>
