@@ -49,6 +49,9 @@ jobs:
               if grep -q "^$k=" "$APP/.env" 2>/dev/null; then echo "  $k: gesetzt"; else echo "  $k: FEHLT"; fi
             done
 
+            echo "===== ADMIN_TOKEN sha256 (effektiver Wert, leck-frei) ====="
+            cd "$APP" && sudo -u www-data "$APP/.venv/bin/python" -c "import hashlib; from backend.config import settings; print('ADMIN_TOKEN sha256:', hashlib.sha256(settings.admin_token.encode()).hexdigest())" 2>&1 || echo "hash-check fehlgeschlagen"
+
             echo "===== Frontend deployed? ====="
             ls -la "$APP/frontend/admin.html" 2>/dev/null || echo "admin.html FEHLT"
 
