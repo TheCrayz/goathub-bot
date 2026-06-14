@@ -875,3 +875,50 @@ def test_position_sync_loop_runs_coverage_every_nth(monkeypatch):
 
     assert calls["reconcile"] == 4
     assert calls["coverage"] == 2   # Iteration 2 und 4
+
+
+# ── H-12: Sync-Loop deferred bei aktivem Rate-Limit-Breaker ──────────────────
+def test_h12_sync_tick_defers_when_rate_limited(monkeypatch):
+    """H-12 (Verdrahtung): bei aktivem prozessweiten Rate-Limit-Breaker setzt
+    _sync_tick den GANZEN Pass aus — kein Reconcile, kein iteration++. Ist der
+    Breaker aus, läuft Reconcile normal und iteration zählt hoch."""
+    from app import hl_retry
+
+    calls = {"reconcile": 0}
+
+    async def _fake_reconcile():
+        calls["reconcile"] += 1
+
+    monkeypatch.setattr(sync, "_reconcile_all_users", _fake_reconcile)
+    # Coverage-Reconciler ausklammern (er würde das HL-SDK lazy importieren).
+    monkeypatch.setattr(sync, "COVERAGE_RECONCILE_EVERY_N", 10_000)
+
+    hl_retry._rate_limited_until = 0.0
+    try:
+        # Breaker AN → Pass übersprungen, iteration unverändert, kein Reconcile.
+        hl_retry.note_rate_limit(30)
+        assert hl_retry.is_hl_rate_limited() is True
+        assert asyncio.run(sync._sync_tick(0)) == 0
+        assert calls["reconcile"] == 0
+
+        # Breaker AUS → Reconcile läuft, iteration++.
+        hl_retry._rate_limited_until = 0.0
+        assert asyncio.run(sync._sync_tick(0)) == 1
+        assert calls["reconcile"] == 1
+    finally:
+        hl_retry._rate_limited_until = 0.0
+
+
+def test_h12_note_rate_limit_caps_retry_after():
+    """Review-Fix 2026-06-14: ein großer (oder manipulierter) Retry-After-Header
+    darf den Breaker NICHT minuten-/stundenlang setzen — note_rate_limit deckelt
+    den delay hart auf _BACKOFF_CAP, sonst pausierte der Sync-Loop (SL-Coverage)
+    viel zu lange."""
+    from app import hl_retry
+    hl_retry._rate_limited_until = 0.0
+    try:
+        hl_retry.note_rate_limit(9999)        # riesiger Server-Wert
+        assert hl_retry.is_hl_rate_limited() is True
+        assert hl_retry.hl_rate_limit_remaining() <= hl_retry._BACKOFF_CAP + 0.5
+    finally:
+        hl_retry._rate_limited_until = 0.0

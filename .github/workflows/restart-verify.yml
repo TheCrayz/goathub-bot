@@ -37,7 +37,9 @@ jobs:
             docker ps --format '{{.Names}}  |  {{.Image}}  |  {{.Status}}  |  {{.Ports}}' 2>/dev/null || echo "docker nicht verfügbar / keine Container"
 
             echo "===== Neustart (richtiges Ziel) ====="
+            MODE=systemd
             if docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'goathub'; then
+              MODE=docker
               C=$(docker ps --format '{{.Names}}' | grep -iE 'goathub' | head -1)
               echo "→ Bot läuft im Docker-Container '$C' → docker restart $C"
               docker restart "$C"
@@ -48,9 +50,20 @@ jobs:
 
             echo "===== Health nach Restart ====="
             sleep 6
-            systemctl is-active goathub
+            # 2026-06-14 Security-Review (LOW): die systemctl-Checks NUR im
+            # systemd-Modus laufen. Im Docker-Modus gibt es keine goathub-Unit →
+            # `systemctl is-active goathub` schlug fehl und riss (set -e) den
+            # ganzen Workflow rot, obwohl der Container-Restart + Health ok waren.
+            # Der HTTP-Health-Check (curl) ist der modus-unabhängige Wahrheits-Check.
+            if [ "$MODE" = systemd ]; then
+              systemctl is-active goathub
+            fi
             curl -fsS localhost:8000/api/health
             echo ""
             echo "===== Uptime des Bot-Prozesses ====="
-            systemctl show goathub -p ActiveEnterTimestamp --value
+            if [ "$MODE" = systemd ]; then
+              systemctl show goathub -p ActiveEnterTimestamp --value
+            else
+              docker inspect -f '{{.State.StartedAt}}' "$C" 2>/dev/null || true
+            fi
             echo "✅ Restart + Verify fertig."

@@ -75,6 +75,12 @@ def _clean_shared_state():
     ):
         d.clear()
     del engine._signal_timestamps[:]
+    # H-12 (2026-06-14): prozessweiter Rate-Limit-Breaker ist In-Memory-Globalstate
+    # wie die engine-Caches. Nach jedem Test zurücksetzen, sonst leakt ein in einem
+    # Test gesetzter Breaker (z.B. test_hl_exec note_rate_limit(5)) in den nächsten
+    # Test — seit der H-12-Verdrahtung würde der Sync-Loop dort fälschlich deferren.
+    import app.hl_retry as _hlr
+    _hlr._rate_limited_until = 0.0
     try:
         os.remove(config.EMERGENCY_HALT_FLAG_PATH)
     except OSError:

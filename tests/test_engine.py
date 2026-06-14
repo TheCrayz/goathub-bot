@@ -226,41 +226,56 @@ def test_sl_ratchet_math():
 def test_emergency_halt_helpers():
     """2026-06-08 Mainnet-Hardening A3: file-based emergency halt flag."""
     import os
-    # Override path to avoid touching prod
+    # Override path to avoid touching prod — Original sichern + im finally
+    # zurücksetzen. config ist ein Modul-Singleton; ohne Restore leakt der Pfad
+    # global in spätere Tests (u.a. leitet der M-7-Trader-Lock seinen Pfad aus
+    # EMERGENCY_HALT_FLAG_PATH ab → Gesamtlauf-Failure).
+    _orig_halt = engine.config.EMERGENCY_HALT_FLAG_PATH
     engine.config.EMERGENCY_HALT_FLAG_PATH = "/tmp/test-halt-flag-engine"
-    if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
-        os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
+    try:
+        if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
+            os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
 
-    assert engine._emergency_halt_active() is False, "no flag yet"
-    engine._set_emergency_halt("test reason")
-    assert engine._emergency_halt_active() is True, "set should activate"
-    engine._set_emergency_halt("second set — idempotent")
-    assert engine._emergency_halt_active() is True, "still active"
-    engine._clear_emergency_halt()
-    assert engine._emergency_halt_active() is False, "clear deactivates"
-    engine._clear_emergency_halt()  # idempotent clear
-    assert engine._emergency_halt_active() is False
-    print("emergency_halt_helpers: OK")
+        assert engine._emergency_halt_active() is False, "no flag yet"
+        engine._set_emergency_halt("test reason")
+        assert engine._emergency_halt_active() is True, "set should activate"
+        engine._set_emergency_halt("second set — idempotent")
+        assert engine._emergency_halt_active() is True, "still active"
+        engine._clear_emergency_halt()
+        assert engine._emergency_halt_active() is False, "clear deactivates"
+        engine._clear_emergency_halt()  # idempotent clear
+        assert engine._emergency_halt_active() is False
+        print("emergency_halt_helpers: OK")
+    finally:
+        engine.config.EMERGENCY_HALT_FLAG_PATH = _orig_halt
 
 
 def test_signal_rate_cap_and_autohalt():
     """2026-06-08 Mainnet-Hardening A1: sliding-window rate cap auto-aktiviert halt."""
     import os
+    # Beide config-Globals sichern + im finally zurücksetzen (Modul-Singleton,
+    # sonst leakt der Halt-Pfad in spätere Tests — siehe test_emergency_halt_helpers).
+    _orig_halt = engine.config.EMERGENCY_HALT_FLAG_PATH
+    _orig_cap = engine.config.MAX_SIGNALS_PER_HOUR
     engine.config.EMERGENCY_HALT_FLAG_PATH = "/tmp/test-halt-flag-rate"
-    if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
-        os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
     engine.config.MAX_SIGNALS_PER_HOUR = 3
-    engine._signal_timestamps.clear()
+    try:
+        if os.path.exists(engine.config.EMERGENCY_HALT_FLAG_PATH):
+            os.remove(engine.config.EMERGENCY_HALT_FLAG_PATH)
+        engine._signal_timestamps.clear()
 
-    assert engine._signal_rate_check() is True, "1/3"
-    assert engine._signal_rate_check() is True, "2/3"
-    assert engine._signal_rate_check() is True, "3/3"
-    assert engine._signal_rate_check() is False, "4th should block"
-    assert engine._emergency_halt_active() is True, "auto-halt set"
+        assert engine._signal_rate_check() is True, "1/3"
+        assert engine._signal_rate_check() is True, "2/3"
+        assert engine._signal_rate_check() is True, "3/3"
+        assert engine._signal_rate_check() is False, "4th should block"
+        assert engine._emergency_halt_active() is True, "auto-halt set"
 
-    engine._clear_emergency_halt()
-    engine._signal_timestamps.clear()
-    print("signal_rate_cap_and_autohalt: OK")
+        engine._clear_emergency_halt()
+        engine._signal_timestamps.clear()
+        print("signal_rate_cap_and_autohalt: OK")
+    finally:
+        engine.config.EMERGENCY_HALT_FLAG_PATH = _orig_halt
+        engine.config.MAX_SIGNALS_PER_HOUR = _orig_cap
 
 
 def test_trade_interval_throttle():

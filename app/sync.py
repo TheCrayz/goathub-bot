@@ -22,6 +22,7 @@ import logging
 import os
 
 from app import config
+from app import hl_retry  # dependency-frei (kein SDK) → top-level import ist ok
 from app.db import SessionLocal
 from app.models import Activity, ManagedTrade, User
 
@@ -54,6 +55,42 @@ def clear_strikes(user_id, coin):
         _stale_counter.pop(k, None)
 
 
+async def _sync_tick(iteration: int) -> int:
+    """Eine Sync-Iteration: (rate-limit-gated) Reconcile-Pass + periodischer
+    Stop-Coverage-Check. Gibt die nächste `iteration`-Zahl zurück.
+
+    Aus position_sync_loop ausgelagert, damit der H-12-Defer unit-testbar ist.
+
+    H-12 (2026-06-14, Verdrahtung): prozessweiter Rate-Limit-Breaker. Wenn HL
+    gerade 429t (von hl_retry via note_rate_limit gesetzt), den GESAMTEN Pass
+    (Reconcile + Coverage — beide hämmern die Info-API) aussetzen, statt den schon
+    überlasteten Endpoint weiter zu belasten und den Brownout zu verlängern.
+    Read-only und harmlos zu deferren: Sync ist idempotent und läuft jede
+    SYNC_INTERVAL_S erneut; der Breaker-Cap (~30s) ist kürzer als ein paar Zyklen.
+    `iteration` wird beim Skip NICHT hochgezählt — der Coverage-Takt zählt nur
+    tatsächlich gelaufene Pässe.
+    """
+    if hl_retry.is_hl_rate_limited():
+        log.info("position-sync: HL rate-limited (~%.0fs verbleibend) — Pass "
+                 "übersprungen (Reconcile + Coverage)", hl_retry.hl_rate_limit_remaining())
+        return iteration
+    try:
+        await _reconcile_all_users()
+    except Exception as e:
+        log.exception("position-sync iteration failed: %s", e)
+    # 2026-06-12 (Review #3): periodischer Stop-Coverage-Check (Unter-Deckung
+    # nach SL-Gap-Through / nackt gefüllten Entry-Resten). Lazy-Import,
+    # damit sync.py ohne hyperliquid-SDK importierbar bleibt.
+    iteration += 1
+    if iteration % COVERAGE_RECONCILE_EVERY_N == 0:
+        try:
+            from app.engine import reconcile_stop_coverage
+            await reconcile_stop_coverage()
+        except Exception as e:
+            log.exception("stop-coverage reconcile failed: %s", e)
+    return iteration
+
+
 async def position_sync_loop():
     """Endlosschleife — startet im lifespan() neben dem Discord-Listener."""
     log.info("position_sync_loop started (interval=%ds, coverage every %d runs)",
@@ -62,20 +99,7 @@ async def position_sync_loop():
     await asyncio.sleep(10)
     iteration = 0
     while True:
-        try:
-            await _reconcile_all_users()
-        except Exception as e:
-            log.exception("position-sync iteration failed: %s", e)
-        # 2026-06-12 (Review #3): periodischer Stop-Coverage-Check (Unter-Deckung
-        # nach SL-Gap-Through / nackt gefüllten Entry-Resten). Lazy-Import,
-        # damit sync.py ohne hyperliquid-SDK importierbar bleibt.
-        iteration += 1
-        if iteration % COVERAGE_RECONCILE_EVERY_N == 0:
-            try:
-                from app.engine import reconcile_stop_coverage
-                await reconcile_stop_coverage()
-            except Exception as e:
-                log.exception("stop-coverage reconcile failed: %s", e)
+        iteration = await _sync_tick(iteration)
         await asyncio.sleep(SYNC_INTERVAL_S)
 
 

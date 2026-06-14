@@ -54,10 +54,13 @@ _RATE_LIMIT_PATTERNS = ("rate limit", "rate_limit", "429", "too many requests")
 # bisher ALLE Caller (sync, watcher, jeder User-Entry) den schon überlasteten
 # Endpoint weiter und verschlimmern den Brownout. Wir merken uns hier EINEN
 # prozessweiten "gesperrt bis"-Zeitpunkt (monotone Uhr).
-# STAND 2026-06-14 (Review): der State wird von hl_retry bei 429 GESETZT
-# (note_rate_limit), aber von handle_signal/sync noch NICHT abgefragt — die
-# eigentliche Defer-Logik ist noch nicht verdrahtet (Follow-up). Bis dahin
-# schützt nur der Per-Call-Backoff in hl_retry(), KEIN prozessweiter Breaker.
+# STAND 2026-06-14: hl_retry SETZT den Breaker bei 429 (note_rate_limit); der
+# SYNC-Loop (sync._sync_tick) FRAGT ihn ab und setzt bei aktivem Breaker den
+# ganzen Pass aus (read-only + idempotent → harmlos zu deferren). handle_signal
+# (Entry) konsultiert ihn BEWUSST NICHT — ein Entry-Signal soll nicht verworfen
+# werden, nur weil HL gerade drosselt; dort greift der Per-Call-Backoff in
+# hl_retry() (mit Retry-After). Der Breaker schützt also die wiederkehrende
+# Info-API-Last (Sync), nicht den einmaligen Entry.
 _BACKOFF_CAP = 30.0        # max. Backoff-Sekunden für einen einzelnen 429-Retry
 _rate_limited_until = 0.0  # monotonic deadline; 0 = nicht gesperrt
 _rate_lock = threading.Lock()
@@ -70,10 +73,14 @@ def is_rate_limit_error(err) -> bool:
 
 
 def note_rate_limit(retry_after: float = None):
-    """Prozessweiten Rate-Limit-Breaker setzen: HL ist bis jetzt+retry_after
-    gesperrt. retry_after None → konservativer Default (Backoff-Cap). Nur
-    verlängern, nie verkürzen (mehrere Threads können parallel 429 sehen)."""
-    delay = _BACKOFF_CAP if retry_after is None else max(0.0, float(retry_after))
+    """Prozessweiten Rate-Limit-Breaker setzen: HL ist bis jetzt+delay gesperrt.
+    retry_after None → konservativer Default = Backoff-Cap. Der Breaker-delay ist
+    HART auf _BACKOFF_CAP (~30s) gedeckelt — auch ein vom Server gelieferter (oder
+    manipulierter) Retry-After-Header darf den Sync-Loop NICHT minuten-/stundenlang
+    pausieren (sonst liefe der SL-Coverage-Check zu lange aus). Bei echt längerem
+    Limit setzt der nächste 429 den Breaker einfach erneut → Re-Check ~alle 30s.
+    Nur verlängern, nie verkürzen (mehrere Threads können parallel 429 sehen)."""
+    delay = _BACKOFF_CAP if retry_after is None else min(max(0.0, float(retry_after)), _BACKOFF_CAP)
     deadline = _time.monotonic() + delay
     global _rate_limited_until
     with _rate_lock:
@@ -82,10 +89,10 @@ def note_rate_limit(retry_after: float = None):
 
 
 def is_hl_rate_limited() -> bool:
-    """True solange der prozessweite Rate-Limit-Breaker aktiv ist. GEDACHT für
-    handle_signal/sync, um teure HL-Aktionen aufzuschieben (H-12) — aktuell aber
-    noch von KEINEM Aufrufer konsultiert (Verdrahtung ist Follow-up; siehe
-    Kommentar oben). Nicht als 'Schutz aktiv' annehmen, bis verdrahtet."""
+    """True solange der prozessweite Rate-Limit-Breaker aktiv ist. Vom SYNC-Loop
+    (sync._sync_tick) abgefragt, um den ganzen Reconcile/Coverage-Pass bei aktivem
+    Breaker auszusetzen statt den gedrosselten Endpoint weiter zu hämmern (H-12).
+    handle_signal nutzt das bewusst NICHT (siehe Kommentar oben)."""
     with _rate_lock:
         return _time.monotonic() < _rate_limited_until
 

@@ -518,6 +518,16 @@ _failed_logins_lock = threading.Lock()
 FAILED_LOGIN_MAX = 5
 FAILED_LOGIN_LOCK_S = 15 * 60
 
+# 2026-06-14 Security-Review Follow-up (Login User-Enumeration/Timing): der
+# Login-Pfad rechnete bcrypt NUR, wenn der User existierte UND einen Passwort-Hash
+# hatte. Ein nicht existentes Konto (oder ein OAuth-only-User ohne Passwort)
+# antwortete dadurch spürbar schneller → Timing-Orakel, mit dem ein Angreifer
+# gültige Emails durchprobieren kann. Gegenmittel: bei fehlendem echten Hash gegen
+# einen festen Wegwerf-v2-Hash prüfen, damit JEDER Fehl-Login dieselbe bcrypt-
+# Arbeit (≈ gleiche Antwortzeit) leistet. Einmalig bei Import erzeugt; der Klartext
+# ist Zufall und nirgends gespeichert, der Hash matcht also nie ein echtes Passwort.
+_DUMMY_PW_HASH = hash_pw(secrets.token_hex(16))
+
 
 @app.post("/api/login")
 @limiter.limit(LOGIN_RATE_LIMIT)
@@ -534,7 +544,14 @@ def login(request: Request, body: Login, db: Session = Depends(get_db)):
             429, f"Account temporarily locked after too many failed logins — "
                  f"try again in {wait_min} min")
     u = db.query(User).filter(User.email == email).first()
-    if not u or not verify_pw(body.password, u.password_hash):
+    # Timing-Angleich (siehe _DUMMY_PW_HASH): immer bcrypt rechnen — auch wenn der
+    # User fehlt oder (OAuth-only) keinen Passwort-Hash hat —, sonst verrät die
+    # Antwortzeit die Existenz des Kontos. Das Ergebnis selbst entscheidet nichts,
+    # wenn kein echter Hash vorliegt (dummy matcht nie); die `not u …`-Bedingung
+    # bleibt maßgeblich.
+    stored_hash = u.password_hash if (u and u.password_hash) else _DUMMY_PW_HASH
+    pw_ok = verify_pw(body.password, stored_hash)
+    if not u or not u.password_hash or not pw_ok:
         # L-9: das Inkrement + die Lockout-Entscheidung serialisieren, sonst
         # gehen parallele Fehlversuche desselben Kontos als verlorene Inkremente
         # verloren (zwei Worker schreiben beide 5 statt 5→6).
@@ -671,7 +688,7 @@ async def discord_callback(request: Request, code: str = None, state: str = None
         discord_user = await get_discord_user(access_token)
         discord_id = str(discord_user["id"])
         username = discord_user.get("username", "")
-        avatar = discord_user.get("avatar", "")
+        avatar = _valid_discord_avatar(discord_user.get("avatar"))  # None wenn kein/ungültiger Hash
 
         # Check role if guild ID and bot token are configured. role_verified
         # bleibt False, wenn das Gate NICHT konfiguriert ist — dann kann die
@@ -745,6 +762,19 @@ async def discord_callback(request: Request, code: str = None, state: str = None
         resp = RedirectResponse("/?error=oauth_failed")
         resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
         return resp
+
+
+def _valid_discord_avatar(h):
+    """2026-06-14 Security-Review (Nit): Discord-Avatar-Hash strikt validieren,
+    bevor er gespeichert und (in _user_public) ungefiltert in eine an den Browser
+    ausgelieferte cdn.discordapp.com/<img src>-URL eingesetzt wird. Gültig ist ein
+    32-stelliger Hex-Hash, optional mit 'a_'-Prefix (animiert). Alles andere → None.
+    Der Wert stammt zwar von Discords OAuth-API, aber Format-Validierung am Eingang
+    ist billige Defense-in-depth gegen unerwartete/manipulierte Inhalte in der URL."""
+    import re
+    if isinstance(h, str) and re.fullmatch(r"(a_)?[0-9a-f]{32}", h):
+        return h
+    return None
 
 
 def _user_public(u: User):

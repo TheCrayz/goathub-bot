@@ -500,11 +500,18 @@ def test_set_referrer_without_wallet_is_clean(client):
 
 
 # ── M-7: Single-Trader-Guard (exklusiver flock) ─────────────────────────────
-def test_m7_trader_lock_acquire_and_release():
+def test_m7_trader_lock_acquire_and_release(monkeypatch, tmp_path):
     """M-7: erster Acquire hält den Lock (True). Hält ein ANDERER fd denselben
     Pfad exklusiv, liefert ein frischer Acquire False (= API-only, kein
     Doppel-Trading). Release ist sauber + idempotent."""
     fcntl = pytest.importorskip("fcntl")  # POSIX-only; prod ist Linux
+    # Lock-Pfad auf eine testeigene Datei pinnen (wie test_m7_second_acquire…).
+    # Sonst leitet _trader_lock_path() den Pfad aus config.EMERGENCY_HALT_FLAG_PATH
+    # ab — und das biegt test_engine global auf /tmp/... um (un-restored), womit
+    # der Lock im Gesamtlauf auf /tmp/goathub.lock landet. Hält dort lokal ein
+    # echter goathub-Prozess (z.B. der Demo-Server) den flock, wäre der Test
+    # falsch-rot. Eigener tmp_path → reihenfolge- UND prozess-unabhängig.
+    monkeypatch.setattr(main, "_trader_lock_path", lambda: str(tmp_path / "goathub.lock"))
     # Sauberer Startzustand.
     main._release_trader_lock()
     assert main._trader_lock_fd is None
@@ -652,3 +659,44 @@ def test_m21_activity_ts_is_utc_marked(client, monkeypatch):
     assert activity[0]["ts"].endswith("Z"), activity[0]["ts"]
     # Form: ISO-8601 mit UTC-Marker (z.B. 2026-06-13T09:00:00Z)
     assert "T" in activity[0]["ts"]
+
+
+# ── 2026-06-14 Security-Review Follow-ups ────────────────────────────────────
+def test_login_nonexistent_user_indistinguishable_from_wrong_password(client):
+    """User-Enumeration-Schutz: ein nicht existentes Konto liefert exakt dieselbe
+    Antwort (Status + Wortlaut) wie ein falsches Passwort. Der Timing-Angleich via
+    _DUMMY_PW_HASH ist nicht deterministisch messbar — hier wird das beobachtbare
+    Verhalten geprüft (gleiche 401, gleicher Detail-Text)."""
+    assert _register(client, "real-user@test.local", "rightpw123").status_code == 200
+    r_wrong = _login(client, "real-user@test.local", "totally-wrong")
+    r_absent = _login(client, "no-such-user@test.local", "totally-wrong")
+    assert r_wrong.status_code == 401
+    assert r_absent.status_code == 401
+    assert r_wrong.json()["detail"] == r_absent.json()["detail"]
+
+
+def test_dummy_pw_hash_is_valid_v2_and_never_matches():
+    """Der Wegwerf-Hash ist ein echter v2-bcrypt-Hash (→ verify_pw leistet die volle
+    bcrypt-Arbeit wie bei einem echten Check, gleiche Antwortzeit) und matcht kein
+    Passwort."""
+    from app.auth import verify_pw
+    assert main._DUMMY_PW_HASH.startswith("v2:")
+    assert verify_pw("anything-at-all", main._DUMMY_PW_HASH) is False
+
+
+def test_valid_discord_avatar_accepts_only_well_formed_hashes():
+    """Nit: Avatar-Hash strikt (32 hex, optional 'a_'-Prefix) — sonst None, damit
+    nichts Unerwartetes in die <img src>-cdn-URL wandert."""
+    f = main._valid_discord_avatar
+    assert f("0123456789abcdef0123456789abcdef") == "0123456789abcdef0123456789abcdef"
+    assert f("a_" + "b" * 32) == "a_" + "b" * 32          # animiert
+    assert f("a" * 32) == "a" * 32                         # 'a' ist hex
+    # abgelehnt:
+    assert f("") is None
+    assert f(None) is None
+    assert f("xyz") is None
+    assert f("g" * 32) is None                             # nicht-hex
+    assert f("a" * 31) is None                             # zu kurz
+    assert f("a" * 33) is None                             # zu lang
+    assert f("a" * 32 + ".png?evil=1") is None             # kein Trailing-Garbage
+    assert f("../../../etc/passwd") is None                # Path-Traversal-Versuch
