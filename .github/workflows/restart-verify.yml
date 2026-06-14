@@ -1,0 +1,56 @@
+name: 🔁 Bot Restart + Verify
+
+# Manuell: prüft die deployte Version, ermittelt ob der Bot in Docker oder als
+# systemd-Dienst läuft, startet das RICHTIGE Ziel sicher neu und verifiziert die
+# Health. Startet NICHT den ganzen Docker-Daemon (andere Container laufen mit).
+on:
+  workflow_dispatch:
+
+jobs:
+  restart:
+    name: 🔁 Restart + Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 SSH — restart + verify
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262
+        with:
+          host: ${{ vars.GOATHUB_HOST }}
+          username: root
+          key: ${{ secrets.GOATHUB_DEPLOY_KEY }}
+          command_timeout: 10m
+          script: |
+            set -eo pipefail
+            cd /var/www/goathub-bot
+            git config --global --add safe.directory /var/www/goathub-bot || true
+
+            echo "===== Deployte Version ====="
+            git log --oneline -1
+
+            echo "===== Neuer Dashboard-Code auf der Platte? (Treffer = vorhanden) ====="
+            echo "  g-track:         $(grep -c 'g-track' app/static/dashboard.js || echo 0)"
+            echo "  wireCollapsibles:$(grep -c 'wireCollapsibles' app/static/dashboard.js || echo 0)"
+            echo "  tp-list (CSS):   $(grep -c 'tp-list' app/dashboard.html || echo 0)"
+
+            echo "===== Läuft der Bot in Docker oder systemd-nativ? ====="
+            systemctl cat goathub 2>/dev/null | grep -iE 'ExecStart|docker|compose' | head -5 || true
+            echo "--- docker ps ---"
+            docker ps --format '{{.Names}}  |  {{.Image}}  |  {{.Status}}  |  {{.Ports}}' 2>/dev/null || echo "docker nicht verfügbar / keine Container"
+
+            echo "===== Neustart (richtiges Ziel) ====="
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -qiE 'goathub'; then
+              C=$(docker ps --format '{{.Names}}' | grep -iE 'goathub' | head -1)
+              echo "→ Bot läuft im Docker-Container '$C' → docker restart $C"
+              docker restart "$C"
+            else
+              echo "→ Bot ist systemd-nativ (kein Bot-Container) → safe_restart.sh"
+              bash scripts/safe_restart.sh
+            fi
+
+            echo "===== Health nach Restart ====="
+            sleep 6
+            systemctl is-active goathub
+            curl -fsS localhost:8000/api/health
+            echo ""
+            echo "===== Uptime des Bot-Prozesses ====="
+            systemctl show goathub -p ActiveEnterTimestamp --value
+            echo "✅ Restart + Verify fertig."
