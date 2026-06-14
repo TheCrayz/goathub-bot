@@ -701,6 +701,14 @@ function posCardHtml(p){
   if(tps.length)near=tps.reduce((a,b)=>Math.abs(Number(b.price)-ref)<Math.abs(Number(a.price)-ref)?b:a);
   const isHit=function(t){return mark!=null&&signed(t.price)<=signed(mark);};
   const hitCount=mark!=null?tps.filter(isHit).length:0;
+  // Profit, der bei jedem TP REALISIERT wird = Kursgewinn pro Einheit (signed) ×
+  // geschlossene Menge (Positionsgröße × Anteil). Anteil aus tp.percent; fehlt er,
+  // gleichmäßig 1/N. Funktioniert für Long & Short (signed kapselt die Richtung).
+  const sizeAbs=Math.abs(size);
+  const tpProfit=function(t){
+    const frac=(t.percent!=null)?Number(t.percent)/100:(tps.length?1/tps.length:1);
+    return signed(t.price)*sizeAbs*frac;
+  };
   const noSl=hasSlKey&&p.stop_loss==null;
   // Amber-Warnung, wenn Mark näher als 1 % am SL ist
   const slWarn=sl!=null&&mark!=null&&mark>0&&Math.abs(mark-sl)/mark<=0.01;
@@ -732,7 +740,8 @@ function posCardHtml(p){
       return '<div class="tp-row'+(hit?" hit":"")+'">'+
         '<span class="tp-i">'+(hit?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l4 5 10-12"/></svg>':"")+'TP'+(i+1)+'</span>'+
         '<span class="tp-pct">'+(t.percent!=null?(esc(String(t.percent))+"%"):"")+'</span>'+
-        '<span class="tp-px">$'+esc(fmtPx(t.price))+'</span></div>';
+        '<span class="tp-px">$'+esc(fmtPx(t.price))+'</span>'+
+        '<span class="tp-pnl" title="Realisierter Profit bei diesem TP">'+esc(fmtUsdSigned(tpProfit(t)))+'</span></div>';
     }).join("");
     tpListHtml='<div class="tp-list'+(tpOpen?" open":"")+'"><div>'+rows+'</div></div>';
   }
@@ -753,8 +762,9 @@ function posCardHtml(p){
     let ticks="",nums="";
     tps.forEach(function(t,i){
       const pp=pos(t.price),hit=isHit(t);
-      ticks+='<div class="g-tick tp'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%"></div>';
-      nums+='<div class="g-num'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%">'+(i+1)+'</div>';
+      const tip='TP'+(i+1)+(t.percent!=null?(" · "+esc(String(t.percent))+"%"):"")+' → '+esc(fmtUsdSigned(tpProfit(t)));
+      ticks+='<div class="g-tick tp'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%" title="'+tip+'"></div>';
+      nums+='<div class="g-num'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%" title="'+tip+'">'+(i+1)+'</div>';
     });
     if(sl!=null)ticks+='<div class="g-tick sl" style="left:0%"></div>';
     const markPos=mark!=null?pos(mark):50;
@@ -763,7 +773,10 @@ function posCardHtml(p){
     let last=null;
     tps.forEach(function(t){if(last===null||signed(t.price)>signed(last.price))last=t;});
     const slLbl=sl!=null?("SL $"+esc(fmtPx(sl))):"No SL";
-    const tpLbl=last?("TP"+(tps.indexOf(last)+1)+" $"+esc(fmtPx(last.price))):"";
+    // Gesamt-Profit-Potenzial (alle TPs voll erreicht) — immer sichtbar am Label.
+    const totalProfit=tps.reduce(function(a,t){return a+tpProfit(t);},0);
+    const tpLbl=last?("TP"+(tps.indexOf(last)+1)+" $"+esc(fmtPx(last.price))
+        +(tps.length?(" · "+esc(fmtUsdSigned(totalProfit))):"")):"";
     const midLbl="ENTRY $"+esc(fmtPx(entry))+(tps.length?(" · "+hitCount+"/"+tps.length+" TP"):"");
     gauge='<div class="g-wrap"><div class="g-nums">'+nums+'</div>'+
       '<div class="g-track"><div class="g-mid"></div>'+ticks+marker+'</div>'+
