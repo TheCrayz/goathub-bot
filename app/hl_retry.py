@@ -53,8 +53,11 @@ _RATE_LIMIT_PATTERNS = ("rate limit", "rate_limit", "429", "too many requests")
 # H-12 (2026-06-13): Prozessweiter Rate-Limit-Breaker. Wenn HL 429t, hämmern
 # bisher ALLE Caller (sync, watcher, jeder User-Entry) den schon überlasteten
 # Endpoint weiter und verschlimmern den Brownout. Wir merken uns hier EINEN
-# prozessweiten "gesperrt bis"-Zeitpunkt (monotone Uhr). Aufrufer (handle_signal,
-# sync) prüfen is_hl_rate_limited() VOR teuren Aktionen und schieben auf.
+# prozessweiten "gesperrt bis"-Zeitpunkt (monotone Uhr).
+# STAND 2026-06-14 (Review): der State wird von hl_retry bei 429 GESETZT
+# (note_rate_limit), aber von handle_signal/sync noch NICHT abgefragt — die
+# eigentliche Defer-Logik ist noch nicht verdrahtet (Follow-up). Bis dahin
+# schützt nur der Per-Call-Backoff in hl_retry(), KEIN prozessweiter Breaker.
 _BACKOFF_CAP = 30.0        # max. Backoff-Sekunden für einen einzelnen 429-Retry
 _rate_limited_until = 0.0  # monotonic deadline; 0 = nicht gesperrt
 _rate_lock = threading.Lock()
@@ -79,9 +82,10 @@ def note_rate_limit(retry_after: float = None):
 
 
 def is_hl_rate_limited() -> bool:
-    """True solange der prozessweite Rate-Limit-Breaker aktiv ist. Aufrufer
-    (handle_signal/sync) nutzen das, um teure HL-Aktionen aufzuschieben statt
-    den gedrosselten Endpoint weiter zu hämmern (H-12)."""
+    """True solange der prozessweite Rate-Limit-Breaker aktiv ist. GEDACHT für
+    handle_signal/sync, um teure HL-Aktionen aufzuschieben (H-12) — aktuell aber
+    noch von KEINEM Aufrufer konsultiert (Verdrahtung ist Follow-up; siehe
+    Kommentar oben). Nicht als 'Schutz aktiv' annehmen, bis verdrahtet."""
     with _rate_lock:
         return _time.monotonic() < _rate_limited_until
 

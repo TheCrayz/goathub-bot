@@ -148,6 +148,50 @@ def test_registration_invite_only_returns_403(client):
         config.REGISTRATION_OPEN = orig
 
 
+def _oauth_callback(client, monkeypatch, discord_id, username="rando", state="st"):
+    """Discord-OAuth-Callback durchspielen: exchange_code/get_discord_user mocken,
+    CSRF-state-Cookie setzen, Callback aufrufen."""
+    import app.main as main
+    async def fake_exchange(code):
+        return {"access_token": "tok"}
+    async def fake_user(tok):
+        return {"id": discord_id, "username": username, "avatar": ""}
+    monkeypatch.setattr(main, "exchange_code", fake_exchange)
+    monkeypatch.setattr(main, "get_discord_user", fake_user)
+    client.cookies.set("discord_oauth_state", state)
+    return client.get(f"/auth/callback?code=c&state={state}")
+
+
+def test_oauth_invite_only_blocks_new_signup(client, monkeypatch):
+    """CRITICAL-Fix (Review 2026-06-14): bei invite-only (REGISTRATION_OPEN=False)
+    + unkonfiguriertem Rollen-Gate legt der Discord-OAuth-Callback KEINEN neuen
+    User an — sonst wäre die Invite-only-Sperre über OAuth komplett umgehbar."""
+    from app import config
+    from app.models import User
+    from app.db import SessionLocal
+    monkeypatch.setattr(config, "DISCORD_GUILD_ID", "")
+    monkeypatch.setattr(config, "DISCORD_BOT_TOKEN", None)
+    monkeypatch.setattr(config, "REGISTRATION_OPEN", False)
+    _oauth_callback(client, monkeypatch, "9000000001")
+    with SessionLocal() as db:
+        assert db.query(User).filter(User.discord_id == "9000000001").first() is None, \
+            "OAuth-Callback darf bei invite-only KEINEN neuen User anlegen"
+
+
+def test_oauth_open_registration_creates_user(client, monkeypatch):
+    """Gegenprobe: mit REGISTRATION_OPEN=True legt der Callback einen User an."""
+    from app import config
+    from app.models import User
+    from app.db import SessionLocal
+    monkeypatch.setattr(config, "DISCORD_GUILD_ID", "")
+    monkeypatch.setattr(config, "DISCORD_BOT_TOKEN", None)
+    monkeypatch.setattr(config, "REGISTRATION_OPEN", True)
+    _oauth_callback(client, monkeypatch, "9000000002", username="openuser")
+    with SessionLocal() as db:
+        assert db.query(User).filter(User.discord_id == "9000000002").first() is not None, \
+            "bei offener Registrierung muss der OAuth-Callback den User anlegen"
+
+
 # ── LOW-7: Per-Account-Lockout ──────────────────────────────────────────────
 def test_account_lockout_after_failed_logins(client):
     email = "lockme@test.local"

@@ -673,27 +673,41 @@ async def discord_callback(request: Request, code: str = None, state: str = None
         username = discord_user.get("username", "")
         avatar = discord_user.get("avatar", "")
 
-        # Check role if guild ID and bot token are configured
+        # Check role if guild ID and bot token are configured. role_verified
+        # bleibt False, wenn das Gate NICHT konfiguriert ist — dann kann die
+        # Supporter-Rolle nicht geprüft werden (wichtig fürs Invite-only-Gate unten).
+        role_verified = False
         if config.DISCORD_GUILD_ID and config.DISCORD_BOT_TOKEN:
             member = await get_guild_member(discord_id, config.DISCORD_BOT_TOKEN, config.DISCORD_GUILD_ID)
             if not has_required_role(member, config.DISCORD_REQUIRED_ROLE_ID):
                 resp = RedirectResponse("/?error=no_role")
                 resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
                 return resp
+            role_verified = True
         else:
-            # 2026-06-12 M-10: Gate nicht konfiguriert → Login bewusst offen
-            # (Beta-Entscheidung), aber jeder Bypass wird EINZELN geloggt,
-            # damit das nie wieder still passiert (plus Startup-Warnung in
-            # lifespan).
             log.warning(
-                "Discord-Login OHNE Rollen-Gate durchgelassen: discord_id=%s "
-                "username=%r (DISCORD_GUILD_ID/DISCORD_BOT_TOKEN nicht konfiguriert)",
-                discord_id, username,
+                "Discord-Rollen-Gate NICHT konfiguriert (DISCORD_GUILD_ID/DISCORD_BOT_TOKEN fehlen) "
+                "— Supporter-Rolle unverifiziert; neue OAuth-Signups werden bei invite-only abgelehnt: "
+                "discord_id=%s username=%r", discord_id, username,
             )
 
         # Find or create user by discord_id
         u = db.query(User).filter(User.discord_id == discord_id).first()
         if not u:
+            # 2026-06-14 CRITICAL-Fix (Review): die Account-NEUANLAGE per OAuth an
+            # DIESELBE Invite-Policy binden wie /api/register. Vorher war /api/register
+            # zu (403), der OAuth-Pfad aber offen → jeder Discord-Account legte einen
+            # Voll-User an. Jetzt: neuer Account nur, wenn die Supporter-Rolle
+            # verifiziert wurde ODER REGISTRATION_OPEN=true. Sonst fail-closed.
+            # BESTEHENDE User (else-Zweig) loggen sich immer ein. Discord-Supporter-
+            # Self-Onboarding braucht daher DISCORD_GUILD_ID + DISCORD_BOT_TOKEN
+            # (+ DISCORD_REQUIRED_ROLE_ID) in der .env.
+            if not (role_verified or config.REGISTRATION_OPEN):
+                log.warning("OAuth-Signup geblockt (invite-only): discord_id=%s username=%r",
+                            discord_id, username)
+                resp = RedirectResponse("/?error=invite_only")
+                resp.delete_cookie(OAUTH_STATE_COOKIE, path="/auth")
+                return resp
             u = User(
                 email=f"discord_{discord_id}@goathub.internal",
                 password_hash="",

@@ -36,7 +36,7 @@
   </style>
 </head>
 <body>
-  <form class="card" id="f" autocomplete="on">
+  <form class="card" id="f" autocomplete="on" method="post" action="/api/login">
     <div class="kick">GoatHub Trading Bot</div>
     <h1>Member Access</h1>
     <p class="sub">Sign in with your account credentials.</p>
@@ -48,24 +48,9 @@
     <button type="submit" id="btn">Sign in →</button>
     <p class="foot">Got a Discord supporter role instead? <a href="/">Use Discord login</a></p>
   </form>
-  <script>
-    var f=document.getElementById("f"),btn=document.getElementById("btn"),err=document.getElementById("err");
-    f.addEventListener("submit",function(e){
-      e.preventDefault();
-      err.textContent="";btn.disabled=true;btn.textContent="Signing in…";
-      var email=document.getElementById("email").value.trim().toLowerCase();
-      var password=document.getElementById("pw").value;
-      fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
-        credentials:"same-origin",body:JSON.stringify({email:email,password:password})})
-        .then(function(r){
-          if(r.ok){window.location.href="/";return;}
-          return r.json().catch(function(){return {};}).then(function(j){
-            btn.disabled=false;btn.textContent="Sign in →";
-            err.textContent=(j&&j.detail)?j.detail:(r.status===429?"Too many attempts — try again later.":"Wrong email or password.");
-          });
-        })
-        .catch(function(){btn.disabled=false;btn.textContent="Sign in →";err.textContent="Network error — is the server reachable?";});
-    });
-  </script>
+  <!-- Externes Script (CSP script-src 'self' blockt Inline). method=post als
+       Fallback, falls JS je blockiert ist: Credentials gehen NIE per GET in die
+       URL, sondern höchstens als POST-Body (→ 422), nie in Logs/History. -->
+  <script src="/static/backdoor.js" defer></script>
 </body>
 </html>

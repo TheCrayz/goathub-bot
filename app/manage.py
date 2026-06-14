@@ -46,15 +46,26 @@ def create_user(args):
     pw = args.password or secrets.token_urlsafe(12)
     if len(pw) < 6:
         sys.exit("FEHLER: Passwort muss mind. 6 Zeichen haben.")
+    # Bounds spiegeln schemas.SettingsIn — die CLI darf KEINE gefährlichen Werte
+    # auf den Geld-Pfad schreiben (sonst Bypass des API-Safety-Caps bei echtem Geld).
+    risk = args.risk if args.risk is not None else config.DEFAULT_RISK_PCT
+    leverage = args.leverage if args.leverage is not None else config.DEFAULT_LEVERAGE
+    max_open = args.max_open if args.max_open is not None else config.DEFAULT_MAX_OPEN
+    if not (0 < risk <= 0.05):
+        sys.exit(f"FEHLER: --risk muss eine FRACTION in (0, 0.05] sein (0.005 = 0.5%). Bekommen: {risk}")
+    if not (1 <= leverage <= 50):
+        sys.exit(f"FEHLER: --leverage muss in [1, 50] sein. Bekommen: {leverage}")
+    if not (1 <= max_open <= 20):
+        sys.exit(f"FEHLER: --max-open muss in [1, 20] sein. Bekommen: {max_open}")
     with SessionLocal() as db:
         if db.query(User).filter(User.email == email).first():
             sys.exit(f"FEHLER: Email {email} ist bereits registriert (set-password nutzen, um das PW zu ändern).")
         u = User(
             email=email,
             password_hash=hash_pw(pw),
-            risk_pct=args.risk if args.risk is not None else config.DEFAULT_RISK_PCT,
-            leverage=args.leverage if args.leverage is not None else config.DEFAULT_LEVERAGE,
-            max_open_positions=args.max_open if args.max_open is not None else config.DEFAULT_MAX_OPEN,
+            risk_pct=risk,
+            leverage=leverage,
+            max_open_positions=max_open,
         )
         db.add(u)
         db.commit()
@@ -127,10 +138,12 @@ def main(argv=None):
     c = sub.add_parser("create-user", help="Gratis-Account anlegen (Email+Passwort, ohne Discord)")
     c.add_argument("--email", required=True)
     c.add_argument("--password", default=None, help="weglassen → sicheres Passwort wird generiert")
-    c.add_argument("--risk", type=float, default=None, help=f"Risk-Prozent (default {config.DEFAULT_RISK_PCT})")
-    c.add_argument("--leverage", type=float, default=None, help=f"Hebel (default {config.DEFAULT_LEVERAGE})")
+    c.add_argument("--risk", type=float, default=None,
+                   help=f"Risk pro Trade als FRACTION (0.005=0.5%%), erlaubt (0,0.05]. Default {config.DEFAULT_RISK_PCT}")
+    c.add_argument("--leverage", type=float, default=None,
+                   help=f"Hebel-Cap [1,50]. Default {config.DEFAULT_LEVERAGE}")
     c.add_argument("--max-open", type=int, default=None, dest="max_open",
-                   help=f"max. offene Positionen (default {config.DEFAULT_MAX_OPEN})")
+                   help=f"max. offene Positionen [1,20]. Default {config.DEFAULT_MAX_OPEN}")
     c.set_defaults(func=create_user)
 
     li = sub.add_parser("list-users", help="alle User auflisten")
