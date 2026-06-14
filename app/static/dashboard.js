@@ -184,7 +184,7 @@ document.addEventListener("DOMContentLoaded",function(){
   // 'unsafe-inline' für script-src.
   const wire=(id,fn,ev)=>{const el=document.getElementById(id); if(el)el.addEventListener(ev||"click",fn);};
   wire("loginBtn", login);
-  wire("registerBtn", register);
+  // registerBtn entfernt (2026-06-14): Registrierung ist invite-only.
   wire("logoutBtn", logout);
   wire("toggle", toggleBot);
   wire("savewalletbtn", saveWallet);

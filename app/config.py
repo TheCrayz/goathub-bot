@@ -42,6 +42,11 @@ if not JWT_SECRET or JWT_SECRET == "dev-insecure-change-me":
         "  JWT_SECRET=$(openssl rand -hex 32)\n"
         "Ohne sicheres Secret sind alle Login-Tokens fälschbar (Account-Übernahme).")
 JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 24)   # 2026-06-08 B4: 24h statt 168h (war 7 Tage). Refresh-Endpoint extends.
+# 2026-06-14: Selbst-Registrierung. Default FALSE = invite-only — neue Accounts
+# kommen NUR via Discord-Supporter-OAuth oder werden vom Team per CLI angelegt
+# (`python -m app.manage create-user`). Wer offene Self-Signups will, setzt
+# REGISTRATION_OPEN=true in der .env.
+REGISTRATION_OPEN = _b("REGISTRATION_OPEN", "false")
 ENCRYPTION_KEY = _g("ENCRYPTION_KEY")        # Fernet-Key; nötig zum Speichern der HL-Agent-Keys
 # 2026-06-12 Key-Rotation (#43): optionaler ALTER Fernet-Key. Bei Rotation:
 # neuen Key nach ENCRYPTION_KEY, alten nach ENCRYPTION_KEY_OLD — decrypt

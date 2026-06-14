@@ -11,6 +11,7 @@ import os
 from cryptography.fernet import Fernet
 os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef")
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("REGISTRATION_OPEN", "true")  # Tests legen User via /api/register an
 
 from app.sizing import size_trade, auto_leverage
 from app.parser import parse_signal

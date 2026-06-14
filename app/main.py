@@ -444,6 +444,13 @@ async def _security_headers(request: Request, call_next):
 @app.post("/api/register")
 @limiter.limit(REGISTER_RATE_LIMIT)
 def register(request: Request, body: Register, db: Session = Depends(get_db)):
+    # 2026-06-14: Invite-only. Offene Selbst-Registrierung ist standardmäßig zu —
+    # Zugang gibt's nur über Discord-Supporter-OAuth oder vom Team angelegte
+    # Accounts (app.manage create-user). Per .env REGISTRATION_OPEN=true wieder
+    # zu öffnen.
+    if not config.REGISTRATION_OPEN:
+        raise HTTPException(403, "Registration is invite-only — new accounts are created by the team. "
+                                 "Ask an admin, or log in with Discord.")
     email = body.email.strip().lower()
     # 2026-06-04 audit-find: vorher hat "@" alleine durchgelassen z.B.
     # "<script>alert(1)</script>@x.com" oder 1MB-langer string. Beides wäre

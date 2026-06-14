@@ -20,6 +20,9 @@ os.environ.setdefault("JWT_SECRET", "test-only-secret-not-prod-1234567890abcdef"
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("ENABLE_LISTENER", "false")
+# Tests legen ihre Test-User via /api/register an → Registrierung im Test offen.
+# Die Invite-only-Sperre (Prod-Default) wird separat gezielt getestet.
+os.environ.setdefault("REGISTRATION_OPEN", "true")
 # Halt-Flag auf testeigenen Pfad — Tests dürfen nie ein echtes Flag sehen/löschen.
 os.environ.setdefault(
     "EMERGENCY_HALT_FLAG_PATH",

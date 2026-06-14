@@ -32,6 +32,8 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 # — der Per-Account-Lockout (LOW-7) wird separat und gezielt getestet.
 os.environ["LOGIN_RATE_LIMIT"] = "1000/minute"
 os.environ["REGISTER_RATE_LIMIT"] = "1000/minute"
+# Standalone-Run: Registrierung offen, damit _register Test-User anlegen kann.
+os.environ.setdefault("REGISTRATION_OPEN", "true")
 
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
@@ -129,6 +131,21 @@ def test_register_rejects_discord_localpart_any_domain(client):
     r = _register(client, "discord_123456@gmail.com")
     assert r.status_code == 400, r.text[:200]
     assert "reserved" in r.json()["detail"].lower()
+
+
+def test_registration_invite_only_returns_403(client):
+    """2026-06-14 Invite-only: bei REGISTRATION_OPEN=False ist /api/register zu
+    (403), bevor irgendeine Email-Validierung greift — Zugang nur via Discord-
+    Supporter oder vom Team angelegte Accounts (app.manage)."""
+    from app import config
+    orig = config.REGISTRATION_OPEN
+    config.REGISTRATION_OPEN = False
+    try:
+        r = _register(client, "rando@example.com")
+        assert r.status_code == 403, r.text[:200]
+        assert "invite-only" in r.json()["detail"].lower()
+    finally:
+        config.REGISTRATION_OPEN = orig
 
 
 # ── LOW-7: Per-Account-Lockout ──────────────────────────────────────────────
