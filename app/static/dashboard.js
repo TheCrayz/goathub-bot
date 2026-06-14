@@ -161,6 +161,10 @@ function updateWalletLens(){
   if(document.readyState==="complete")go(); else window.addEventListener("load",go,{once:true});
 })();
 (function(){
+  // 2026-06-14 App-Shell: auf Mobile (<=720px) schalten die Tabs SCREENS statt
+  // zu scrollen → der Scroll-Spy ist dort obsolet (und würde mit dem Screen-
+  // Switcher um die .active-Klasse streiten). Nur auf Desktop aktiv lassen.
+  if(window.matchMedia&&window.matchMedia("(max-width:720px)").matches)return;
   var tabs=document.querySelectorAll(".tabbar a");
   if(!tabs.length||!("IntersectionObserver" in window))return;
   var map={}; tabs.forEach(function(t){var s=t.getAttribute("data-sec"); if(s)map[s]=t;});
@@ -174,6 +178,49 @@ function updateWalletLens(){
     });
   },{rootMargin:"-45% 0px -50% 0px",threshold:0});
   Object.keys(map).forEach(function(id){var el=document.getElementById(id); if(el)io.observe(el);});
+})();
+// ── App-Shell (2026-06-14): MOBILE (<=720px, eingeloggt) = natives App-Gefühl.
+// Jeder Bottom-Tab öffnet EINEN eigenen Screen (Kategorie) statt einer langen
+// Scroll-Seite. Desktop bleibt unverändert (alle Sektionen; .screen-off greift
+// per @media nur <=720px). id→Screen-Map; .screen-off blendet nicht-aktive aus.
+(function(){
+  var MQ=window.matchMedia("(max-width:720px)");
+  var SCREEN_OF={overview:"overview",positions:"positions","chart-card":"positions",
+    history:"history",percoin:"history",activity:"history",
+    wallet:"wallet","wallet-connect":"wallet",builder:"wallet","risk-setup":"risk"};
+  var SCREENS=["overview","positions","history","wallet","risk"];
+  Object.keys(SCREEN_OF).forEach(function(id){var el=document.getElementById(id); if(el)el.dataset.screen=SCREEN_OF[id];});
+  // Große Hero-Metriken + Warn-Banner + Onboarding-Stepper NUR auf dem Overview-
+  // Screen — sonst frisst dieser „Chrome" oben jeden Screen. Header bleibt schlank.
+  [".hero-metrics","#netbanner","#stepper"].forEach(function(sel){var el=document.querySelector(sel); if(el)el.dataset.screen="overview";});
+  var tabs=document.querySelectorAll(".tabbar a");
+  function tabScreen(t){var s=t.getAttribute("data-sec"); return SCREEN_OF[s]||s;}
+  var current="overview";
+  function apply(name){
+    var cards=document.querySelectorAll("[data-screen]"),i;
+    for(i=0;i<cards.length;i++)cards[i].classList.toggle("screen-off", cards[i].getAttribute("data-screen")!==name);
+    for(i=0;i<tabs.length;i++)tabs[i].classList.toggle("active", tabScreen(tabs[i])===name);
+  }
+  function showScreen(name){
+    if(SCREENS.indexOf(name)<0)name="overview";
+    current=name; apply(name); window.scrollTo(0,0);
+    try{sessionStorage.setItem("ght_screen",name);}catch(e){}
+  }
+  tabs.forEach(function(t){
+    t.addEventListener("click",function(e){ if(MQ.matches){e.preventDefault(); showScreen(tabScreen(t));} });
+  });
+  function activate(){
+    if(MQ.matches){
+      var saved=null; try{saved=sessionStorage.getItem("ght_screen");}catch(e){}
+      showScreen(saved&&SCREENS.indexOf(saved)>=0?saved:current);
+    } else {
+      var off=document.querySelectorAll(".screen-off"),i;
+      for(i=0;i<off.length;i++)off[i].classList.remove("screen-off");
+    }
+  }
+  if(MQ.addEventListener)MQ.addEventListener("change",activate); else if(MQ.addListener)MQ.addListener(activate);
+  window.__ghActivateAppShell=activate;
+  if(document.body.classList.contains("authed"))activate();
 })();
 document.addEventListener("DOMContentLoaded",function(){
   if(addr){addr.addEventListener("input",updateWalletLens);}
@@ -890,6 +937,7 @@ async function load(){
 function render(d){
   auth.classList.add("hide");app.classList.remove("hide");
   document.body.classList.add("authed");   // App-Shell: Bottom-Tab-Nav nur eingeloggt zeigen
+  if(window.__ghActivateAppShell)window.__ghActivateAppShell();   // mobil: initialen Screen setzen
   // 2026-06-08: Mainnet-aware UI — Pille + Banner-Style switch. Banner-text
   // selbst ist immer der Risk-Warning (siehe HTML); auf Mainnet zusätzlich
   // roter Style + 'real money' emphasis.
