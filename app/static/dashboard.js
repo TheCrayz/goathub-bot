@@ -693,28 +693,83 @@ function posCardHtml(p){
   const margin=p.margin_used!=null?Number(p.margin_used):null;
   const notional=Math.abs(size*entry);
   const ref=mark!=null?mark:entry;
+  // profitDir: +1 für Long, −1 für Short. signed(v) = Fortschritt von Entry in
+  // Profit-Richtung (positiv = Richtung TP, negativ = Richtung SL).
+  const profitDir=size>=0?1:-1;
+  const signed=function(v){return (Number(v)-entry)*profitDir;};
   let near=null;
   if(tps.length)near=tps.reduce((a,b)=>Math.abs(Number(b.price)-ref)<Math.abs(Number(a.price)-ref)?b:a);
+  const isHit=function(t){return mark!=null&&signed(t.price)<=signed(mark);};
+  const hitCount=mark!=null?tps.filter(isHit).length:0;
   const noSl=hasSlKey&&p.stop_loss==null;
   // Amber-Warnung, wenn Mark näher als 1 % am SL ist
   const slWarn=sl!=null&&mark!=null&&mark>0&&Math.abs(mark-sl)/mark<=0.01;
   const upPct=(margin!=null&&margin>0)?((up>=0?"+":"−")+Math.abs(up/margin*100).toFixed(1)+"% of margin"):"";
+  const tpOpen=(typeof TP_OPEN!=="undefined")&&TP_OPEN.has(coin);
+
+  // SL-Box (unverändert) + TP-Box → aufklappbarer Button (zeigt nächsten TP + Chevron)
   let slTpRow="";
   if(hasSlKey||tps.length){
-    const tpTitle=esc(tps.map(t=>(t.percent!=null?t.percent+"% @ ":"")+"$"+fmtPx(t.price)).join(", "));
-    slTpRow=
-      '<div class="metric-box'+(slWarn?' warn-sl':'')+'"'+(slWarn?' title="Mark ist < 1 % vom Stop Loss entfernt"':'')+'><div class="label">Stop Loss</div><div class="value">'+
-        (sl!=null?("$"+esc(fmtPx(sl))):'<span class="badge-nosl">No SL</span>')+'</div></div>'+
-      '<div class="metric-box" title="'+tpTitle+'"><div class="label">Take Profit</div><div class="value">'+
-        (near?("$"+esc(fmtPx(near.price))+(tps.length>1?' <span class="mut">+'+(tps.length-1)+'</span>':"")):"—")+'</div></div>';
+    const slBox='<div class="metric-box'+(slWarn?' warn-sl':'')+'"'+(slWarn?' title="Mark ist < 1 % vom Stop Loss entfernt"':'')+'><div class="label">Stop Loss</div><div class="value">'+
+        (sl!=null?("$"+esc(fmtPx(sl))):'<span class="badge-nosl">No SL</span>')+'</div></div>';
+    let tpBox;
+    if(tps.length){
+      tpBox='<button type="button" class="metric-box tp-btn'+(tpOpen?' open':'')+'" data-tp-toggle="'+esc(coin)+'" aria-expanded="'+(tpOpen?'true':'false')+'">'+
+          '<div class="label">Take Profit'+(tps.length>1?' · '+tps.length:"")+'</div>'+
+          '<div class="value"><span>'+(near?("$"+esc(fmtPx(near.price))):"—")+'</span>'+
+          '<svg class="tp-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></div></button>';
+    } else {
+      tpBox='<div class="metric-box"><div class="label">Take Profit</div><div class="value">—</div></div>';
+    }
+    slTpRow=slBox+tpBox;
   }
-  let bar="";
-  if(sl!=null&&near&&Number(near.price)!==sl){
-    let pct=(ref-sl)/(Number(near.price)-sl);
-    pct=Math.max(0,Math.min(1,pct));
-    bar='<div class="sl-bar" title="Position des Mark-Preises zwischen SL und nächstem TP"><div class="sl-fill" style="width:'+(pct*100).toFixed(1)+'%"></div></div>'+
-        '<div class="sl-bar-l"><span>SL '+esc(fmtPx(sl))+'</span><span>TP '+esc(fmtPx(near.price))+'</span></div>';
+
+  // Aufklappbare TP-Liste (alle Targets, erreichte durchgestrichen)
+  let tpListHtml="";
+  if(tps.length){
+    const rows=tps.map(function(t,i){
+      const hit=isHit(t);
+      return '<div class="tp-row'+(hit?" hit":"")+'">'+
+        '<span class="tp-i">'+(hit?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l4 5 10-12"/></svg>':"")+'TP'+(i+1)+'</span>'+
+        '<span class="tp-pct">'+(t.percent!=null?(esc(String(t.percent))+"%"):"")+'</span>'+
+        '<span class="tp-px">$'+esc(fmtPx(t.price))+'</span></div>';
+    }).join("");
+    tpListHtml='<div class="tp-list'+(tpOpen?" open":"")+'"><div>'+rows+'</div></div>';
   }
+
+  // SL→TP-Leiter: Mitte=Entry, links Weg zum SL (rot), rechts Weg zu den TPs
+  // (grün, je ein Tick), pulsierender Marker = Mark-Preis. Progress-Skala via
+  // signed(): nicht linear im Preis, sondern im Fortschritt zum jeweiligen Ziel.
+  let gauge="";
+  if((sl!=null||tps.length)&&entry>0){
+    let tpReach=0;
+    tps.forEach(function(t){const s=signed(t.price);if(s>tpReach)tpReach=s;});
+    const slReach=sl!=null?Math.max(0,-signed(sl)):0;
+    const pos=function(v){
+      const s=signed(v);
+      if(s>=0){const d=tpReach>0?tpReach:(slReach>0?slReach:1);return 50+Math.max(0,Math.min(1,s/d))*50;}
+      const d=slReach>0?slReach:(tpReach>0?tpReach:1);return 50-Math.max(0,Math.min(1,(-s)/d))*50;
+    };
+    let ticks="",nums="";
+    tps.forEach(function(t,i){
+      const pp=pos(t.price),hit=isHit(t);
+      ticks+='<div class="g-tick tp'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%"></div>';
+      nums+='<div class="g-num'+(hit?" hit":"")+'" style="left:'+pp.toFixed(1)+'%">'+(i+1)+'</div>';
+    });
+    if(sl!=null)ticks+='<div class="g-tick sl" style="left:0%"></div>';
+    const markPos=mark!=null?pos(mark):50;
+    const markNeg=mark!=null&&signed(mark)<0;
+    const marker='<div class="g-mark'+(markNeg?" n":"")+'" style="left:'+markPos.toFixed(1)+'%"></div>';
+    let last=null;
+    tps.forEach(function(t){if(last===null||signed(t.price)>signed(last.price))last=t;});
+    const slLbl=sl!=null?("SL $"+esc(fmtPx(sl))):"No SL";
+    const tpLbl=last?("TP"+(tps.indexOf(last)+1)+" $"+esc(fmtPx(last.price))):"";
+    const midLbl="ENTRY $"+esc(fmtPx(entry))+(tps.length?(" · "+hitCount+"/"+tps.length+" TP"):"");
+    gauge='<div class="g-wrap"><div class="g-nums">'+nums+'</div>'+
+      '<div class="g-track"><div class="g-mid"></div>'+ticks+marker+'</div>'+
+      '<div class="g-lbls"><span class="sl">'+slLbl+'</span><span class="mid">'+midLbl+'</span><span class="tp">'+tpLbl+'</span></div></div>';
+  }
+
   return '<article class="position-card '+(up>=0?"heat-positive":"heat-negative")+'" data-coin="'+esc(coin)+'">'+
     '<div class="position-top">'+
       '<div class="position-coin">'+esc(coin)+
@@ -731,7 +786,8 @@ function posCardHtml(p){
       '<div class="metric-box"><div class="label">Size</div><div class="value">'+esc(fmtSize(size))+" "+esc(coin)+'</div></div>'+
       '<div class="metric-box"><div class="label">'+(liq!=null?"Liq. Price":(margin!=null?"Margin":"Notional"))+'</div><div class="value">$'+
         esc(liq!=null?fmtPx(liq):FMT_USD.format(margin!=null?margin:notional))+'</div></div>'+
-    '</div>'+bar+
+    '</div>'+
+    tpListHtml+gauge+
   '</article>';
 }
 function renderPositions(list){
@@ -1001,6 +1057,50 @@ setInterval(function(){
   if(!LAST_OK){el.textContent="—";return;}
   el.textContent="Updated "+Math.max(0,Math.round((Date.now()-LAST_OK)/1000))+"s ago";
 },1000);
+
+// ── TP-Dropdown + ein-/ausklappbare Kategorien (2026-06-14).
+// TP_OPEN merkt pro Coin, ob die TP-Liste offen ist; posCardHtml liest das, der
+// Klick-Handler liegt DELEGIERT auf #positionCards und überlebt so das 15s-Re-
+// Render (die Cards werden via innerHTML neu gebaut, der Container bleibt).
+const TP_OPEN=new Set();
+function wireTpToggle(){
+  const c=document.getElementById("positionCards"); if(!c||c.dataset.tpw)return; c.dataset.tpw="1";
+  c.addEventListener("click",function(e){
+    const b=e.target.closest("[data-tp-toggle]"); if(!b)return;
+    const coin=b.getAttribute("data-tp-toggle");
+    const open=!TP_OPEN.has(coin);
+    if(open)TP_OPEN.add(coin); else TP_OPEN.delete(coin);
+    b.classList.toggle("open",open);
+    b.setAttribute("aria-expanded",open?"true":"false");
+    const card=b.closest(".position-card");
+    const list=card&&card.querySelector(".tp-list"); if(list)list.classList.toggle("open",open);
+  });
+}
+// Kategorie-Header klickbar machen: Body nach der h2 in einen Klapp-Wrapper
+// verschieben + Chevron anhängen; Zustand in localStorage merken.
+function wireCollapsibles(){
+  ["overview","positions","chart-card","history","percoin"].forEach(function(id){
+    const sec=document.getElementById(id); if(!sec||sec.dataset.coll)return; sec.dataset.coll="1";
+    const h=sec.querySelector("h2"); if(!h)return;
+    const body=document.createElement("div"); body.className="sect-body";
+    const inner=document.createElement("div");
+    let n=h.nextSibling;
+    while(n){const next=n.nextSibling; inner.appendChild(n); n=next;}
+    body.appendChild(inner); sec.appendChild(body);
+    h.classList.add("sect-h");
+    const chev=document.createElement("span"); chev.className="sect-chev"; chev.setAttribute("aria-hidden","true");
+    chev.innerHTML='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg>';
+    h.appendChild(chev);
+    const key="ght_coll_"+id;
+    try{ if(localStorage.getItem(key)==="1")sec.classList.add("collapsed"); }catch(e){}
+    h.addEventListener("click",function(){
+      const col=sec.classList.toggle("collapsed");
+      try{ localStorage.setItem(key,col?"1":"0"); }catch(e){}
+    });
+  });
+}
+wireTpToggle();
+wireCollapsibles();
 
 // Phase 2 #18: immer load() probieren — auth läuft via Cookie. Wenn 401,
 // zeigt load() die Login-Form (auth section ist by default sichtbar).

@@ -137,6 +137,43 @@
   .sl-bar{height:4px;border-radius:2px;background:rgba(255,255,255,.09);margin-top:10px;position:relative;overflow:hidden}
   .sl-fill{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:linear-gradient(90deg,var(--red),var(--amber) 35%,var(--green))}
   .sl-bar-l{display:flex;justify-content:space-between;font-size:10px;color:var(--mut);margin-top:3px;font-family:var(--num)}
+  /* ── TP-Dropdown (2026-06-14): Take-Profit-Box wird ein aufklappbarer Button */
+  .tp-btn{cursor:pointer;width:100%;text-align:left;font:inherit;color:var(--text)}
+  .tp-btn:hover{border-color:rgba(74,242,178,.35);background:rgba(74,242,178,.07)}
+  .tp-btn .value{display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .tp-chev{flex:none;color:var(--mut);transition:transform .25s}
+  .tp-btn.open .tp-chev{transform:rotate(180deg)}
+  .tp-list{display:grid;grid-template-rows:0fr;transition:grid-template-rows .28s ease}
+  .tp-list.open{grid-template-rows:1fr;margin-top:8px}
+  .tp-list>div{overflow:hidden}
+  .tp-row{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid rgba(74,242,178,.14);border-radius:9px;margin-bottom:5px;background:rgba(74,242,178,.04);font-family:var(--num)}
+  .tp-row .tp-i{font-size:12px;color:var(--green);font-weight:800;display:flex;align-items:center;gap:5px;min-width:56px}
+  .tp-row .tp-pct{font-size:11px;color:var(--mut);flex:1}
+  .tp-row .tp-px{font-size:13px;font-weight:800}
+  .tp-row.hit{opacity:.5}.tp-row.hit .tp-px{text-decoration:line-through}
+  /* ── SL→TP-Leiter: Mitte=Entry, links SL, rechts die TP-Stufen, Marker=Mark */
+  .g-wrap{margin-top:12px}
+  .g-nums{position:relative;height:13px;margin-bottom:2px}
+  .g-num{position:absolute;transform:translateX(-50%);font-size:10px;font-family:var(--num);color:var(--mut)}
+  .g-num.hit{color:var(--green)}
+  .g-track{position:relative;height:24px;border-radius:7px;overflow:hidden;border:1px solid var(--line);background:linear-gradient(90deg,rgba(255,138,138,.22),rgba(255,138,138,.05) 40%,rgba(74,242,178,.05) 60%,rgba(74,242,178,.18))}
+  .g-mid{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,.3);z-index:2}
+  .g-tick{position:absolute;top:3px;bottom:3px;width:2px;border-radius:2px;transform:translateX(-50%);z-index:2}
+  .g-tick.tp{background:rgba(74,242,178,.45)}.g-tick.tp.hit{background:var(--green);box-shadow:0 0 6px rgba(74,242,178,.7)}
+  .g-tick.sl{background:var(--red);width:3px}
+  .g-mark{position:absolute;top:50%;width:12px;height:12px;border-radius:50%;background:var(--green);color:var(--green);z-index:4;transform:translate(-50%,-50%);transition:left .9s cubic-bezier(.5,0,.2,1);box-shadow:0 0 0 4px rgba(74,242,178,.16)}
+  .g-mark.n{background:var(--red);color:var(--red);box-shadow:0 0 0 4px rgba(255,138,138,.16)}
+  .g-mark::before{content:"";position:absolute;inset:-3px;border-radius:50%;border:1px solid currentColor;opacity:.5;animation:gpulse 1.8s ease-out infinite}
+  @keyframes gpulse{0%{transform:scale(.7);opacity:.6}100%{transform:scale(2.2);opacity:0}}
+  .g-lbls{display:flex;justify-content:space-between;gap:6px;font-size:10.5px;margin-top:5px;font-family:var(--num)}
+  .g-lbls .sl{color:#ffb0b0}.g-lbls .mid{color:var(--mut)}.g-lbls .tp{color:#9af2cf}
+  /* ── Ein-/ausklappbare Kategorien (2026-06-14) */
+  .sect-h{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+  .sect-chev{margin-left:auto;flex:none;color:var(--mut);transition:transform .25s}
+  .card.collapsed .sect-chev{transform:rotate(-90deg)}
+  .sect-body{display:grid;grid-template-rows:1fr;transition:grid-template-rows .3s ease}
+  .card.collapsed .sect-body{grid-template-rows:0fr}
+  .sect-body>div{overflow:hidden}
   /* Setup-Cards als details/summary: zugeklappt wenn der Schritt erledigt ist */
   details.card>summary{display:flex;justify-content:space-between;align-items:center;gap:10px;cursor:pointer;list-style:none;font-weight:800;color:#a8ffd8;font-size:15px}
   details.card>summary::-webkit-details-marker{display:none}
